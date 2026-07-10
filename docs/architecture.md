@@ -4,20 +4,23 @@
 
 ```mermaid
 flowchart LR
-  C["API client"] --> E["HTTPS edge / WAF"]
-  E --> G["OpenAI-compatible gateway"]
+  C["API client"] --> E["Global HTTPS load balancer"]
+  E --> A["Cloud Armor abuse controls"]
+  A --> G["Cloud Run gateway"]
   G --> R["Memorystore rate limits"]
+  G --> F["Firestore keys and usage"]
+  G --> O["OpenSoftware Accounts wallet"]
   G -->|"disabled or fallback"| S["Standard vLLM on L4"]
   G -->|"required or preferred"| T["vLLM on H100 + Intel TDX"]
   S --> M["Model weights"]
   T --> M
 ```
 
-The gateway is the policy enforcement point. Public model IDs are decoupled from Hugging Face/vLLM model IDs, and each public model declares its permitted backends. A request marked `required` can select only the confidential backend. This invariant is covered by tests.
+The gateway is the policy enforcement point. Public model IDs are decoupled from Hugging Face/vLLM model IDs, and each public model declares its permitted backends. A request marked `required` can select only the confidential backend. This invariant is covered by tests. The edge rate limit is availability protection only; authenticated per-key limits and spend reservations remain authoritative in the gateway.
 
 ## Trust boundaries
 
-- The edge terminates public TLS and applies volumetric protection. It must not log request bodies.
+- Certificate Manager terminates public TLS at the global load balancer. Cloud Armor applies an approximate source-IP throttle without inspecting prompt bodies. Cloud Run ingress rejects direct internet paths after edge cutover.
 - The gateway authenticates tenant keys, applies request limits, makes the privacy decision, and streams bytes. It intentionally has no prompt database.
 - Standard vLLM nodes protect data at rest and in transit but do not provide memory encryption against the cloud/hypervisor boundary.
 - Confidential H100 nodes use Confidential GKE Nodes with Intel TDX. Their manifest requires the `TDX` node label as well as the H100 GPU label.
@@ -30,6 +33,8 @@ A Standard cluster permits separate ordinary L4 and confidential H100 node pools
 
 For stronger organizational isolation, move confidential serving to a separate project and cluster. The API routing/config contract does not change.
 
-## Control plane to add next
+## Control plane
 
-The production control plane should own tenants, hashed API-key records, model catalog versions, immutable usage events, quotas, invoices, and revocation. Keep it out of the prompt data path. Usage events should contain tenant, model, token counts, latency, status, and compute class—never prompt or completion text.
+OpenSoftware Accounts owns user identity and the Credit wallet. Firestore owns SHA-256 API-key records, revocation, expiration, spend reservations, and immutable usage events. Memorystore owns short-lived distributed request counters. None of these stores prompt or completion text.
+
+GitHub Actions obtains short-lived GCP credentials through Workload Identity Federation. The provider accepts only the immutable numeric repository and organization IDs on `refs/heads/main`; no service-account key is stored in GitHub. A candidate revision receives zero traffic until its readiness and authenticated model-list smoke tests pass.

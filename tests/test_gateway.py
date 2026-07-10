@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 import httpx
 from fastapi.testclient import TestClient
@@ -111,6 +112,57 @@ def test_request_id_is_preserved(client: TestClient) -> None:
     response = client.get("/healthz", headers={"X-Request-ID": "request-from-client"})
 
     assert response.headers["x-request-id"] == "request-from-client"
+
+
+def test_invalid_request_id_is_replaced(client: TestClient) -> None:
+    response = client.get("/healthz", headers={"X-Request-ID": "not valid with spaces"})
+
+    assert response.headers["x-request-id"] != "not valid with spaces"
+    assert len(response.headers["x-request-id"]) == 36
+
+
+def test_success_responses_include_rate_limit_metadata(client: TestClient) -> None:
+    response = client.get("/v1/models")
+
+    assert response.headers["x-ratelimit-limit-requests"] == "20"
+    assert response.headers["x-ratelimit-remaining-requests"] == "19"
+    assert int(response.headers["x-ratelimit-reset-requests"]) > int(time.time())
+
+
+def test_rate_limit_returns_retry_metadata(client: TestClient) -> None:
+    for _ in range(20):
+        response = client.get("/v1/models")
+        assert response.status_code == 200
+
+    response = client.get("/v1/models")
+
+    assert response.status_code == 429
+    assert response.json()["error"]["code"] == "rate_limit_exceeded"
+    assert response.headers["x-ratelimit-remaining-requests"] == "0"
+    assert 1 <= int(response.headers["retry-after"]) <= 60
+
+
+def test_readiness_reports_dependency_state(client: TestClient) -> None:
+    response = client.get("/readyz")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ready", "components": {}}
+
+
+def test_unhandled_api_errors_use_safe_openai_shape(client: TestClient) -> None:
+    async def broken_send(*args, **kwargs):
+        raise RuntimeError("sensitive internal detail")
+
+    client.app.state.http.send = broken_send
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "dual-model", "messages": []},
+    )
+
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "internal_error"
+    assert "sensitive" not in response.text
+    assert response.headers["x-request-id"]
 
 
 def test_rejects_oversized_body_before_proxying(

@@ -10,7 +10,7 @@
 - Rate limit: 60 requests per minute per API key
 - OpenAI automatic tool choice: enabled with the vLLM Hermes parser
 
-The public edge is Cloud Run with Google-managed HTTPS. Managed API keys are created in the OpenSoftware-login dashboard and stored as SHA-256 hashes in Firestore. The service uses TLS-authenticated Memorystore for rate limits and reaches vLLM through a private internal GKE load balancer.
+The public edge uses a global Google HTTPS load balancer, Certificate Manager, and Cloud Armor in front of Cloud Run. Managed API keys are created in the OpenSoftware-login dashboard and stored as SHA-256 hashes in Firestore. The service uses TLS-authenticated Memorystore for rate limits and reaches vLLM through a private internal GKE load balancer.
 
 Create a key at `https://api.opensoftware.co/dashboard`. Set its expiration and optional lifetime spend limit. The raw key is displayed once; only the prefix and hash are retained. Use the key only from a server-side application. Do not embed it in browser JavaScript or a mobile binary.
 
@@ -62,7 +62,13 @@ Successful model responses currently include:
 ```text
 X-Compute-Privacy: confidential
 X-Model-Backend: confidential-vllm-cpu
+X-Request-ID: 62de42e8-42ea-45a7-99c3-b1f3efb15ea7
+X-RateLimit-Limit-Requests: 60
+X-RateLimit-Remaining-Requests: 59
+X-RateLimit-Reset-Requests: 1783708800
 ```
+
+`X-RateLimit-Reset-Requests` is a Unix timestamp. A `429` response also includes `Retry-After`. Supply your own safe `X-Request-ID` (letters, digits, `.`, `_`, `:`, `/`, or `-`, up to 128 characters) to correlate an API error with support; otherwise the gateway creates one.
 
 The L4 backend remains configured, but all three L4 zones in `us-central1` reported temporary capacity stockout during public deployment. Switch the Cloud Run model-config secret back to the private L4 load balancer after L4 capacity becomes available.
 

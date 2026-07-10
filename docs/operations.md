@@ -1,31 +1,80 @@
-# Operations and productization
+# Production operations
 
-## Deployment order
+## Service objectives
 
-1. Apply Terraform with both GPU pools disabled and verify the private GKE control plane path.
-2. Push the gateway image and deploy the gateway plus Redis connectivity.
-3. Enable the L4 pool, deploy one small model, and test OpenAI SDK compatibility and streaming.
-4. Optionally validate strict routing on the lower-cost C3 + TDX pool with the `standard-smoke` overlay.
-5. Secure preemptible H100 quota in a supported zone, enable the confidential GPU pool, and verify both the TDX and H100 node labels.
-6. Validate that deleting/tainting the TDX nodes makes `required` requests fail closed.
-7. Publish the Cloud Run edge at `api.opensoftware.co`, register it in OpenSoftware Accounts, and enable Firestore key management and Credit wallet settlement.
-8. Add Cloudflare WAF rules, alerting, and SLOs before broad public access.
+- Public control-plane availability target: 99.9% per calendar month.
+- Confidential model availability is reported separately and is not included in the control-plane SLO while capacity uses a single TDX pool.
+- The API never silently downgrades a request whose `X-Confidential-Compute` value is `required`.
+- Prompts, completions, bearer tokens, wallet grants, and full request URLs must never appear in logs, metrics, traces, or support tickets.
 
-## Minimum alerts
+## Release process
 
-- Gateway 5xx and 429 rate
-- Per-backend time to first token and completion latency
-- Pending GPU pods and unavailable confidential capacity
-- Redis connectivity/failures
-- Model load failures and GPU Xid errors
-- API authentication failure spikes
+The `Deploy production` GitHub workflow is manually dispatched from `main`. It authenticates with GCP Workload Identity Federation, builds an SBOM/provenance-attested image, pushes it to Artifact Registry, and deploys the image by digest to a zero-traffic candidate revision. It promotes the revision only after:
 
-Metrics and traces must never include prompts, completions, raw authorization headers, or full request URLs.
+1. `/readyz` confirms Redis and Firestore access.
+2. An authenticated `/v1/models` call succeeds with the dedicated smoke key.
+3. The public readiness endpoint succeeds after traffic promotion.
 
-## Commercial API roadmap
+The previous revision remains available for rollback:
 
-1. Model health/capacity-aware routing, circuit breaking, and admission control
-2. Signed model/image supply chain and attestation-backed key release
-3. Multi-zone standard capacity and a published confidential-capacity policy
-4. Abuse automation, customer audit exports, and administrator controls
-5. Additional OpenAI endpoints such as Responses, audio, reranking, and image generation
+```bash
+gcloud run revisions list \
+  --service=sovereign-api \
+  --region=us-central1 \
+  --project=autonomous-lab-490610
+
+gcloud run services update-traffic sovereign-api \
+  --region=us-central1 \
+  --project=autonomous-lab-490610 \
+  --to-revisions=REVISION_NAME=100
+```
+
+Do not deploy mutable tags. Terraform owns service configuration and CI owns the digest-pinned application revision.
+
+## Alerts
+
+Terraform creates an external readiness check and policies for sustained 5xx responses, readiness failures, and wallet settlement failures. Alert notifications go to the configured operations channel. The next alert set should cover Redis memory pressure, pending inference pods, model load failures, GPU Xid events, authentication failure spikes, and time-to-first-token by backend.
+
+On any alert:
+
+1. Confirm scope and copy one `X-Request-ID`; never copy the request body or API key.
+2. Check Cloud Run revision traffic and structured `event` logs.
+3. Check `/readyz`, Redis availability, and the selected model pod.
+4. Roll back the gateway if the incident began with a release.
+5. If the model is unhealthy, fail the affected privacy mode closed rather than silently changing its privacy class.
+6. Record customer impact, start/end times, and corrective actions in the incident review.
+
+## Billing reconciliation
+
+Wallet charges use `inference:<billing_id>` as an idempotency key and are retried three times. A `wallet_charge_failed` event means inference was delivered and local usage settled, but the wallet charge did not confirm. Re-run only the idempotent charge for that billing ID after verifying its Firestore usage event. Never synthesize a new billing ID for the same usage.
+
+## Key compromise
+
+1. Revoke the key in the dashboard; revocation is effective on the next authenticated request.
+2. Search request metadata by key ID or fingerprint, never by raw key.
+3. Rotate any upstream credential if there is evidence it was exposed.
+4. Preserve security logs and notify the owner using the account email.
+
+## Edge and denial-of-service controls
+
+Cloud Armor throttles `/v1/*` at 600 requests per source IP per minute. This is intentionally looser than the 60 RPM per-key Redis limit and exists only to protect availability. Tune it from observed traffic before adding bans. Do not enable body-inspecting WAF rules on model prompts without a privacy and false-positive review.
+
+The Cloud Run service must use `INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER` after load-balancer DNS cutover so its default URL cannot bypass Cloud Armor.
+
+## Capacity and shutdown
+
+The gateway keeps one Cloud Run instance warm and can scale to ten. Model compute scales independently and remains the bottleneck. Stop model charges without deleting data:
+
+```bash
+kubectl -n inference scale deployment/confidential-vllm-cpu --replicas=0
+gcloud container clusters resize sovereign-inference \
+  --node-pool=confidential-cpu-tdx \
+  --num-nodes=0 \
+  --region=us-central1 \
+  --project=autonomous-lab-490610 \
+  --quiet
+```
+
+## Backup and recovery
+
+Terraform state is stored in a versioned GCS backend. Secret Manager retains secret versions; Firestore is the system of record for keys and metering. Before broad commercial launch, schedule Firestore exports to a retention-locked bucket and test restore into a separate project. Never restore an expired or revoked key to active status.

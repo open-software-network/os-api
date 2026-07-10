@@ -35,3 +35,19 @@ output "get_credentials_command" {
 output "public_api_url" {
   value = try(google_cloud_run_v2_service.public_api[0].uri, null)
 }
+
+output "production_edge_ip" {
+  value = try(google_compute_global_address.public_api[0].address, null)
+}
+
+output "production_edge_dns_authorization" {
+  value = try(google_certificate_manager_dns_authorization.public_api[0].dns_resource_record[0], null)
+}
+
+output "github_workload_identity_provider" {
+  value = try(google_iam_workload_identity_pool_provider.github[0].name, null)
+}
+
+output "github_deployer_service_account" {
+  value = try(google_service_account.github_deployer[0].email, null)
+}

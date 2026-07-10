@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -52,6 +53,7 @@ class BillingContext:
 PrivacyPreference = Literal["required", "preferred", "disabled"]
 PROXY_PATHS = {"chat/completions", "completions", "embeddings"}
 PACKAGE_DIR = Path(__file__).resolve().parent
+REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 
 
 def _settings() -> tuple[
@@ -101,7 +103,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app() -> FastAPI:
     app = FastAPI(
         title="OpenSoftware API",
-        version="0.2.0",
+        version="0.3.0",
         docs_url=None,
         redoc_url=None,
         lifespan=lifespan,
@@ -110,22 +112,66 @@ def create_app() -> FastAPI:
 
     @app.middleware("http")
     async def request_context(request: Request, call_next: Any) -> Response:
-        request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+        supplied_request_id = request.headers.get("x-request-id", "")
+        request_id = (
+            supplied_request_id
+            if REQUEST_ID_PATTERN.fullmatch(supplied_request_id)
+            else str(uuid.uuid4())
+        )
         request.state.request_id = request_id
         started = time.monotonic()
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        except Exception:
+            logger.exception(
+                json.dumps(
+                    {
+                        "severity": "ERROR",
+                        "event": "unhandled_exception",
+                        "request_id": request_id,
+                        "method": request.method,
+                        "path": request.url.path,
+                    },
+                    separators=(",", ":"),
+                )
+            )
+            if request.url.path.startswith("/v1/"):
+                response = openai_error(
+                    500,
+                    "An internal error occurred",
+                    error_type="server_error",
+                    code="internal_error",
+                )
+            else:
+                response = JSONResponse(
+                    status_code=500,
+                    content={"error": "internal_error", "request_id": request_id},
+                )
         response.headers["x-request-id"] = request_id
         response.headers["x-content-type-options"] = "nosniff"
         response.headers["referrer-policy"] = "strict-origin-when-cross-origin"
         response.headers["permissions-policy"] = "camera=(), microphone=(), geolocation=()"
+        if os.getenv("APP_ORIGIN", "").startswith("https://"):
+            response.headers["strict-transport-security"] = "max-age=31536000; includeSubDomains"
         response.headers["content-security-policy"] = (
             "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; "
             "form-action 'self'; img-src 'self' data: https:; style-src 'self'; "
             "script-src 'self'; connect-src 'self'"
         )
+        if request.url.path.startswith(("/auth/", "/api/", "/dashboard")):
+            response.headers["cache-control"] = "no-store"
+        if hasattr(request.state, "rate_limit_remaining"):
+            response.headers["x-ratelimit-limit-requests"] = str(request.app.state.limiter.limit)
+            response.headers["x-ratelimit-remaining-requests"] = str(
+                request.state.rate_limit_remaining
+            )
+            response.headers["x-ratelimit-reset-requests"] = str(
+                request.state.rate_limit_reset
+            )
         logger.info(
             json.dumps(
                 {
+                    "severity": "INFO",
                     "event": "http_request",
                     "request_id": request_id,
                     "method": request.method,
@@ -144,12 +190,26 @@ def create_app() -> FastAPI:
 
     @app.get("/readyz", include_in_schema=False)
     async def readyz(request: Request) -> Response:
+        components: dict[str, str] = {}
         if request.app.state.redis:
             try:
                 await request.app.state.redis.ping()
             except Exception:
-                return JSONResponse(status_code=503, content={"status": "not_ready"})
-        return JSONResponse(content={"status": "ready"})
+                components["redis"] = "unavailable"
+            else:
+                components["redis"] = "ready"
+        if request.app.state.managed_keys:
+            try:
+                await request.app.state.managed_keys.healthcheck()
+            except Exception:
+                components["firestore"] = "unavailable"
+            else:
+                components["firestore"] = "ready"
+        status = "ready" if all(value == "ready" for value in components.values()) else "not_ready"
+        return JSONResponse(
+            status_code=200 if status == "ready" else 503,
+            content={"status": status, "components": components},
+        )
 
     @app.get("/v1/models")
     async def models(request: Request) -> Response:
@@ -194,8 +254,23 @@ def create_app() -> FastAPI:
 
         max_request_bytes = int(os.getenv("MAX_REQUEST_BYTES", "10485760"))
         content_length = request.headers.get("content-length")
-        if content_length and int(content_length) > max_request_bytes:
-            return openai_error(413, "Request body is too large", code="request_too_large")
+        if content_length:
+            try:
+                declared_length = int(content_length)
+            except ValueError:
+                return openai_error(
+                    400,
+                    "Content-Length must be an integer",
+                    code="invalid_request",
+                )
+            if declared_length < 0:
+                return openai_error(
+                    400,
+                    "Content-Length cannot be negative",
+                    code="invalid_request",
+                )
+            if declared_length > max_request_bytes:
+                return openai_error(413, "Request body is too large", code="request_too_large")
         raw = await request.body()
         if len(raw) > max_request_bytes:
             return openai_error(413, "Request body is too large", code="request_too_large")
@@ -251,11 +326,30 @@ def create_app() -> FastAPI:
         )
         try:
             upstream = await request.app.state.http.send(upstream_request, stream=parsed.stream)
+        except httpx.TimeoutException:
+            await _release_billing(request, billing, "backend_timeout")
+            logger.exception(
+                json.dumps(
+                    {
+                        "severity": "ERROR",
+                        "event": "upstream_timeout",
+                        "request_id": request.state.request_id,
+                        "backend": backend.name,
+                    }
+                )
+            )
+            return openai_error(
+                504,
+                "The selected inference backend timed out",
+                error_type="server_error",
+                code="backend_timeout",
+            )
         except httpx.HTTPError:
             await _release_billing(request, billing, "backend_unavailable")
             logger.exception(
                 json.dumps(
                     {
+                        "severity": "ERROR",
                         "event": "upstream_unavailable",
                         "request_id": request.state.request_id,
                         "backend": backend.name,
@@ -343,6 +437,9 @@ async def _authorize(request: Request) -> Response | None:
             error_type="server_error",
             code="rate_limiter_unavailable",
         )
+    reset_at = (int(time.time()) // 60 + 1) * 60
+    request.state.rate_limit_remaining = remaining
+    request.state.rate_limit_reset = reset_at
     if not allowed:
         response = openai_error(
             429,
@@ -350,11 +447,9 @@ async def _authorize(request: Request) -> Response | None:
             error_type="rate_limit_error",
             code="rate_limit_exceeded",
         )
-        response.headers["x-ratelimit-remaining-requests"] = "0"
-        response.headers["retry-after"] = "60"
+        response.headers["retry-after"] = str(max(1, reset_at - int(time.time())))
         return response
     request.state.principal = principal
-    request.state.rate_limit_remaining = remaining
     return None
 
 
@@ -394,7 +489,19 @@ async def _prepare_billing(
         request.state.request_id,
     )
     if decision.reason:
-        await repository.release(principal.key_id, billing_id, "wallet_denied")
+        unavailable = decision.reason == "accounts_unavailable"
+        await repository.release(
+            principal.key_id,
+            billing_id,
+            "billing_service_unavailable" if unavailable else "wallet_denied",
+        )
+        if unavailable:
+            return openai_error(
+                503,
+                "The billing service is temporarily unavailable",
+                error_type="server_error",
+                code="billing_service_unavailable",
+            )
         return openai_error(
             402,
             "Your OpenSoftware account does not have enough credits",
@@ -455,6 +562,7 @@ async def _settle_billing(
             logger.error(
                 json.dumps(
                     {
+                        "severity": "ERROR",
                         "event": "wallet_charge_failed",
                         "request_id": request.state.request_id,
                         "billing_id": billing.billing_id,

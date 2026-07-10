@@ -18,6 +18,9 @@ This repository is an original infrastructure implementation. It does not copy V
 - Per-model standard/confidential routing with a no-downgrade guarantee
 - vLLM backends and GKE manifests for L4 and confidential H100 nodes
 - Terraform for a private GKE cluster, GPU node pools, VPC/NAT, Artifact Registry, Memorystore, and Secret Manager
+- Global HTTPS load balancer, Certificate Manager, Cloud Armor, uptime checks, and billing/5xx alerts
+- Keyless GitHub deployments with a zero-traffic candidate smoke test and digest-pinned promotion
+- Dependency auditing, a lockfile-enforced container build, liveness probes, and warm gateway capacity
 
 The standard L4 path and strict confidential routing on an Intel TDX node have both been exercised against real GCP resources; see [the live test record](docs/live-test.md). The production H100 + TDX path remains quota-gated.
 
@@ -77,7 +80,7 @@ Create a real key with `python scripts/create_api_key.py TENANT_ID`; put only th
 4. Run Terraform from `deploy/terraform`.
 5. Create the Kubernetes secrets described in `deploy/kubernetes/base/secrets.example.yaml`; never commit their values.
 6. Update the two model IDs/images in the manifests, then run `kubectl apply -k deploy/kubernetes/base`.
-7. Put a managed HTTPS load balancer/API edge in front of the gateway service before exposing it publicly.
+7. Enable the global HTTPS load balancer and complete the Certificate Manager DNS authorization before restricting Cloud Run ingress.
 
 The confidential node pool is disabled by default because GCP rejects creation without zone-specific preemptible H100 quota. Enable it only after quota and capacity are confirmed:
 
