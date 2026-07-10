@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import time
 
@@ -22,6 +23,42 @@ def test_public_home_and_docs_render(client: TestClient) -> None:
     assert "Open models" in home.text
     assert docs.status_code == 200
     assert "Developer docs" in docs.text
+
+
+def test_site_basic_auth_does_not_replace_api_key_auth(
+    client: TestClient, monkeypatch
+) -> None:
+    monkeypatch.setenv("SITE_BASIC_AUTH_USERNAME", "alongside")
+    monkeypatch.setenv("SITE_BASIC_AUTH_PASSWORD", "test-password")
+
+    missing = client.get("/", headers={"Authorization": ""})
+    wrong = client.get(
+        "/docs",
+        headers={"Authorization": _basic_auth("alongside", "wrong")},
+    )
+    allowed = client.get(
+        "/dashboard",
+        headers={"Authorization": _basic_auth("alongside", "test-password")},
+        follow_redirects=False,
+    )
+    api = client.get("/v1/models")
+    readiness = client.get("/readyz", headers={"Authorization": ""})
+
+    assert missing.status_code == 401
+    assert missing.headers["www-authenticate"] == (
+        'Basic realm="OpenSoftware API", charset="UTF-8"'
+    )
+    assert missing.headers["cache-control"] == "no-store"
+    assert wrong.status_code == 401
+    assert allowed.status_code == 303
+    assert allowed.headers["location"] == "/auth/start"
+    assert api.status_code == 200
+    assert readiness.status_code == 200
+
+
+def _basic_auth(username: str, password: str) -> str:
+    encoded = base64.b64encode(f"{username}:{password}".encode()).decode()
+    return f"Basic {encoded}"
 
 
 def test_lists_models_and_privacy_modes(client: TestClient) -> None:

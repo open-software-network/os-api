@@ -127,6 +127,7 @@ resource "google_secret_manager_secret" "runtime" {
     "gateway-redis-url",
     "os-accounts-app-api-key",
     "os-accounts-client-id",
+    "site-basic-auth-password",
     "standard-vllm-api-key",
     "confidential-vllm-api-key",
     "huggingface-token",
@@ -163,6 +164,7 @@ resource "google_secret_manager_secret_iam_member" "api_runtime" {
     "gateway-redis-url",
     "os-accounts-app-api-key",
     "os-accounts-client-id",
+    "site-basic-auth-password",
   ])
 
   project   = var.project_id
@@ -247,10 +249,15 @@ resource "google_cloud_run_v2_service" "public_api" {
         value = "https://accounts-api.opensoftware.co"
       }
 
+      env {
+        name  = "SITE_BASIC_AUTH_USERNAME"
+        value = "alongside"
+      }
+
       # Bump when a `latest` runtime secret changes to force a fresh revision.
       env {
         name  = "RUNTIME_CONFIG_VERSION"
-        value = "8"
+        value = "9"
       }
 
       env {
@@ -288,6 +295,16 @@ resource "google_cloud_run_v2_service" "public_api" {
         value_source {
           secret_key_ref {
             secret  = google_secret_manager_secret.runtime["os-accounts-app-api-key"].secret_id
+            version = "latest"
+          }
+        }
+      }
+
+      env {
+        name = "SITE_BASIC_AUTH_PASSWORD"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.runtime["site-basic-auth-password"].secret_id
             version = "latest"
           }
         }

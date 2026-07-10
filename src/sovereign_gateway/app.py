@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import os
 import re
+import secrets
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -54,6 +57,47 @@ PrivacyPreference = Literal["required", "preferred", "disabled"]
 PROXY_PATHS = {"chat/completions", "completions", "embeddings"}
 PACKAGE_DIR = Path(__file__).resolve().parent
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+SITE_AUTH_EXEMPT_PATHS = frozenset({"/healthz", "/readyz", "/v1"})
+
+
+def _site_auth_protects_path(path: str) -> bool:
+    return path not in SITE_AUTH_EXEMPT_PATHS and not path.startswith("/v1/")
+
+
+def _site_basic_auth_error(request: Request) -> Response | None:
+    expected_username = os.getenv("SITE_BASIC_AUTH_USERNAME", "")
+    expected_password = os.getenv("SITE_BASIC_AUTH_PASSWORD", "")
+    if not expected_username and not expected_password:
+        return None
+    if not _site_auth_protects_path(request.url.path):
+        return None
+
+    authorization = request.headers.get("authorization", "")
+    scheme, _, encoded = authorization.partition(" ")
+    if scheme.lower() == "basic" and encoded:
+        try:
+            decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError):
+            decoded = ""
+        username, separator, password = decoded.partition(":")
+        if (
+            separator
+            and expected_username
+            and expected_password
+            and secrets.compare_digest(username.encode(), expected_username.encode())
+            and secrets.compare_digest(password.encode(), expected_password.encode())
+        ):
+            return None
+
+    return Response(
+        content="Authentication required\n",
+        status_code=401,
+        media_type="text/plain",
+        headers={
+            "www-authenticate": 'Basic realm="OpenSoftware API", charset="UTF-8"',
+            "cache-control": "no-store",
+        },
+    )
 
 
 def _settings() -> tuple[
@@ -103,7 +147,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app() -> FastAPI:
     app = FastAPI(
         title="OpenSoftware API",
-        version="0.3.0",
+        version="0.3.1",
         docs_url=None,
         redoc_url=None,
         lifespan=lifespan,
@@ -120,33 +164,35 @@ def create_app() -> FastAPI:
         )
         request.state.request_id = request_id
         started = time.monotonic()
-        try:
-            response = await call_next(request)
-        except Exception:
-            logger.exception(
-                json.dumps(
-                    {
-                        "severity": "ERROR",
-                        "event": "unhandled_exception",
-                        "request_id": request_id,
-                        "method": request.method,
-                        "path": request.url.path,
-                    },
-                    separators=(",", ":"),
+        response = _site_basic_auth_error(request)
+        if response is None:
+            try:
+                response = await call_next(request)
+            except Exception:
+                logger.exception(
+                    json.dumps(
+                        {
+                            "severity": "ERROR",
+                            "event": "unhandled_exception",
+                            "request_id": request_id,
+                            "method": request.method,
+                            "path": request.url.path,
+                        },
+                        separators=(",", ":"),
+                    )
                 )
-            )
-            if request.url.path.startswith("/v1/"):
-                response = openai_error(
-                    500,
-                    "An internal error occurred",
-                    error_type="server_error",
-                    code="internal_error",
-                )
-            else:
-                response = JSONResponse(
-                    status_code=500,
-                    content={"error": "internal_error", "request_id": request_id},
-                )
+                if request.url.path.startswith("/v1/"):
+                    response = openai_error(
+                        500,
+                        "An internal error occurred",
+                        error_type="server_error",
+                        code="internal_error",
+                    )
+                else:
+                    response = JSONResponse(
+                        status_code=500,
+                        content={"error": "internal_error", "request_id": request_id},
+                    )
         response.headers["x-request-id"] = request_id
         response.headers["x-content-type-options"] = "nosniff"
         response.headers["referrer-policy"] = "strict-origin-when-cross-origin"
@@ -158,7 +204,12 @@ def create_app() -> FastAPI:
             "form-action 'self'; img-src 'self' data: https:; style-src 'self'; "
             "script-src 'self'; connect-src 'self'"
         )
-        if request.url.path.startswith(("/auth/", "/api/", "/dashboard")):
+        site_auth_configured = bool(
+            os.getenv("SITE_BASIC_AUTH_USERNAME") or os.getenv("SITE_BASIC_AUTH_PASSWORD")
+        )
+        if request.url.path.startswith(("/auth/", "/api/", "/dashboard")) or (
+            site_auth_configured and _site_auth_protects_path(request.url.path)
+        ):
             response.headers["cache-control"] = "no-store"
         if hasattr(request.state, "rate_limit_remaining"):
             response.headers["x-ratelimit-limit-requests"] = str(request.app.state.limiter.limit)

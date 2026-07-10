@@ -12,6 +12,7 @@ This repository is an original infrastructure implementation. It does not copy V
 - `POST /v1/embeddings`
 - SSE streaming without buffering prompts or generated tokens
 - OpenSoftware Accounts login with PKCE and server-side rotating sessions
+- HTTP Basic protection for the human-facing site without changing API-key authentication
 - Firestore-backed API keys with expiration, revocation, hard spend limits, and usage history
 - OpenSoftware Credit wallet authorization and idempotent settlement
 - SHA-256-hashed credentials and Redis-backed request limits

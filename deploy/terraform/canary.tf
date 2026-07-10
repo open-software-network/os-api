@@ -71,8 +71,13 @@ resource "google_cloud_run_v2_service" "api_canary" {
       }
 
       env {
+        name  = "SITE_BASIC_AUTH_USERNAME"
+        value = "alongside"
+      }
+
+      env {
         name  = "RUNTIME_CONFIG_VERSION"
-        value = "8"
+        value = "9"
       }
 
       env {
@@ -110,6 +115,16 @@ resource "google_cloud_run_v2_service" "api_canary" {
         value_source {
           secret_key_ref {
             secret  = google_secret_manager_secret.runtime["os-accounts-app-api-key"].secret_id
+            version = "latest"
+          }
+        }
+      }
+
+      env {
+        name = "SITE_BASIC_AUTH_PASSWORD"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.runtime["site-basic-auth-password"].secret_id
             version = "latest"
           }
         }

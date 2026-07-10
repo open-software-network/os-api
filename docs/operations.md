@@ -55,6 +55,10 @@ Wallet charges use `inference:<billing_id>` as an idempotency key and are retrie
 3. Rotate any upstream credential if there is evidence it was exposed.
 4. Preserve security logs and notify the owner using the account email.
 
+## Site access gate
+
+The human-facing site, docs, dashboard, login callbacks, and dashboard JSON routes use HTTP Basic authentication when `SITE_BASIC_AUTH_USERNAME` and `SITE_BASIC_AUTH_PASSWORD` are configured. The password is stored in the `site-basic-auth-password` Secret Manager secret. `/v1/*`, `/healthz`, and `/readyz` are intentionally exempt so API-key clients and infrastructure probes continue to work. Rotate the site password by adding a new secret version and bumping `RUNTIME_CONFIG_VERSION` in both Cloud Run services.
+
 ## Edge and denial-of-service controls
 
 Cloud Armor throttles `/v1/*` at 600 requests per source IP per minute. This is intentionally looser than the 60 RPM per-key Redis limit and exists only to protect availability. Tune it from observed traffic before adding bans. Do not enable body-inspecting WAF rules on model prompts without a privacy and false-positive review.

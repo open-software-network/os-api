@@ -61,6 +61,8 @@ models:
     monkeypatch.setenv("TEE_UPSTREAM_KEY", "internal-secret")
     monkeypatch.setenv("REQUESTS_PER_MINUTE", "20")
     monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("SITE_BASIC_AUTH_USERNAME", raising=False)
+    monkeypatch.delenv("SITE_BASIC_AUTH_PASSWORD", raising=False)
 
     def upstream(request: httpx.Request) -> httpx.Response:
         upstream_requests.append(request)
