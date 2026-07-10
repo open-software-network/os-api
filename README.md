@@ -18,7 +18,7 @@ This repository is an original infrastructure implementation. It does not copy V
 - Per-model standard/confidential routing with a no-downgrade guarantee
 - vLLM backends and GKE manifests for L4 and confidential H100 nodes
 - Terraform for a private GKE cluster, GPU node pools, VPC/NAT, Artifact Registry, Memorystore, and Secret Manager
-- Global HTTPS load balancer, Certificate Manager, Cloud Armor, uptime checks, and billing/5xx alerts
+- Live global HTTPS load balancer, Certificate Manager, Cloud Armor, uptime checks, and billing/5xx alerts; direct Cloud Run ingress is blocked
 - Keyless GitHub deployments with a zero-traffic candidate smoke test and digest-pinned promotion
 - Dependency auditing, a lockfile-enforced container build, liveness probes, and warm gateway capacity
 

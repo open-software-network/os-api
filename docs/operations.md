@@ -59,7 +59,7 @@ Wallet charges use `inference:<billing_id>` as an idempotency key and are retrie
 
 Cloud Armor throttles `/v1/*` at 600 requests per source IP per minute. This is intentionally looser than the 60 RPM per-key Redis limit and exists only to protect availability. Tune it from observed traffic before adding bans. Do not enable body-inspecting WAF rules on model prompts without a privacy and false-positive review.
 
-The Cloud Run service must use `INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER` after load-balancer DNS cutover so its default URL cannot bypass Cloud Armor.
+Production DNS resolves `api.opensoftware.co` directly to the global load-balancer address `34.36.164.16` in DNS-only mode. Cloud Run uses `INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER`, the legacy Cloud Run domain mapping is removed, and the default `run.app` URL cannot bypass Cloud Armor. Keep the Certificate Manager DNS-authorization CNAME in place so certificate renewal continues to work.
 
 ## Capacity and shutdown
 
