@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gateway-models
+  namespace: inference
+data:
+  models.yaml: |
+    backends:
+      standard-vllm:
+        base_url: http://standard-vllm:8000
+        privacy: standard
+      confidential-vllm:
+        base_url: http://confidential-vllm:8000
+        privacy: confidential
+    models:
+      llama-3.1-8b-instruct:
+        upstream_model: meta-llama/Llama-3.1-8B-Instruct
+        standard_backend: standard-vllm
+        confidential_backend: confidential-vllm
+        owned_by: self-hosted
+        max_context_length: 8192
+        input_price_microusd_per_million: 100000
+        output_price_microusd_per_million: 200000

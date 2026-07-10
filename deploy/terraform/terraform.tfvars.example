@@ -1,0 +1,13 @@
+project_id             = "autonomous-lab-490610"
+region                 = "us-central1"
+system_node_zone       = "us-central1-a"
+standard_gpu_zones     = ["us-central1-a", "us-central1-b", "us-central1-c"]
+master_authorized_cidr = "203.0.113.10/32"
+
+# Enable only after confirming current zone availability and preemptible H100 quota.
+enable_confidential_gpu_pool = false
+enable_confidential_cpu_pool = false
+confidential_gpu_zone        = "us-central1-a"
+
+# Enable only after populating the Cloud Run model, API-key, and Redis secrets.
+enable_public_api = false

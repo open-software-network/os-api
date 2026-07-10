@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}OpenSoftware API — Private model infrastructure{% endblock %}
+{% block content %}
+<section class="hero shell">
+  <div class="eyebrow"><span class="status-dot"></span> Live on OpenSoftware infrastructure</div>
+  <h1>Open models.<br><span>One private API.</span></h1>
+  <p class="lede">Run OpenAI-compatible inference against models hosted by OpenSoftware on GCP, with confidential-compute routing when privacy has to be enforced.</p>
+  <div class="actions">
+    <a class="button primary" href="/auth/start">Login with OpenSoftware</a>
+    <a class="button secondary" href="/docs">Read the docs</a>
+  </div>
+  {% if request.query_params.get('auth') == 'failed' %}
+  <p class="notice error">Login could not be completed. Please try again.</p>
+  {% endif %}
+</section>
+
+<section class="feature-grid shell">
+  <article>
+    <span class="feature-number">01</span>
+    <h2>OpenAI compatible</h2>
+    <p>Point the OpenAI SDK at one base URL. Chat completions, streaming, models, tool calls, and standard error shapes work as expected.</p>
+  </article>
+  <article>
+    <span class="feature-number">02</span>
+    <h2>Keys you control</h2>
+    <p>Create scoped credentials, set an expiration date and hard spend ceiling, inspect usage, and revoke access instantly.</p>
+  </article>
+  <article>
+    <span class="feature-number">03</span>
+    <h2>Confidential routing</h2>
+    <p>Require a TEE backend per request. If confidential compute is unavailable, the gateway fails closed instead of silently downgrading.</p>
+  </article>
+</section>
+
+<section class="code-section shell">
+  <div>
+    <div class="eyebrow">A familiar interface</div>
+    <h2>Change the base URL.<br>Keep your code.</h2>
+  </div>
+  <pre><code>from openai import OpenAI
+
+client = OpenAI(
+    api_key="sk-os-…",
+    base_url="https://api.opensoftware.co/v1",
+)
+
+response = client.chat.completions.create(
+    model="qwen2.5-0.5b-instruct",
+    messages=[{"role": "user", "content": "Hello"}],
+)</code></pre>
+</section>
+{% endblock %}

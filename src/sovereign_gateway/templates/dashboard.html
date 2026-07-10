@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — OpenSoftware API{% endblock %}
+{% block content %}
+<section class="dashboard shell">
+  <div class="dashboard-head">
+    <div>
+      <div class="eyebrow">Developer dashboard</div>
+      <h1>API keys</h1>
+      <p>Signed in as {{ user.display_name or user.handle }}{% if user.email %} · {{ user.email }}{% endif %}</p>
+    </div>
+    <div class="account-actions">
+      {% if balance %}<span class="balance"><small>Credits</small>{{ balance.get('credits', 0) }}</span>{% endif %}
+      <button class="button ghost" id="logout-button">Log out</button>
+    </div>
+  </div>
+
+  <div id="key-reveal" class="key-reveal hidden" role="status">
+    <div>
+      <strong>Copy this key now</strong>
+      <span>It will never be shown again.</span>
+    </div>
+    <code id="new-key"></code>
+    <button class="button secondary" id="copy-key">Copy key</button>
+  </div>
+
+  <div class="dashboard-grid">
+    <section class="panel">
+      <div class="panel-title">
+        <div><h2>Your keys</h2><p>Only key prefixes are stored for display.</p></div>
+        <button class="button primary small" id="open-create">Create key</button>
+      </div>
+      <div id="keys" class="table-wrap"><div class="loading">Loading keys…</div></div>
+    </section>
+
+    <section class="panel usage-panel">
+      <div class="panel-title"><div><h2>Recent usage</h2><p>Metered by model response tokens.</p></div></div>
+      <div id="usage" class="usage-list"><div class="loading">Loading usage…</div></div>
+    </section>
+  </div>
+</section>
+
+<dialog id="create-dialog">
+  <form id="create-form">
+    <div class="modal-head"><div><div class="eyebrow">New credential</div><h2>Create API key</h2></div><button type="button" class="close" id="close-create" aria-label="Close">×</button></div>
+    <label>Name<input name="name" required maxlength="64" value="My app" autocomplete="off"></label>
+    <label>Expiration
+      <select name="expires_in_days">
+        <option value="7">7 days</option><option value="30" selected>30 days</option><option value="90">90 days</option><option value="365">1 year</option><option value="">Never</option>
+      </select>
+    </label>
+    <label>Spend limit (USD)<span class="hint">Optional hard lifetime cap for this key.</span><input name="spend_limit_usd" type="number" min="0.01" max="10000" step="0.01" placeholder="10.00"></label>
+    <p id="form-error" class="notice error hidden"></p>
+    <button class="button primary full" type="submit">Create key</button>
+  </form>
+</dialog>
+{% endblock %}
+{% block scripts %}<script src="/static/dashboard.js" defer></script>{% endblock %}
