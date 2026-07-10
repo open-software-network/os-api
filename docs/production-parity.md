@@ -7,7 +7,7 @@ Production parity means the platform is ready for a broad commercial launch, not
 | API contract, login, key lifecycle, billing | Complete | OpenAI-compatible requests, fail-closed privacy routing, expiration/revocation, hard spend limits, idempotent settlement, and live smoke tests remain green. |
 | Edge and origin security | Complete | Managed TLS, Cloud Armor, direct-origin blocking, rate-based abuse bans, authentication-spike alerts, and documented threshold tuning. |
 | Customer auditability | Complete | Metadata-only key and inference events, JSONL/CSV export, retained backups, tenant-isolation coverage, CSV-injection defense, and a live managed-key canary are verified. |
-| Backup and recovery | In progress | Seven-day PITR and daily exports to a versioned, retention-protected bucket are automated; a successful restore drill into an isolated project remains required. |
+| Backup and recovery | Complete | Seven-day PITR, daily retained exports, backup-failure alerting, and an isolated restore drill with measured RPO/RTO and verified cleanup are in place. |
 | Multi-region control plane | Pending | At least two gateway regions behind health-based routing with no shared regional single point of failure and a documented failover drill. |
 | Model rollout safety | Pending | Digest-pinned model revisions, readiness and quality gates, canary traffic, automatic rollback, and version-visible responses. |
 | Capacity and admission control | Pending | Reserved or diversified GPU capacity, concurrency queues, overload responses, capacity alerts, and tested scale/failure behavior. |
