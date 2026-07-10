@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import math
 import os
 from dataclasses import dataclass
@@ -145,18 +146,24 @@ class AccountsClient:
         if not grant or not self.billing_enabled:
             return True
         credits = min(grant.cap_credits, max(1, math.ceil(max(0, actual_microusd) / 1_000)))
-        envelope = await self._json(
-            "/charge",
-            method="POST",
-            authorization=f"Bearer {self.app_api_key}",
-            request_id=request_id,
-            body={
-                "token": grant.token,
-                "credits": credits,
-                "idempotency_key": f"inference:{billing_id}",
-            },
-        )
-        return bool(envelope.get("success"))
+        body = {
+            "token": grant.token,
+            "credits": credits,
+            "idempotency_key": f"inference:{billing_id}",
+        }
+        for attempt in range(3):
+            envelope = await self._json(
+                "/charge",
+                method="POST",
+                authorization=f"Bearer {self.app_api_key}",
+                request_id=request_id,
+                body=body,
+            )
+            if envelope.get("success"):
+                return True
+            if attempt < 2:
+                await asyncio.sleep(0.1 * (2**attempt))
+        return False
 
     async def _json(
         self,

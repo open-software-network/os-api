@@ -4,19 +4,17 @@ locals {
     "compute.googleapis.com",
     "confidentialcomputing.googleapis.com",
     "container.googleapis.com",
+    "certificatemanager.googleapis.com",
     "firestore.googleapis.com",
+    "iam.googleapis.com",
     "iamcredentials.googleapis.com",
+    "logging.googleapis.com",
+    "monitoring.googleapis.com",
     "redis.googleapis.com",
     "run.googleapis.com",
     "secretmanager.googleapis.com",
     "siteverification.googleapis.com",
   ])
-}
-
-data "google_container_engine_versions" "region" {
-  location = var.region
-
-  depends_on = [google_project_service.required]
 }
 
 resource "google_project_service" "required" {
@@ -129,6 +127,7 @@ resource "google_secret_manager_secret" "runtime" {
     "gateway-redis-url",
     "os-accounts-app-api-key",
     "os-accounts-client-id",
+    "site-basic-auth-password",
     "standard-vllm-api-key",
     "confidential-vllm-api-key",
     "huggingface-token",
@@ -165,6 +164,7 @@ resource "google_secret_manager_secret_iam_member" "api_runtime" {
     "gateway-redis-url",
     "os-accounts-app-api-key",
     "os-accounts-client-id",
+    "site-basic-auth-password",
   ])
 
   project   = var.project_id
@@ -176,9 +176,13 @@ resource "google_secret_manager_secret_iam_member" "api_runtime" {
 resource "google_cloud_run_v2_service" "public_api" {
   count = var.enable_public_api ? 1 : 0
 
-  name                = "sovereign-api"
-  location            = var.region
-  ingress             = "INGRESS_TRAFFIC_ALL"
+  name     = "sovereign-api"
+  location = var.region
+  ingress = (
+    var.enable_production_edge && var.restrict_cloud_run_ingress
+    ? "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"
+    : "INGRESS_TRAFFIC_ALL"
+  )
   deletion_protection = true
   labels              = var.labels
 
@@ -189,8 +193,8 @@ resource "google_cloud_run_v2_service" "public_api" {
     timeout                          = "600s"
 
     scaling {
-      min_instance_count = 0
-      max_instance_count = 2
+      min_instance_count = var.public_api_min_instances
+      max_instance_count = var.public_api_max_instances
     }
 
     containers {
@@ -245,10 +249,15 @@ resource "google_cloud_run_v2_service" "public_api" {
         value = "https://accounts-api.opensoftware.co"
       }
 
+      env {
+        name  = "SITE_BASIC_AUTH_USERNAME"
+        value = "alongside"
+      }
+
       # Bump when a `latest` runtime secret changes to force a fresh revision.
       env {
         name  = "RUNTIME_CONFIG_VERSION"
-        value = "8"
+        value = "9"
       }
 
       env {
@@ -291,6 +300,16 @@ resource "google_cloud_run_v2_service" "public_api" {
         }
       }
 
+      env {
+        name = "SITE_BASIC_AUTH_PASSWORD"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.runtime["site-basic-auth-password"].secret_id
+            version = "latest"
+          }
+        }
+      }
+
       resources {
         limits = {
           cpu    = "1"
@@ -298,6 +317,30 @@ resource "google_cloud_run_v2_service" "public_api" {
         }
         cpu_idle          = true
         startup_cpu_boost = true
+      }
+
+      startup_probe {
+        initial_delay_seconds = 0
+        timeout_seconds       = 3
+        period_seconds        = 3
+        failure_threshold     = 20
+
+        http_get {
+          path = "/healthz"
+          port = 8080
+        }
+      }
+
+      liveness_probe {
+        initial_delay_seconds = 10
+        timeout_seconds       = 3
+        period_seconds        = 30
+        failure_threshold     = 3
+
+        http_get {
+          path = "/healthz"
+          port = 8080
+        }
       }
 
       volume_mounts {
@@ -350,6 +393,16 @@ resource "google_cloud_run_v2_service" "public_api" {
     google_project_iam_member.api_runtime_firestore,
     google_secret_manager_secret_iam_member.api_runtime,
   ]
+
+  # CI owns digest-pinned application rollouts after the service is bootstrapped.
+  lifecycle {
+    ignore_changes = [
+      client,
+      client_version,
+      template[0].containers[0].image,
+      template[0].revision,
+    ]
+  }
 }
 
 resource "google_cloud_run_v2_service_iam_member" "public_api" {
@@ -363,10 +416,10 @@ resource "google_cloud_run_v2_service_iam_member" "public_api" {
 }
 
 resource "google_cloud_run_domain_mapping" "public_api" {
-  count = var.enable_public_api ? 1 : 0
+  count = var.enable_public_api && var.enable_legacy_domain_mapping ? 1 : 0
 
   location = var.region
-  name     = "api.opensoftware.co"
+  name     = var.public_api_domain
 
   metadata {
     namespace = var.project_id
@@ -393,7 +446,6 @@ resource "google_container_cluster" "inference" {
   network    = google_compute_network.inference.id
   subnetwork = google_compute_subnetwork.gke.id
 
-  min_master_version       = data.google_container_engine_versions.region.latest_master_version
   remove_default_node_pool = true
   initial_node_count       = 1
   deletion_protection      = var.deletion_protection
@@ -450,6 +502,12 @@ resource "google_container_cluster" "inference" {
     google_project_service.required,
     google_project_iam_member.node_roles,
   ]
+
+  # The release channel owns patch upgrades; avoid coupling unrelated applies
+  # to the control plane's server-selected current version.
+  lifecycle {
+    ignore_changes = [min_master_version]
+  }
 }
 
 resource "google_container_node_pool" "system" {

@@ -1,0 +1,10 @@
+.git
+.github
+.pytest_cache
+.ruff_cache
+.venv
+deploy
+docs
+tests
+*.tfplan
+*.tfstate*

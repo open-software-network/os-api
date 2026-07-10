@@ -1,0 +1,136 @@
+name: Deploy production
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: os-api-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PROJECT_ID: autonomous-lab-490610
+  REGION: us-central1
+  SERVICE: sovereign-api
+  CANARY_SERVICE: sovereign-api-canary
+  IMAGE: us-central1-docker.pkg.dev/autonomous-lab-490610/sovereign-inference/gateway
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push immutable image
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=true \
+            --sbom=true \
+            --tag "${IMAGE}:${GITHUB_SHA}" \
+            --push \
+            .
+          digest="$(gcloud artifacts docker images describe "${IMAGE}:${GITHUB_SHA}" --format='value(image_summary.digest)')"
+          test -n "${digest}"
+          echo "reference=${IMAGE}@${digest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Deploy private canary
+        id: canary
+        shell: bash
+        run: |
+          set -euo pipefail
+          suffix="gh-${GITHUB_RUN_ID}"
+          gcloud run deploy "${CANARY_SERVICE}" \
+            --project "${PROJECT_ID}" \
+            --region "${REGION}" \
+            --image "${{ steps.image.outputs.reference }}" \
+            --revision-suffix "${suffix}" \
+            --quiet
+          canary_url="$(gcloud run services describe "${CANARY_SERVICE}" \
+            --project "${PROJECT_ID}" \
+            --region "${REGION}" \
+            --format='value(status.url)')"
+          test -n "${canary_url}"
+          echo "url=${canary_url}" >> "${GITHUB_OUTPUT}"
+
+      - name: Smoke test private canary
+        shell: bash
+        env:
+          CANARY_URL: ${{ steps.canary.outputs.url }}
+        run: |
+          set -euo pipefail
+          smoke_key="$(gcloud secrets versions access latest \
+            --project "${PROJECT_ID}" \
+            --secret smoke-client-api-key)"
+          echo "::add-mask::${smoke_key}"
+          identity_token="$(gcloud auth print-identity-token --audiences="${CANARY_URL}")"
+          echo "::add-mask::${identity_token}"
+          for attempt in {1..12}; do
+            if curl --fail --silent --show-error --max-time 15 \
+              -H "X-Serverless-Authorization: Bearer ${identity_token}" \
+              "${CANARY_URL}/readyz" >/dev/null; then
+              break
+            fi
+            if [[ "${attempt}" == "12" ]]; then
+              exit 1
+            fi
+            sleep 5
+          done
+          curl --fail --silent --show-error --max-time 30 \
+            -H "X-Serverless-Authorization: Bearer ${identity_token}" \
+            -H "Authorization: Bearer ${smoke_key}" \
+            "${CANARY_URL}/v1/models" \
+            | jq -e '.object == "list" and (.data | length > 0)' >/dev/null
+
+      - name: Deploy production revision without traffic
+        id: production
+        shell: bash
+        run: |
+          set -euo pipefail
+          suffix="gh-${GITHUB_RUN_ID}"
+          revision="${SERVICE}-${suffix}"
+          gcloud run deploy "${SERVICE}" \
+            --project "${PROJECT_ID}" \
+            --region "${REGION}" \
+            --image "${{ steps.image.outputs.reference }}" \
+            --revision-suffix "${suffix}" \
+            --no-traffic \
+            --quiet
+          echo "revision=${revision}" >> "${GITHUB_OUTPUT}"
+
+      - name: Promote production revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud run services update-traffic "${SERVICE}" \
+            --project "${PROJECT_ID}" \
+            --region "${REGION}" \
+            --to-revisions "${{ steps.production.outputs.revision }}=100" \
+            --quiet
+
+      - name: Verify public endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --max-time 30 https://api.opensoftware.co/readyz \
+            | jq -e '.status == "ready"' >/dev/null

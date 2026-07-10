@@ -72,6 +72,8 @@ class CreatedApiKey:
 
 
 class ManagedKeyRepository(Protocol):
+    async def healthcheck(self) -> None: ...
+
     async def authenticate(self, raw_key: str) -> Principal | None: ...
 
     async def create_key(
@@ -106,6 +108,9 @@ class InMemoryKeyRepository:
         self.records: dict[str, dict[str, Any]] = {}
         self.usage: dict[str, dict[str, Any]] = {}
         self._lock = asyncio.Lock()
+
+    async def healthcheck(self) -> None:
+        return None
 
     async def authenticate(self, raw_key: str) -> Principal | None:
         parsed = _parse_key(raw_key)
@@ -238,6 +243,12 @@ class FirestoreKeyRepository:
         self.client = firestore.Client(project=project or None)
         self.keys = self.client.collection(f"{prefix}_api_keys")
         self.usage = self.client.collection(f"{prefix}_usage")
+
+    async def healthcheck(self) -> None:
+        def probe() -> None:
+            next(iter(self.keys.limit(1).stream()), None)
+
+        await asyncio.to_thread(probe)
 
     async def authenticate(self, raw_key: str) -> Principal | None:
         parsed = _parse_key(raw_key)

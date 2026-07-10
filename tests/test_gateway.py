@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import json
+import time
 
 import httpx
 from fastapi.testclient import TestClient
@@ -21,6 +23,42 @@ def test_public_home_and_docs_render(client: TestClient) -> None:
     assert "Open models" in home.text
     assert docs.status_code == 200
     assert "Developer docs" in docs.text
+
+
+def test_site_basic_auth_does_not_replace_api_key_auth(
+    client: TestClient, monkeypatch
+) -> None:
+    monkeypatch.setenv("SITE_BASIC_AUTH_USERNAME", "alongside")
+    monkeypatch.setenv("SITE_BASIC_AUTH_PASSWORD", "test-password")
+
+    missing = client.get("/", headers={"Authorization": ""})
+    wrong = client.get(
+        "/docs",
+        headers={"Authorization": _basic_auth("alongside", "wrong")},
+    )
+    allowed = client.get(
+        "/dashboard",
+        headers={"Authorization": _basic_auth("alongside", "test-password")},
+        follow_redirects=False,
+    )
+    api = client.get("/v1/models")
+    readiness = client.get("/readyz", headers={"Authorization": ""})
+
+    assert missing.status_code == 401
+    assert missing.headers["www-authenticate"] == (
+        'Basic realm="OpenSoftware API", charset="UTF-8"'
+    )
+    assert missing.headers["cache-control"] == "no-store"
+    assert wrong.status_code == 401
+    assert allowed.status_code == 303
+    assert allowed.headers["location"] == "/auth/start"
+    assert api.status_code == 200
+    assert readiness.status_code == 200
+
+
+def _basic_auth(username: str, password: str) -> str:
+    encoded = base64.b64encode(f"{username}:{password}".encode()).decode()
+    return f"Basic {encoded}"
 
 
 def test_lists_models_and_privacy_modes(client: TestClient) -> None:
@@ -111,6 +149,57 @@ def test_request_id_is_preserved(client: TestClient) -> None:
     response = client.get("/healthz", headers={"X-Request-ID": "request-from-client"})
 
     assert response.headers["x-request-id"] == "request-from-client"
+
+
+def test_invalid_request_id_is_replaced(client: TestClient) -> None:
+    response = client.get("/healthz", headers={"X-Request-ID": "not valid with spaces"})
+
+    assert response.headers["x-request-id"] != "not valid with spaces"
+    assert len(response.headers["x-request-id"]) == 36
+
+
+def test_success_responses_include_rate_limit_metadata(client: TestClient) -> None:
+    response = client.get("/v1/models")
+
+    assert response.headers["x-ratelimit-limit-requests"] == "20"
+    assert response.headers["x-ratelimit-remaining-requests"] == "19"
+    assert int(response.headers["x-ratelimit-reset-requests"]) > int(time.time())
+
+
+def test_rate_limit_returns_retry_metadata(client: TestClient) -> None:
+    for _ in range(20):
+        response = client.get("/v1/models")
+        assert response.status_code == 200
+
+    response = client.get("/v1/models")
+
+    assert response.status_code == 429
+    assert response.json()["error"]["code"] == "rate_limit_exceeded"
+    assert response.headers["x-ratelimit-remaining-requests"] == "0"
+    assert 1 <= int(response.headers["retry-after"]) <= 60
+
+
+def test_readiness_reports_dependency_state(client: TestClient) -> None:
+    response = client.get("/readyz")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ready", "components": {}}
+
+
+def test_unhandled_api_errors_use_safe_openai_shape(client: TestClient) -> None:
+    async def broken_send(*args, **kwargs):
+        raise RuntimeError("sensitive internal detail")
+
+    client.app.state.http.send = broken_send
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "dual-model", "messages": []},
+    )
+
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "internal_error"
+    assert "sensitive" not in response.text
+    assert response.headers["x-request-id"]
 
 
 def test_rejects_oversized_body_before_proxying(
