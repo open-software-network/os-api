@@ -65,9 +65,9 @@ resource "google_compute_security_policy" "public_api" {
   type        = "CLOUD_ARMOR"
 
   rule {
-    action      = "throttle"
+    action      = "rate_based_ban"
     priority    = 1000
-    description = "Throttle abusive inference traffic per source IP; API-key quotas remain authoritative"
+    description = "Throttle abusive inference traffic and temporarily ban extreme sources; API-key quotas remain authoritative"
 
     match {
       expr {
@@ -84,6 +84,13 @@ resource "google_compute_security_policy" "public_api" {
         count        = 600
         interval_sec = 60
       }
+
+      ban_threshold {
+        count        = 1800
+        interval_sec = 60
+      }
+
+      ban_duration_sec = 600
     }
   }
 

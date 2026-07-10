@@ -39,6 +39,11 @@ async function loadUsage() {
   $("#usage").innerHTML = data.length ? data.slice(0, 12).map((row) => `<div class="usage-row"><div><strong>${escapeHtml(row.model || "Inference")}</strong><span>${date(row.created_at)} · ${escapeHtml(row.status)}</span></div><div><strong>${money(row.actual_microusd ?? row.estimate_microusd)}</strong><span>${Number(row.total_tokens || 0).toLocaleString()} tokens</span></div></div>`).join("") : `<div class="empty"><strong>No usage yet</strong><span>Completed API requests appear here.</span></div>`;
 }
 
+async function loadAudit() {
+  const { data } = await request("/api/audit?limit=20");
+  $("#audit").innerHTML = data.length ? data.map((event) => `<div class="usage-row"><div><strong>${escapeHtml(event.event_type)}</strong><span>${date(event.occurred_at)} · ${escapeHtml(event.key_id || event.model || "account")}</span></div><div><strong>${escapeHtml(event.status || "recorded")}</strong><span>${escapeHtml(event.request_id || event.billing_id || event.id)}</span></div></div>`).join("") : `<div class="empty"><strong>No audit events yet</strong><span>Key changes and completed inference requests appear here.</span></div>`;
+}
+
 $("#open-create").addEventListener("click", () => dialog.showModal());
 $("#close-create").addEventListener("click", () => dialog.close());
 $("#create-form").addEventListener("submit", async (event) => {
@@ -54,7 +59,7 @@ $("#create-form").addEventListener("submit", async (event) => {
     dialog.close();
     $("#new-key").textContent = created.data.key;
     $("#key-reveal").classList.remove("hidden");
-    await Promise.all([loadKeys(), loadUsage()]);
+    await Promise.all([loadKeys(), loadUsage(), loadAudit()]);
   } catch (err) {
     error.textContent = err.message;
     error.classList.remove("hidden");
@@ -69,6 +74,6 @@ $("#logout-button").addEventListener("click", async () => {
   window.location.href = "/";
 });
 
-Promise.all([loadKeys(), loadUsage()]).catch((error) => {
+Promise.all([loadKeys(), loadUsage(), loadAudit()]).catch((error) => {
   $("#keys").innerHTML = `<div class="notice error">${escapeHtml(error.message)}</div>`;
 });

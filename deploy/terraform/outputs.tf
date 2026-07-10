@@ -55,3 +55,11 @@ output "github_workload_identity_provider" {
 output "github_deployer_service_account" {
   value = try(google_service_account.github_deployer[0].email, null)
 }
+
+output "firestore_backup_bucket" {
+  value = try(google_storage_bucket.firestore_backups[0].name, null)
+}
+
+output "firestore_backup_scheduler_job" {
+  value = try(google_cloud_scheduler_job.firestore_export[0].id, null)
+}

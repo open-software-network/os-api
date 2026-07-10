@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import base64
+import csv
 import hashlib
+import io
+import json
 import os
 import secrets
 from dataclasses import dataclass
@@ -245,6 +248,57 @@ async def api_usage(request: Request) -> Response:
     return response
 
 
+@router.get("/api/audit", include_in_schema=False)
+async def api_audit(request: Request, limit: int = 100) -> Response:
+    session = await _session(request)
+    repository = _repository(request)
+    if not session:
+        return JSONResponse({"error": "authentication_required"}, status_code=401)
+    if not repository:
+        return JSONResponse({"error": "key_management_unavailable"}, status_code=503)
+    response = JSONResponse(
+        {"data": await repository.list_audit_events(session.user.id, _audit_limit(limit))}
+    )
+    if session.rotated:
+        _set_session_cookies(response, session.rotated)
+    return response
+
+
+@router.get("/api/audit/export", include_in_schema=False)
+async def api_audit_export(request: Request, format: str = "jsonl") -> Response:
+    session = await _session(request)
+    repository = _repository(request)
+    if not session:
+        return JSONResponse({"error": "authentication_required"}, status_code=401)
+    if not repository:
+        return JSONResponse({"error": "key_management_unavailable"}, status_code=503)
+    events = await repository.list_audit_events(session.user.id, 5000)
+    export_format = format.lower()
+    if export_format == "jsonl":
+        content = "".join(
+            f"{json.dumps(event, separators=(',', ':'), sort_keys=True)}\n"
+            for event in events
+        )
+        media_type = "application/x-ndjson"
+    elif export_format == "csv":
+        content = _audit_csv(events)
+        media_type = "text/csv"
+    else:
+        return JSONResponse({"error": "format_must_be_jsonl_or_csv"}, status_code=422)
+    response = Response(
+        content=content,
+        media_type=media_type,
+        headers={
+            "content-disposition": (
+                f'attachment; filename="os-api-audit.{export_format}"'
+            )
+        },
+    )
+    if session.rotated:
+        _set_session_cookies(response, session.rotated)
+    return response
+
+
 async def _session(request: Request) -> Session | None:
     accounts: AccountsClient = request.app.state.accounts
     access = request.cookies.get(ACCESS_COOKIE)
@@ -269,6 +323,53 @@ async def _session(request: Request) -> Session | None:
 
 def _repository(request: Request) -> ManagedKeyRepository | None:
     return request.app.state.managed_keys
+
+
+def _audit_limit(value: int) -> int:
+    return max(1, min(value, 1000))
+
+
+def _audit_csv(events: list[dict[str, Any]]) -> str:
+    fields = [
+        "id",
+        "event_type",
+        "occurred_at",
+        "key_id",
+        "key_name",
+        "billing_id",
+        "request_id",
+        "model",
+        "privacy",
+        "backend",
+        "status",
+        "reason",
+        "actual_microusd",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "expires_at",
+        "spend_limit_microusd",
+    ]
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore", lineterminator="\n")
+    writer.writeheader()
+    for event in events:
+        writer.writerow({key: _safe_csv_value(event.get(key)) for key in fields})
+    return output.getvalue()
+
+
+def _safe_csv_value(value: Any) -> str | int:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, int):
+        return value
+    if isinstance(value, (dict, list)):
+        text = json.dumps(value, separators=(",", ":"), sort_keys=True)
+    else:
+        text = str(value)
+    return f"'{text}" if text.startswith(("=", "+", "-", "@")) else text
 
 
 def _html(template_name: str, *, status_code: int = 200, **context: Any) -> HTMLResponse:

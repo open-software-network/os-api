@@ -18,5 +18,6 @@ enable_production_edge       = false
 restrict_cloud_run_ingress   = false
 enable_legacy_domain_mapping = true
 enable_monitoring            = true
+enable_firestore_backups     = false
 enable_github_deployments    = false
 alert_email                  = "alerts@example.com"

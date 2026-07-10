@@ -5,6 +5,7 @@ locals {
     "confidentialcomputing.googleapis.com",
     "container.googleapis.com",
     "certificatemanager.googleapis.com",
+    "cloudscheduler.googleapis.com",
     "firestore.googleapis.com",
     "iam.googleapis.com",
     "iamcredentials.googleapis.com",
@@ -14,6 +15,7 @@ locals {
     "run.googleapis.com",
     "secretmanager.googleapis.com",
     "siteverification.googleapis.com",
+    "storage.googleapis.com",
   ])
 }
 

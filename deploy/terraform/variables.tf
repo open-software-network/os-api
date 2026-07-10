@@ -117,6 +117,34 @@ variable "enable_monitoring" {
   default     = true
 }
 
+variable "enable_firestore_backups" {
+  description = "Enable Firestore PITR plus scheduled managed exports to a retention-protected bucket. Existing databases must be imported into Terraform state before apply."
+  type        = bool
+  default     = false
+}
+
+variable "firestore_backup_retention_days" {
+  description = "Minimum number of days that Firestore export objects cannot be deleted."
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.firestore_backup_retention_days >= 7
+    error_message = "Firestore backup retention must be at least seven days."
+  }
+}
+
+variable "firestore_backup_delete_after_days" {
+  description = "Age at which retained Firestore exports are removed automatically."
+  type        = number
+  default     = 90
+
+  validation {
+    condition     = var.firestore_backup_delete_after_days > var.firestore_backup_retention_days
+    error_message = "Firestore backup deletion age must exceed its retention period."
+  }
+}
+
 variable "alert_notification_channels" {
   description = "Cloud Monitoring notification channel resource names attached to API alerts."
   type        = list(string)
@@ -150,7 +178,7 @@ variable "github_repository_owner_id" {
 variable "gateway_image" {
   description = "Digest-pinned gateway container deployed to Cloud Run."
   type        = string
-  default     = "us-central1-docker.pkg.dev/autonomous-lab-490610/sovereign-inference/gateway@sha256:409e0860e8d21b604945ec81b307591d81f43d233c360f8812fbf1628ab1599d"
+  default     = "us-central1-docker.pkg.dev/autonomous-lab-490610/sovereign-inference/gateway@sha256:dfcc5478ec7abc719f89a9735211bfb3ca706057dcd33012d1de16186ad38b06"
 }
 
 variable "deletion_protection" {

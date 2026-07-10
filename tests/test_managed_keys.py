@@ -27,7 +27,13 @@ async def test_managed_key_lifecycle_and_usage() -> None:
         created.record.id,
         "bill_1",
         2_500,
-        {"model": "test-model", "total_tokens": 12},
+        {
+            "request_id": "req_test",
+            "model": "test-model",
+            "privacy": "confidential",
+            "backend": "tee",
+            "total_tokens": 12,
+        },
     )
     records = await repository.list_keys("usr_test")
     assert records[0].spend_used_microusd == 2_500
@@ -38,6 +44,18 @@ async def test_managed_key_lifecycle_and_usage() -> None:
 
     assert await repository.revoke_key("usr_test", created.record.id)
     assert await repository.authenticate(created.secret) is None
+    audit = await repository.list_audit_events("usr_test")
+    assert [event["event_type"] for event in audit] == [
+        "api_key.revoked",
+        "inference.settled",
+        "api_key.created",
+    ]
+    settled = audit[1]
+    assert settled["request_id"] == "req_test"
+    assert settled["privacy"] == "confidential"
+    assert settled["backend"] == "tee"
+    assert settled["total_tokens"] == 12
+    assert created.secret not in repr(audit)
 
 
 @pytest.mark.asyncio
@@ -49,4 +67,7 @@ async def test_spend_limit_reservation_is_atomic() -> None:
     with pytest.raises(SpendLimitExceeded):
         await repository.reserve(created.record.id, "bill_2", 300)
     await repository.release(created.record.id, "bill_1", "test")
+    audit = await repository.list_audit_events("usr_test")
+    assert audit[0]["event_type"] == "inference.released"
+    assert audit[0]["reason"] == "test"
     await repository.reserve(created.record.id, "bill_3", 1_000)

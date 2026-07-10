@@ -155,6 +155,110 @@ resource "google_logging_metric" "wallet_charge_failures" {
   }
 }
 
+resource "google_logging_metric" "api_auth_failures" {
+  count = var.enable_public_api && var.enable_monitoring ? 1 : 0
+
+  name        = "os_api_auth_failures"
+  description = "Rejected Bearer authentication attempts against OpenSoftware API endpoints"
+  filter      = "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"${google_cloud_run_v2_service.public_api[0].name}\" AND jsonPayload.event=\"http_request\" AND jsonPayload.status=401 AND jsonPayload.path=~\"^/v1/\""
+
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+    unit        = "1"
+  }
+}
+
+resource "google_monitoring_alert_policy" "api_auth_failures" {
+  count = var.enable_public_api && var.enable_monitoring ? 1 : 0
+
+  display_name          = "OpenSoftware API authentication failures spiked"
+  combiner              = "OR"
+  notification_channels = local.alert_notification_channels
+
+  conditions {
+    display_name = "More than 60 rejected API credentials per minute"
+
+    condition_threshold {
+      filter          = "resource.type = \"cloud_run_revision\" AND metric.type = \"logging.googleapis.com/user/${google_logging_metric.api_auth_failures[0].name}\""
+      comparison      = "COMPARISON_GT"
+      threshold_value = 60
+      duration        = "0s"
+
+      aggregations {
+        alignment_period     = "60s"
+        per_series_aligner   = "ALIGN_DELTA"
+        cross_series_reducer = "REDUCE_SUM"
+      }
+    }
+  }
+
+  alert_strategy {
+    auto_close = "1800s"
+  }
+
+  documentation {
+    content   = "Bearer authentication failures exceeded 60 per minute. Inspect source distribution at the load balancer, confirm no key leak or credential-stuffing campaign, and preserve request IDs without copying credentials. Cloud Armor automatically bans sources above the extreme-rate threshold."
+    mime_type = "text/markdown"
+  }
+
+  timeouts {
+    create = "5m"
+  }
+}
+
+resource "google_logging_metric" "firestore_backup_failures" {
+  count = var.enable_firestore_backups && var.enable_monitoring ? 1 : 0
+
+  name        = "os_api_firestore_backup_failures"
+  description = "Failed executions of the scheduled OpenSoftware API Firestore export"
+  filter      = "resource.type=\"cloud_scheduler_job\" AND resource.labels.job_id=\"${google_cloud_scheduler_job.firestore_export[0].name}\" AND severity>=ERROR"
+
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+    unit        = "1"
+  }
+}
+
+resource "google_monitoring_alert_policy" "firestore_backup_failures" {
+  count = var.enable_firestore_backups && var.enable_monitoring ? 1 : 0
+
+  display_name          = "OpenSoftware API Firestore backup failed"
+  combiner              = "OR"
+  notification_channels = local.alert_notification_channels
+
+  conditions {
+    display_name = "One or more scheduled export attempts failed"
+
+    condition_threshold {
+      filter          = "resource.type = \"cloud_scheduler_job\" AND metric.type = \"logging.googleapis.com/user/${google_logging_metric.firestore_backup_failures[0].name}\""
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0
+      duration        = "0s"
+
+      aggregations {
+        alignment_period     = "300s"
+        per_series_aligner   = "ALIGN_DELTA"
+        cross_series_reducer = "REDUCE_SUM"
+      }
+    }
+  }
+
+  alert_strategy {
+    auto_close = "1800s"
+  }
+
+  documentation {
+    content   = "A scheduled Firestore managed export failed. Inspect Cloud Scheduler execution logs, then run the backup manually and confirm the export operation completed before closing the incident. Follow the backup recovery procedure in docs/operations.md."
+    mime_type = "text/markdown"
+  }
+
+  timeouts {
+    create = "5m"
+  }
+}
+
 resource "google_monitoring_alert_policy" "wallet_charge_failures" {
   count = var.enable_public_api && var.enable_monitoring ? 1 : 0
 

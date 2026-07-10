@@ -147,7 +147,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app() -> FastAPI:
     app = FastAPI(
         title="OpenSoftware API",
-        version="0.3.1",
+        version="0.4.0",
         docs_url=None,
         redoc_url=None,
         lifespan=lifespan,
@@ -431,7 +431,15 @@ def create_app() -> FastAPI:
             )
         if parsed.stream:
             return StreamingResponse(
-                _metered_stream(request, upstream, billing, route, parsed.model),
+                _metered_stream(
+                    request,
+                    upstream,
+                    billing,
+                    route,
+                    parsed.model,
+                    privacy,
+                    backend.name,
+                ),
                 status_code=upstream.status_code,
                 media_type=content_type,
                 headers=response_headers,
@@ -439,7 +447,15 @@ def create_app() -> FastAPI:
         content = await upstream.aread()
         await upstream.aclose()
         usage = _usage_from_json(content)
-        await _settle_billing(request, billing, route, parsed.model, usage)
+        await _settle_billing(
+            request,
+            billing,
+            route,
+            parsed.model,
+            privacy,
+            backend.name,
+            usage,
+        )
         return Response(
             content=content,
             status_code=upstream.status_code,
@@ -588,13 +604,21 @@ async def _settle_billing(
     billing: BillingContext | None,
     route: ModelRoute,
     model: str,
+    privacy: str,
+    backend: str,
     usage: dict[str, Any] | None,
 ) -> None:
     if not billing or not request.app.state.managed_keys:
         return
     clean_usage = _clean_usage(usage)
     actual = _actual_cost(route, clean_usage) if clean_usage else billing.estimate_microusd
-    event = {"model": model, **clean_usage}
+    event = {
+        "request_id": request.state.request_id,
+        "model": model,
+        "privacy": privacy,
+        "backend": backend,
+        **clean_usage,
+    }
     try:
         await request.app.state.managed_keys.settle(
             billing.key_id,
@@ -638,6 +662,8 @@ async def _metered_stream(
     billing: BillingContext | None,
     route: ModelRoute,
     model: str,
+    privacy: str,
+    backend: str,
 ) -> AsyncIterator[bytes]:
     pending = b""
     usage: dict[str, Any] | None = None
@@ -655,7 +681,7 @@ async def _metered_stream(
         if pending:
             usage = _usage_from_sse_line(pending) or usage
         await upstream.aclose()
-        await _settle_billing(request, billing, route, model, usage)
+        await _settle_billing(request, billing, route, model, privacy, backend, usage)
 
 
 def _estimate_cost(route: ModelRoute, payload: dict[str, Any], request_bytes: int) -> int:

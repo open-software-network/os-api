@@ -94,4 +94,4 @@ For a lower-cost validation of TDX scheduling and fail-closed API routing, Terra
 
 ## Remaining production boundaries
 
-The first control plane is live, including login, key lifecycle, hard spend limits, usage metering, and wallet settlement. Before broad commercial launch, add abuse automation, multi-region routing, model rollout automation, reserved GPU capacity, externally verifiable attestation, and customer audit exports. These are sequenced in [operations](docs/operations.md).
+The first control plane is live, including login, key lifecycle, hard spend limits, usage metering, and wallet settlement. The remaining launch controls and measurable exit criteria are tracked in the [production parity checklist](docs/production-parity.md) and sequenced in [operations](docs/operations.md).

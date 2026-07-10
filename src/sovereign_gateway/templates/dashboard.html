@@ -36,6 +36,17 @@
       <div class="panel-title"><div><h2>Recent usage</h2><p>Metered by model response tokens.</p></div></div>
       <div id="usage" class="usage-list"><div class="loading">Loading usage…</div></div>
     </section>
+
+    <section class="panel audit-panel">
+      <div class="panel-title">
+        <div><h2>Audit log</h2><p>Metadata-only key and inference events. Prompts and outputs are never included.</p></div>
+        <div class="audit-actions">
+          <a class="button secondary small" href="/api/audit/export?format=jsonl">Export JSONL</a>
+          <a class="button secondary small" href="/api/audit/export?format=csv">Export CSV</a>
+        </div>
+      </div>
+      <div id="audit" class="usage-list"><div class="loading">Loading audit events…</div></div>
+    </section>
   </div>
 </section>
 
