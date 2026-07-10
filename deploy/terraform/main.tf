@@ -237,6 +237,16 @@ resource "google_cloud_run_v2_service" "public_api" {
       }
 
       env {
+        name  = "FIRESTORE_DATABASE_ID"
+        value = local.active_firestore_database_id
+      }
+
+      env {
+        name  = "GATEWAY_REGION"
+        value = var.region
+      }
+
+      env {
         name  = "APP_ORIGIN"
         value = "https://api.opensoftware.co"
       }
@@ -328,7 +338,7 @@ resource "google_cloud_run_v2_service" "public_api" {
         failure_threshold     = 20
 
         http_get {
-          path = "/healthz"
+          path = "/readyz"
           port = 8080
         }
       }

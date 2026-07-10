@@ -122,6 +122,14 @@ resource "google_compute_backend_service" "public_api" {
     group = google_compute_region_network_endpoint_group.public_api[0].id
   }
 
+  dynamic "backend" {
+    for_each = var.enable_multi_region_control_plane ? [1] : []
+
+    content {
+      group = google_compute_region_network_endpoint_group.public_api_secondary[0].id
+    }
+  }
+
   log_config {
     enable      = true
     sample_rate = 1

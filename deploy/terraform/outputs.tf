@@ -36,6 +36,10 @@ output "public_api_url" {
   value = try(google_cloud_run_v2_service.public_api[0].uri, null)
 }
 
+output "secondary_api_url" {
+  value = try(google_cloud_run_v2_service.public_api_secondary[0].uri, null)
+}
+
 output "canary_api_url" {
   value = try(google_cloud_run_v2_service.api_canary[0].uri, null)
 }
@@ -62,4 +66,12 @@ output "firestore_backup_bucket" {
 
 output "firestore_backup_scheduler_job" {
   value = try(google_cloud_scheduler_job.firestore_export[0].id, null)
+}
+
+output "firestore_active_database" {
+  value = local.active_firestore_database_id
+}
+
+output "firestore_active_backup_bucket" {
+  value = try(local.active_firestore_backup_bucket, null)
 }

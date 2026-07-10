@@ -56,6 +56,16 @@ resource "google_cloud_run_v2_service" "api_canary" {
       }
 
       env {
+        name  = "FIRESTORE_DATABASE_ID"
+        value = local.active_firestore_database_id
+      }
+
+      env {
+        name  = "GATEWAY_REGION"
+        value = var.region
+      }
+
+      env {
         name  = "APP_ORIGIN"
         value = "https://${var.public_api_domain}"
       }
@@ -146,7 +156,7 @@ resource "google_cloud_run_v2_service" "api_canary" {
         failure_threshold     = 20
 
         http_get {
-          path = "/healthz"
+          path = "/readyz"
           port = 8080
         }
       }

@@ -16,6 +16,8 @@ env:
   REGION: us-central1
   SERVICE: sovereign-api
   CANARY_SERVICE: sovereign-api-canary
+  SECONDARY_SERVICE: sovereign-api-secondary
+  SECONDARY_REGION: us-east4
   IMAGE: us-central1-docker.pkg.dev/autonomous-lab-490610/sovereign-inference/gateway
 
 jobs:
@@ -118,6 +120,22 @@ jobs:
             --quiet
           echo "revision=${revision}" >> "${GITHUB_OUTPUT}"
 
+      - name: Deploy secondary-region revision without traffic
+        id: secondary
+        shell: bash
+        run: |
+          set -euo pipefail
+          suffix="gh-${GITHUB_RUN_ID}"
+          revision="${SECONDARY_SERVICE}-${suffix}"
+          gcloud run deploy "${SECONDARY_SERVICE}" \
+            --project "${PROJECT_ID}" \
+            --region "${SECONDARY_REGION}" \
+            --image "${{ steps.image.outputs.reference }}" \
+            --revision-suffix "${suffix}" \
+            --no-traffic \
+            --quiet
+          echo "revision=${revision}" >> "${GITHUB_OUTPUT}"
+
       - name: Promote production revision
         shell: bash
         run: |
@@ -126,6 +144,16 @@ jobs:
             --project "${PROJECT_ID}" \
             --region "${REGION}" \
             --to-revisions "${{ steps.production.outputs.revision }}=100" \
+            --quiet
+
+      - name: Promote secondary-region revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud run services update-traffic "${SECONDARY_SERVICE}" \
+            --project "${PROJECT_ID}" \
+            --region "${SECONDARY_REGION}" \
+            --to-revisions "${{ steps.secondary.outputs.revision }}=100" \
             --quiet
 
       - name: Verify public endpoint

@@ -289,8 +289,13 @@ class InMemoryKeyRepository:
 
 
 class FirestoreKeyRepository:
-    def __init__(self, project: str | None = None, prefix: str = "sovereign") -> None:
-        self.client = firestore.Client(project=project or None)
+    def __init__(
+        self,
+        project: str | None = None,
+        prefix: str = "sovereign",
+        database: str | None = None,
+    ) -> None:
+        self.client = firestore.Client(project=project or None, database=database or None)
         self.keys = self.client.collection(f"{prefix}_api_keys")
         self.usage = self.client.collection(f"{prefix}_usage")
         self.audit = self.client.collection(f"{prefix}_audit_events")
@@ -565,6 +570,7 @@ def build_managed_repository() -> ManagedKeyRepository | None:
     return FirestoreKeyRepository(
         project=os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCP_PROJECT"),
         prefix=os.getenv("FIRESTORE_COLLECTION_PREFIX", "sovereign"),
+        database=os.getenv("FIRESTORE_DATABASE_ID") or None,
     )
 
 

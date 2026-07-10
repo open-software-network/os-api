@@ -141,12 +141,57 @@ resource "google_monitoring_alert_policy" "public_api_5xx" {
   }
 }
 
+resource "google_monitoring_alert_policy" "public_api_secondary_5xx" {
+  count = var.enable_public_api && var.enable_monitoring && var.enable_multi_region_control_plane ? 1 : 0
+
+  display_name          = "OpenSoftware API secondary-region 5xx error ratio"
+  combiner              = "OR"
+  notification_channels = local.alert_notification_channels
+
+  conditions {
+    display_name = "Secondary-region 5xx responses exceed 5 percent"
+
+    condition_threshold {
+      filter             = "resource.type = \"cloud_run_revision\" AND resource.labels.service_name = \"${google_cloud_run_v2_service.public_api_secondary[0].name}\" AND metric.type = \"run.googleapis.com/request_count\" AND metric.label.response_code_class = \"5xx\""
+      denominator_filter = "resource.type = \"cloud_run_revision\" AND resource.labels.service_name = \"${google_cloud_run_v2_service.public_api_secondary[0].name}\" AND metric.type = \"run.googleapis.com/request_count\""
+      comparison         = "COMPARISON_GT"
+      threshold_value    = 0.05
+      duration           = "300s"
+
+      aggregations {
+        alignment_period     = "60s"
+        per_series_aligner   = "ALIGN_DELTA"
+        cross_series_reducer = "REDUCE_SUM"
+      }
+
+      denominator_aggregations {
+        alignment_period     = "60s"
+        per_series_aligner   = "ALIGN_DELTA"
+        cross_series_reducer = "REDUCE_SUM"
+      }
+    }
+  }
+
+  alert_strategy {
+    auto_close = "1800s"
+  }
+
+  documentation {
+    content   = "The us-east4 gateway has returned more than 5% server errors for five minutes. Inspect the regional Cloud Run revision and dependency connectivity; remove only the affected serverless NEG from the edge during mitigation."
+    mime_type = "text/markdown"
+  }
+
+  timeouts {
+    create = "5m"
+  }
+}
+
 resource "google_logging_metric" "wallet_charge_failures" {
   count = var.enable_public_api && var.enable_monitoring ? 1 : 0
 
   name        = "os_api_wallet_charge_failures"
   description = "Inference usage that could not be settled against the OpenSoftware wallet"
-  filter      = "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"${google_cloud_run_v2_service.public_api[0].name}\" AND jsonPayload.event=\"wallet_charge_failed\""
+  filter      = "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=~\"^sovereign-api(-secondary)?$\" AND jsonPayload.event=\"wallet_charge_failed\""
 
   metric_descriptor {
     metric_kind = "DELTA"
@@ -160,7 +205,7 @@ resource "google_logging_metric" "api_auth_failures" {
 
   name        = "os_api_auth_failures"
   description = "Rejected Bearer authentication attempts against OpenSoftware API endpoints"
-  filter      = "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"${google_cloud_run_v2_service.public_api[0].name}\" AND jsonPayload.event=\"http_request\" AND jsonPayload.status=401 AND jsonPayload.path=~\"^/v1/\""
+  filter      = "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=~\"^sovereign-api(-secondary)?$\" AND jsonPayload.event=\"http_request\" AND jsonPayload.status=401 AND jsonPayload.path=~\"^/v1/\""
 
   metric_descriptor {
     metric_kind = "DELTA"

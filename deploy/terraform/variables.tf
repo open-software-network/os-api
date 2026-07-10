@@ -9,6 +9,12 @@ variable "region" {
   default     = "us-central1"
 }
 
+variable "secondary_region" {
+  description = "Second Cloud Run gateway region used by the global production edge."
+  type        = string
+  default     = "us-east4"
+}
+
 variable "system_node_zone" {
   description = "Zone for the system and ordinary GPU node pools."
   type        = string
@@ -123,6 +129,24 @@ variable "enable_firestore_backups" {
   default     = false
 }
 
+variable "enable_multi_region_control_plane" {
+  description = "Create a secondary Cloud Run gateway and a multi-region Firestore system of record."
+  type        = bool
+  default     = false
+}
+
+variable "multi_region_firestore_database_id" {
+  description = "Named Firestore database used by the multi-region control plane."
+  type        = string
+  default     = "os-api-global"
+}
+
+variable "multi_region_firestore_location" {
+  description = "Firestore multi-region whose read-write regions align with the gateway regions."
+  type        = string
+  default     = "nam7"
+}
+
 variable "firestore_backup_retention_days" {
   description = "Minimum number of days that Firestore export objects cannot be deleted."
   type        = number
@@ -178,7 +202,7 @@ variable "github_repository_owner_id" {
 variable "gateway_image" {
   description = "Digest-pinned gateway container deployed to Cloud Run."
   type        = string
-  default     = "us-central1-docker.pkg.dev/autonomous-lab-490610/sovereign-inference/gateway@sha256:dfcc5478ec7abc719f89a9735211bfb3ca706057dcd33012d1de16186ad38b06"
+  default     = "us-central1-docker.pkg.dev/autonomous-lab-490610/sovereign-inference/gateway@sha256:47b4bf42a464f9ae12c37be569eebdc58e5f2f449ff40347567acbaf4f0464f6"
 }
 
 variable "deletion_protection" {

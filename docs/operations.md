@@ -103,3 +103,11 @@ Treat a successful scheduler HTTP response as "export accepted," not "backup com
 Quarterly, restore the latest completed export into the designated isolated recovery project and record the measured recovery point and recovery time. The recovery project must use a bucket/database-compatible location, must not have production runtime service accounts, and must never receive production traffic. Verify key, usage, and audit collection counts; sample documents for schema compatibility; confirm raw key secrets and prompts are absent; and then destroy the recovery database. Never restore into production during a drill, and never reactivate an expired or revoked key.
 
 The latest completed exercise is recorded in [the 2026-07-10 recovery drill](recovery-drills/2026-07-10.md).
+
+## Regional failover
+
+The gateway runs in us-central1 (`sovereign-api`) and us-east4 (`sovereign-api-secondary`) behind the same global load balancer, on the same image digest, against the same nam7 Firestore database. Every response carries an `x-gateway-region` header identifying the serving region. Both internal model load balancers set `allowGlobalAccess`, and the vLLM NetworkPolicies admit both gateway subnets (10.20.0.0/20 and 10.30.0.0/24); a change to either breaks cross-region inference silently, so rerun the failover drill after touching them.
+
+Known regional single points of failure: Redis (rate limits and spend reservations) and the GKE model cluster both live in us-central1. A full us-central1 outage therefore still takes down inference and readiness in both regions. Do not advertise a regional-outage SLO until those are replicated.
+
+To fail away from a region, detach its NEG from the `os-api-edge` backend service and confirm the other region serves via the header; restore by re-running `terraform apply`, which is authoritative for the backend set. Failback routing is eventually consistent — judge recovery by the attached backend set and continuous 200s, not by which region serves your client. The latest exercise, including two defects the first attempt surfaced, is recorded in [the 2026-07-10 failover drill](recovery-drills/2026-07-10-failover.md).

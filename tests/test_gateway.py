@@ -25,6 +25,12 @@ def test_public_home_and_docs_render(client: TestClient) -> None:
     assert "Developer docs" in docs.text
 
 
+def test_responses_identify_gateway_region(client: TestClient) -> None:
+    response = client.get("/v1/models")
+
+    assert response.headers["x-gateway-region"] == "local"
+
+
 def test_site_basic_auth_does_not_replace_api_key_auth(
     client: TestClient, monkeypatch
 ) -> None:

@@ -1,5 +1,6 @@
 project_id             = "autonomous-lab-490610"
 region                 = "us-central1"
+secondary_region       = "us-east4"
 system_node_zone       = "us-central1-a"
 standard_gpu_zones     = ["us-central1-a", "us-central1-b", "us-central1-c"]
 master_authorized_cidr = "203.0.113.10/32"
@@ -19,5 +20,6 @@ restrict_cloud_run_ingress   = false
 enable_legacy_domain_mapping = true
 enable_monitoring            = true
 enable_firestore_backups     = false
+enable_multi_region_control_plane = false
 enable_github_deployments    = false
 alert_email                  = "alerts@example.com"

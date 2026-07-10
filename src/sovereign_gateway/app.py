@@ -147,7 +147,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app() -> FastAPI:
     app = FastAPI(
         title="OpenSoftware API",
-        version="0.4.0",
+        version="0.5.0",
         docs_url=None,
         redoc_url=None,
         lifespan=lifespan,
@@ -194,6 +194,7 @@ def create_app() -> FastAPI:
                         content={"error": "internal_error", "request_id": request_id},
                     )
         response.headers["x-request-id"] = request_id
+        response.headers["x-gateway-region"] = os.getenv("GATEWAY_REGION", "local")
         response.headers["x-content-type-options"] = "nosniff"
         response.headers["referrer-policy"] = "strict-origin-when-cross-origin"
         response.headers["permissions-policy"] = "camera=(), microphone=(), geolocation=()"
