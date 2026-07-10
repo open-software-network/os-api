@@ -135,6 +135,12 @@ variable "enable_multi_region_control_plane" {
   default     = false
 }
 
+variable "enable_binary_authorization" {
+  description = "Enforce the project Binary Authorization allowlist on the inference cluster and the gateway Cloud Run services."
+  type        = bool
+  default     = false
+}
+
 variable "multi_region_firestore_database_id" {
   description = "Named Firestore database used by the multi-region control plane."
   type        = string

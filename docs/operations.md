@@ -67,6 +67,10 @@ Wallet charges use `inference:<billing_id>` as an idempotency key and are retrie
 3. Rotate any upstream credential if there is evidence it was exposed.
 4. Preserve security logs and notify the owner using the account email.
 
+## Supply chain
+
+Binary Authorization enforces a deny-by-default image allowlist on the inference GKE cluster and every gateway Cloud Run service: only images from the project's `sovereign-inference` Artifact Registry repository and the pinned `docker.io/vllm/*` model servers are admitted; Google-maintained GKE system images are exempted via the global policy. Enforcement is admission-time, so it never disrupts running workloads, and it is opt-in per workload — other clusters in the project are unaffected. A blocked deploy fails with `Denied by an ALWAYS_DENY admission rule`; fix the image source rather than editing the policy. The enforcement drill is recorded in [the 2026-07-10 Binary Authorization drill](recovery-drills/2026-07-10-binauthz.md).
+
 ## Site access gate
 
 The human-facing site, docs, dashboard, login callbacks, and dashboard JSON routes use HTTP Basic authentication when `SITE_BASIC_AUTH_USERNAME` and `SITE_BASIC_AUTH_PASSWORD` are configured. The password is stored in the `site-basic-auth-password` Secret Manager secret. `/v1/*`, `/healthz`, and `/readyz` are intentionally exempt so API-key clients and infrastructure probes continue to work. Rotate the site password by adding a new secret version and bumping `RUNTIME_CONFIG_VERSION` in both Cloud Run services.

@@ -7,6 +7,14 @@ resource "google_cloud_run_v2_service" "api_canary" {
   deletion_protection = true
   labels              = var.labels
 
+  dynamic "binary_authorization" {
+    for_each = var.enable_binary_authorization ? [1] : []
+
+    content {
+      use_default = true
+    }
+  }
+
   template {
     service_account                  = google_service_account.api_runtime.email
     execution_environment            = "EXECUTION_ENVIRONMENT_GEN2"

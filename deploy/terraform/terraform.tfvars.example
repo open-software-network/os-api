@@ -21,5 +21,6 @@ enable_legacy_domain_mapping = true
 enable_monitoring            = true
 enable_firestore_backups     = false
 enable_multi_region_control_plane = false
+enable_binary_authorization       = false
 enable_github_deployments    = false
 alert_email                  = "alerts@example.com"

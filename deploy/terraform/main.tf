@@ -1,6 +1,7 @@
 locals {
   services = toset([
     "artifactregistry.googleapis.com",
+    "binaryauthorization.googleapis.com",
     "compute.googleapis.com",
     "confidentialcomputing.googleapis.com",
     "container.googleapis.com",
@@ -187,6 +188,14 @@ resource "google_cloud_run_v2_service" "public_api" {
   )
   deletion_protection = true
   labels              = var.labels
+
+  dynamic "binary_authorization" {
+    for_each = var.enable_binary_authorization ? [1] : []
+
+    content {
+      use_default = true
+    }
+  }
 
   template {
     service_account                  = google_service_account.api_runtime.email
@@ -489,6 +498,14 @@ resource "google_container_cluster" "inference" {
 
   workload_identity_config {
     workload_pool = "${var.project_id}.svc.id.goog"
+  }
+
+  dynamic "binary_authorization" {
+    for_each = var.enable_binary_authorization ? [1] : []
+
+    content {
+      evaluation_mode = "PROJECT_SINGLETON_POLICY_ENFORCE"
+    }
   }
 
   secret_manager_config {
