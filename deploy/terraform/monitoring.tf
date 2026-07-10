@@ -252,6 +252,148 @@ resource "google_monitoring_alert_policy" "api_auth_failures" {
   }
 }
 
+resource "google_logging_metric" "model_overloaded" {
+  count = var.enable_public_api && var.enable_monitoring ? 1 : 0
+
+  name        = "os_api_model_overloaded"
+  description = "Inference requests rejected by per-backend admission control"
+  filter      = "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=~\"^sovereign-api(-secondary)?$\" AND jsonPayload.event=\"model_overloaded\""
+
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+    unit        = "1"
+  }
+}
+
+resource "google_monitoring_alert_policy" "model_overloaded" {
+  count = var.enable_public_api && var.enable_monitoring ? 1 : 0
+
+  display_name          = "OpenSoftware API model capacity saturated"
+  combiner              = "OR"
+  notification_channels = local.alert_notification_channels
+
+  conditions {
+    display_name = "Sustained admission-control rejections"
+
+    condition_threshold {
+      filter          = "resource.type = \"cloud_run_revision\" AND metric.type = \"logging.googleapis.com/user/${google_logging_metric.model_overloaded[0].name}\""
+      comparison      = "COMPARISON_GT"
+      threshold_value = 30
+      duration        = "300s"
+
+      aggregations {
+        alignment_period     = "60s"
+        per_series_aligner   = "ALIGN_DELTA"
+        cross_series_reducer = "REDUCE_SUM"
+      }
+    }
+  }
+
+  alert_strategy {
+    auto_close = "1800s"
+  }
+
+  documentation {
+    content   = "Inference requests are being rejected with 503 model_overloaded faster than 30 per minute for five minutes. Clients are retrying against saturated model capacity. Scale the affected model deployment (or its node pool), or raise max_concurrency only if the backend has verified headroom. Do not raise limits to silence the alert."
+    mime_type = "text/markdown"
+  }
+
+  timeouts {
+    create = "5m"
+  }
+}
+
+resource "google_logging_metric" "upstream_failures" {
+  count = var.enable_public_api && var.enable_monitoring ? 1 : 0
+
+  name        = "os_api_upstream_failures"
+  description = "Inference requests that failed because a model backend timed out or was unreachable"
+  filter      = "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=~\"^sovereign-api(-secondary)?$\" AND (jsonPayload.event=\"upstream_timeout\" OR jsonPayload.event=\"upstream_unavailable\")"
+
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+    unit        = "1"
+  }
+}
+
+resource "google_monitoring_alert_policy" "upstream_failures" {
+  count = var.enable_public_api && var.enable_monitoring ? 1 : 0
+
+  display_name          = "OpenSoftware API model backend failing"
+  combiner              = "OR"
+  notification_channels = local.alert_notification_channels
+
+  conditions {
+    display_name = "Model backend timeouts or connection failures"
+
+    condition_threshold {
+      filter          = "resource.type = \"cloud_run_revision\" AND metric.type = \"logging.googleapis.com/user/${google_logging_metric.upstream_failures[0].name}\""
+      comparison      = "COMPARISON_GT"
+      threshold_value = 5
+      duration        = "300s"
+
+      aggregations {
+        alignment_period     = "60s"
+        per_series_aligner   = "ALIGN_DELTA"
+        cross_series_reducer = "REDUCE_SUM"
+      }
+    }
+  }
+
+  alert_strategy {
+    auto_close = "1800s"
+  }
+
+  documentation {
+    content   = "The gateway is failing to reach a model backend (timeouts or connection errors). Check model pod readiness, the internal load balancers, and cross-region reachability (allowGlobalAccess plus NetworkPolicies). Billing reservations for failed requests are automatically released."
+    mime_type = "text/markdown"
+  }
+
+  timeouts {
+    create = "5m"
+  }
+}
+
+resource "google_monitoring_alert_policy" "gateway_instances_near_max" {
+  count = var.enable_public_api && var.enable_monitoring ? 1 : 0
+
+  display_name          = "OpenSoftware API gateway near instance ceiling"
+  combiner              = "OR"
+  notification_channels = local.alert_notification_channels
+
+  conditions {
+    display_name = "Instance count at 80 percent of the configured maximum"
+
+    condition_threshold {
+      filter          = "resource.type = \"cloud_run_revision\" AND resource.labels.service_name = \"sovereign-api\" AND metric.type = \"run.googleapis.com/container/instance_count\""
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0.8 * var.public_api_max_instances
+      duration        = "600s"
+
+      aggregations {
+        alignment_period     = "60s"
+        per_series_aligner   = "ALIGN_MAX"
+        cross_series_reducer = "REDUCE_SUM"
+      }
+    }
+  }
+
+  alert_strategy {
+    auto_close = "1800s"
+  }
+
+  documentation {
+    content   = "The primary gateway is running at or above 80 percent of its Cloud Run instance ceiling for ten minutes. Raise public_api_max_instances or investigate abnormal traffic before requests queue at the edge."
+    mime_type = "text/markdown"
+  }
+
+  timeouts {
+    create = "5m"
+  }
+}
+
 resource "google_logging_metric" "firestore_backup_failures" {
   count = var.enable_firestore_backups && var.enable_monitoring ? 1 : 0
 

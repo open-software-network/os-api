@@ -33,7 +33,7 @@ Do not deploy mutable tags. Terraform owns service configuration and CI owns the
 
 ## Alerts
 
-Terraform creates an external readiness check and policies for sustained 5xx responses, readiness failures, wallet settlement failures, authentication spikes, and scheduled backup failures. Alert notifications go to the configured operations channel. The next alert set should cover Redis memory pressure, pending inference pods, model load failures, GPU Xid events, and time-to-first-token by backend.
+Terraform creates an external readiness check and policies for sustained 5xx responses, readiness failures, wallet settlement failures, authentication spikes, scheduled backup failures, sustained admission-control rejections (`model_overloaded`), model-backend timeouts and connection failures, and the gateway running near its Cloud Run instance ceiling. Alert notifications go to the configured operations channel. The next alert set should cover Redis memory pressure, model load failures, GPU Xid events, and time-to-first-token by backend.
 
 On any alert:
 
@@ -79,7 +79,9 @@ Production DNS resolves `api.opensoftware.co` directly to the global load-balanc
 
 ## Capacity and shutdown
 
-The gateway keeps one Cloud Run instance warm and can scale to ten. Model compute scales independently and remains the bottleneck. Stop model charges without deleting data:
+The gateway keeps one Cloud Run instance warm and can scale to ten. Model compute scales independently and remains the bottleneck.
+
+Admission to each model backend is bounded by `max_concurrency` in `models.yaml`, enforced globally across every gateway instance and region through a shared Redis in-flight counter. Requests beyond the bound are rejected **before any billing reservation** with `503`, `Retry-After: 10`, and OpenAI-style error code `model_overloaded`; clients are expected to retry. The counter key self-heals via a 900-second expiry refreshed on each admit, so a crashed gateway instance cannot permanently shrink capacity. Size `max_concurrency` from measured backend saturation, not from the alert threshold: the live saturation test admitted exactly 8 of 24 concurrent requests at the configured limit of 8 and recovered immediately after the burst. Raising the limit without adding model capacity converts fast, honest 503s into slow queueing for everyone. Stop model charges without deleting data:
 
 ```bash
 kubectl -n inference scale deployment/confidential-vllm-cpu --replicas=0

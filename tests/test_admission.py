@@ -1,0 +1,98 @@
+from __future__ import annotations
+
+import anyio
+from fastapi.testclient import TestClient
+
+from sovereign_gateway.rate_limit import LocalConcurrencyLimiter
+
+
+class RecordingLimiter:
+    def __init__(self, admit: bool) -> None:
+        self.admit = admit
+        self.acquires = 0
+        self.releases = 0
+
+    async def acquire(self, backend: str, limit: int) -> bool:
+        self.acquires += 1
+        return self.admit
+
+    async def release(self, backend: str) -> None:
+        self.releases += 1
+
+
+def test_local_concurrency_limiter_enforces_and_recovers() -> None:
+    async def scenario() -> tuple[bool, bool, bool]:
+        limiter = LocalConcurrencyLimiter()
+        first = await limiter.acquire("backend", 1)
+        second = await limiter.acquire("backend", 1)
+        await limiter.release("backend")
+        third = await limiter.acquire("backend", 1)
+        return first, second, third
+
+    first, second, third = anyio.run(scenario)
+    assert first is True
+    assert second is False
+    assert third is True
+
+
+def test_saturated_backend_returns_503_with_retry_after(client: TestClient) -> None:
+    limiter = RecordingLimiter(admit=False)
+    client.app.state.concurrency = limiter
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"X-Confidential-Compute": "required"},
+        json={"model": "dual-model", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "10"
+    assert response.json()["error"]["code"] == "model_overloaded"
+    assert limiter.acquires == 1
+    assert limiter.releases == 0
+
+
+def test_admitted_request_releases_capacity(client: TestClient) -> None:
+    limiter = RecordingLimiter(admit=True)
+    client.app.state.concurrency = limiter
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"X-Confidential-Compute": "required"},
+        json={"model": "dual-model", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert limiter.acquires == 1
+    assert limiter.releases == 1
+
+
+def test_streaming_request_releases_capacity_after_stream(client: TestClient) -> None:
+    limiter = RecordingLimiter(admit=True)
+    client.app.state.concurrency = limiter
+
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers={"X-Confidential-Compute": "required"},
+        json={"model": "dual-model", "stream": True, "messages": []},
+    ) as response:
+        body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    assert "[DONE]" in body
+    assert limiter.acquires == 1
+    assert limiter.releases == 1
+
+
+def test_unlimited_backend_skips_admission_control(client: TestClient) -> None:
+    limiter = RecordingLimiter(admit=False)
+    client.app.state.concurrency = limiter
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "standard-only", "messages": []},
+    )
+
+    assert response.status_code == 200
+    assert limiter.acquires == 0

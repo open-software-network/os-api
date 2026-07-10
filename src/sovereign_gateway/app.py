@@ -9,7 +9,7 @@ import re
 import secrets
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, ValidationError
 from redis.asyncio import Redis
 
+from . import __version__
 from .accounts import AccountsClient, WalletGrant
 from .auth import ApiKeyStore, Principal
 from .config import Backend, GatewayConfig, ModelRoute
@@ -32,7 +33,14 @@ from .managed_keys import (
     SpendLimitExceeded,
     build_managed_repository,
 )
-from .rate_limit import LocalFixedWindowLimiter, RateLimiter, RedisFixedWindowLimiter
+from .rate_limit import (
+    ConcurrencyLimiter,
+    LocalConcurrencyLimiter,
+    LocalFixedWindowLimiter,
+    RateLimiter,
+    RedisConcurrencyLimiter,
+    RedisFixedWindowLimiter,
+)
 from .web import router as web_router
 
 logger = logging.getLogger("sovereign_gateway")
@@ -133,6 +141,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.managed_keys = managed_keys
     app.state.limiter = limiter
     app.state.redis = redis
+    concurrency: ConcurrencyLimiter = (
+        RedisConcurrencyLimiter(redis) if redis else LocalConcurrencyLimiter()
+    )
+    app.state.concurrency = concurrency
     app.state.http = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=10, read=600, write=30, pool=10),
         limits=httpx.Limits(max_connections=500, max_keepalive_connections=100),
@@ -147,7 +159,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app() -> FastAPI:
     app = FastAPI(
         title="OpenSoftware API",
-        version="0.5.0",
+        version=__version__,
         docs_url=None,
         redoc_url=None,
         lifespan=lifespan,
@@ -353,8 +365,42 @@ def create_app() -> FastAPI:
             return selected
         backend, privacy = selected
 
+        capacity_held = False
+        if backend.max_concurrency:
+            admitted = await request.app.state.concurrency.acquire(
+                backend.name, backend.max_concurrency
+            )
+            if not admitted:
+                logger.warning(
+                    json.dumps(
+                        {
+                            "severity": "WARNING",
+                            "event": "model_overloaded",
+                            "request_id": request.state.request_id,
+                            "backend": backend.name,
+                            "max_concurrency": backend.max_concurrency,
+                        },
+                        separators=(",", ":"),
+                    )
+                )
+                return openai_error(
+                    503,
+                    "The model is at capacity; retry after a short delay",
+                    error_type="server_error",
+                    code="model_overloaded",
+                    headers={"retry-after": "10"},
+                )
+            capacity_held = True
+
+        async def _free_capacity() -> None:
+            nonlocal capacity_held
+            if capacity_held:
+                capacity_held = False
+                await request.app.state.concurrency.release(backend.name)
+
         billing = await _prepare_billing(request, route, payload, len(raw))
         if isinstance(billing, Response):
+            await _free_capacity()
             return billing
 
         payload["model"] = route.upstream_model
@@ -379,6 +425,7 @@ def create_app() -> FastAPI:
         try:
             upstream = await request.app.state.http.send(upstream_request, stream=parsed.stream)
         except httpx.TimeoutException:
+            await _free_capacity()
             await _release_billing(request, billing, "backend_timeout")
             logger.exception(
                 json.dumps(
@@ -397,6 +444,7 @@ def create_app() -> FastAPI:
                 code="backend_timeout",
             )
         except httpx.HTTPError:
+            await _free_capacity()
             await _release_billing(request, billing, "backend_unavailable")
             logger.exception(
                 json.dumps(
@@ -425,6 +473,7 @@ def create_app() -> FastAPI:
         if upstream.status_code >= 400:
             content = await upstream.aread()
             await upstream.aclose()
+            await _free_capacity()
             await _release_billing(request, billing, f"upstream_{upstream.status_code}")
             return Response(
                 content=content,
@@ -442,6 +491,7 @@ def create_app() -> FastAPI:
                     parsed.model,
                     privacy,
                     backend.name,
+                    on_close=_free_capacity,
                 ),
                 status_code=upstream.status_code,
                 media_type=content_type,
@@ -449,6 +499,7 @@ def create_app() -> FastAPI:
             )
         content = await upstream.aread()
         await upstream.aclose()
+        await _free_capacity()
         usage = _usage_from_json(content)
         await _settle_billing(
             request,
@@ -667,6 +718,7 @@ async def _metered_stream(
     model: str,
     privacy: str,
     backend: str,
+    on_close: Callable[[], Awaitable[None]] | None = None,
 ) -> AsyncIterator[bytes]:
     pending = b""
     usage: dict[str, Any] | None = None
@@ -684,6 +736,8 @@ async def _metered_stream(
         if pending:
             usage = _usage_from_sse_line(pending) or usage
         await upstream.aclose()
+        if on_close is not None:
+            await on_close()
         await _settle_billing(request, billing, route, model, privacy, backend, usage)
 
 

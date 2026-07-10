@@ -42,3 +42,22 @@ models:
 
     with pytest.raises(ConfigurationError, match="revision must be a string"):
         GatewayConfig.load(path)
+
+
+def test_rejects_non_positive_max_concurrency(tmp_path: Path) -> None:
+    path = tmp_path / "invalid.yaml"
+    path.write_text(
+        """
+backends:
+  standard:
+    base_url: http://example
+    privacy: standard
+    max_concurrency: 0
+models:
+  model:
+    standard_backend: standard
+"""
+    )
+
+    with pytest.raises(ConfigurationError, match="max_concurrency must be a positive integer"):
+        GatewayConfig.load(path)

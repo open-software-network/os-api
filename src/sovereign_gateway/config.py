@@ -19,6 +19,7 @@ class Backend:
     api_key_env: str | None = None
     privacy: str = "standard"
     revision: str | None = None
+    max_concurrency: int | None = None
 
     @property
     def api_key(self) -> str | None:
@@ -72,12 +73,19 @@ class GatewayConfig:
             revision = item.get("revision")
             if revision is not None and not isinstance(revision, str):
                 raise ConfigurationError(f"backend {name!r} revision must be a string")
+            max_concurrency = item.get("max_concurrency")
+            if max_concurrency is not None:
+                if not isinstance(max_concurrency, int) or max_concurrency < 1:
+                    raise ConfigurationError(
+                        f"backend {name!r} max_concurrency must be a positive integer"
+                    )
             backends[name] = Backend(
                 name=name,
                 base_url=str(item["base_url"]).rstrip("/"),
                 api_key_env=item.get("api_key_env"),
                 privacy=privacy,
                 revision=revision,
+                max_concurrency=max_concurrency,
             )
 
         models: dict[str, ModelRoute] = {}
