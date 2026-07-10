@@ -419,6 +419,8 @@ def create_app() -> FastAPI:
             "x-compute-privacy": privacy,
             "x-model-backend": backend.name,
         }
+        if backend.revision:
+            response_headers["x-model-revision"] = backend.revision
         content_type = upstream.headers.get("content-type", "application/json")
         if upstream.status_code >= 400:
             content = await upstream.aread()

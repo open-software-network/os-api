@@ -23,3 +23,22 @@ models:
 
     with pytest.raises(ConfigurationError, match="confidential backend is not confidential"):
         GatewayConfig.load(path)
+
+
+def test_rejects_non_string_backend_revision(tmp_path: Path) -> None:
+    path = tmp_path / "invalid.yaml"
+    path.write_text(
+        """
+backends:
+  standard:
+    base_url: http://example
+    privacy: standard
+    revision: 123
+models:
+  model:
+    standard_backend: standard
+"""
+    )
+
+    with pytest.raises(ConfigurationError, match="revision must be a string"):
+        GatewayConfig.load(path)

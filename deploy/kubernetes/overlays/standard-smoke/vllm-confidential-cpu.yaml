@@ -6,7 +6,12 @@ metadata:
 spec:
   replicas: 0
   strategy:
-    type: Recreate
+    # A new model build must become ready (surging onto an autoscaled node)
+    # before the serving pod is removed; a bad rollout never drops capacity.
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       app: confidential-vllm

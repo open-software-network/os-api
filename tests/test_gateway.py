@@ -92,6 +92,25 @@ def test_required_routes_to_confidential_backend(
     assert json.loads(upstream_requests[-1].content)["model"] == "org/real-model"
 
 
+def test_responses_identify_model_revision_when_pinned(
+    client: TestClient, upstream_requests: list[httpx.Request]
+) -> None:
+    pinned = client.post(
+        "/v1/chat/completions",
+        headers={"X-Confidential-Compute": "required"},
+        json={"model": "dual-model", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    unpinned = client.post(
+        "/v1/chat/completions",
+        json={"model": "standard-only", "messages": []},
+    )
+
+    assert pinned.headers["x-model-backend"] == "tee"
+    assert pinned.headers["x-model-revision"] == "vllm-openai@testdigest0001"
+    assert unpinned.status_code == 200
+    assert "x-model-revision" not in unpinned.headers
+
+
 def test_required_never_downgrades(
     client: TestClient, upstream_requests: list[httpx.Request]
 ) -> None:

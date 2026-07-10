@@ -18,6 +18,7 @@ class Backend:
     base_url: str
     api_key_env: str | None = None
     privacy: str = "standard"
+    revision: str | None = None
 
     @property
     def api_key(self) -> str | None:
@@ -68,11 +69,15 @@ class GatewayConfig:
             privacy = item.get("privacy", "standard")
             if privacy not in {"standard", "confidential"}:
                 raise ConfigurationError(f"backend {name!r} has invalid privacy mode")
+            revision = item.get("revision")
+            if revision is not None and not isinstance(revision, str):
+                raise ConfigurationError(f"backend {name!r} revision must be a string")
             backends[name] = Backend(
                 name=name,
                 base_url=str(item["base_url"]).rstrip("/"),
                 api_key_env=item.get("api_key_env"),
                 privacy=privacy,
+                revision=revision,
             )
 
         models: dict[str, ModelRoute] = {}

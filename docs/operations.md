@@ -44,6 +44,18 @@ On any alert:
 5. If the model is unhealthy, fail the affected privacy mode closed rather than silently changing its privacy class.
 6. Record customer impact, start/end times, and corrective actions in the incident review.
 
+## Model rollouts
+
+Model server images are pinned by digest in `deploy/kubernetes` and never deployed by mutable tag. Every inference response identifies the artifact that served it: `x-model-backend` names the backend and `x-model-revision` carries the pinned image revision from the model configuration (`revision` per backend in `models.yaml`). When rolling a model image, update the digest in the manifests **and** the `revision` fields in both the in-cluster ConfigMap patch and the `cloudrun-model-config` secret so the header stays truthful.
+
+Roll out with `scripts/model_rollout.sh`, which enforces three gates:
+
+1. **Canary**: the exact new image starts as an off-service deployment on the production cluster (no Service selects it) and must answer golden prompts before any serving pod is touched.
+2. **Health-gated promotion**: the CPU model deployment uses `RollingUpdate` with `maxSurge: 1, maxUnavailable: 0`, so the old model keeps serving until the new pod is ready; a stuck rollout is automatically undone. The surge pod schedules onto an autoscaled node (the pool allows two nodes), so allow ~5–15 minutes.
+3. **Post-promote verification**: golden prompts run against the serving deployment; failure triggers an automatic `rollout undo`.
+
+The GPU deployment keeps `Recreate` because it owns a single dedicated TDX GPU node; treat GPU model rollouts as brief planned unavailability of the confidential GPU pool until capacity is diversified. Roll back manually at any time with `kubectl -n inference rollout undo deployment/<name>` — data and gateway config are unaffected by model rollbacks. The latest exercised rollout and automatic rollback are recorded in [the 2026-07-10 model rollout drill](recovery-drills/2026-07-10-model-rollout.md).
+
 ## Billing reconciliation
 
 Wallet charges use `inference:<billing_id>` as an idempotency key and are retried three times. A `wallet_charge_failed` event means inference was delivered and local usage settled, but the wallet charge did not confirm. Re-run only the idempotent charge for that billing ID after verifying its Firestore usage event. Never synthesize a new billing ID for the same usage.
