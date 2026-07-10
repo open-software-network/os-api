@@ -7,6 +7,9 @@ locals {
     "container.googleapis.com",
     "certificatemanager.googleapis.com",
     "cloudscheduler.googleapis.com",
+    "cloudkms.googleapis.com",
+    "cloudresourcemanager.googleapis.com",
+    "containeranalysis.googleapis.com",
     "firestore.googleapis.com",
     "iam.googleapis.com",
     "iamcredentials.googleapis.com",
@@ -125,9 +128,12 @@ resource "google_secret_manager_secret" "runtime" {
   for_each = toset([
     "app-client-api-key",
     "cloudrun-model-config",
+    "cloudrun-model-config-secondary",
     "gateway-api-key-hashes",
     "gateway-redis-ca",
+    "gateway-redis-ca-secondary",
     "gateway-redis-url",
+    "gateway-redis-url-secondary",
     "os-accounts-app-api-key",
     "os-accounts-client-id",
     "site-basic-auth-password",
@@ -162,9 +168,12 @@ resource "google_project_iam_member" "api_runtime_firestore" {
 resource "google_secret_manager_secret_iam_member" "api_runtime" {
   for_each = toset([
     "cloudrun-model-config",
+    "cloudrun-model-config-secondary",
     "gateway-api-key-hashes",
     "gateway-redis-ca",
+    "gateway-redis-ca-secondary",
     "gateway-redis-url",
+    "gateway-redis-url-secondary",
     "os-accounts-app-api-key",
     "os-accounts-client-id",
     "site-basic-auth-password",
@@ -253,6 +262,11 @@ resource "google_cloud_run_v2_service" "public_api" {
       env {
         name  = "GATEWAY_REGION"
         value = var.region
+      }
+
+      env {
+        name  = "ATTESTATION_AGENT_URL"
+        value = var.attestation_agent_url
       }
 
       env {
@@ -467,12 +481,13 @@ resource "google_container_cluster" "inference" {
   network    = google_compute_network.inference.id
   subnetwork = google_compute_subnetwork.gke.id
 
-  remove_default_node_pool = true
-  initial_node_count       = 1
-  deletion_protection      = var.deletion_protection
-  networking_mode          = "VPC_NATIVE"
-  datapath_provider        = "ADVANCED_DATAPATH"
-  enable_shielded_nodes    = true
+  remove_default_node_pool   = true
+  initial_node_count         = 1
+  deletion_protection        = var.deletion_protection
+  networking_mode            = "VPC_NATIVE"
+  datapath_provider          = "ADVANCED_DATAPATH"
+  enable_fqdn_network_policy = true
+  enable_shielded_nodes      = true
 
   release_channel {
     channel = "RAPID"

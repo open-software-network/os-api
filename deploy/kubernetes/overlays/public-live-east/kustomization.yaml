@@ -1,0 +1,53 @@
+# Secondary-region model plane (us-east4 cluster). Runs only the confidential
+# CPU vLLM workload and its internal load balancer; the in-cluster gateway is
+# not deployed here (production gateways run on Cloud Run), and the east
+# cluster has no system node pool for it.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../standard-smoke
+
+patches:
+  - target:
+      kind: Deployment
+      name: confidential-vllm-cpu
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 1
+  - target:
+      kind: Deployment
+      name: gateway
+    patch: |-
+      $patch: delete
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: gateway
+  - target:
+      kind: Service
+      name: gateway
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: gateway
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: gateway
+    patch: |-
+      $patch: delete
+      apiVersion: autoscaling/v2
+      kind: HorizontalPodAutoscaler
+      metadata:
+        name: gateway
+  - target:
+      kind: PodDisruptionBudget
+      name: gateway
+    patch: |-
+      $patch: delete
+      apiVersion: policy/v1
+      kind: PodDisruptionBudget
+      metadata:
+        name: gateway

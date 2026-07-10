@@ -56,6 +56,27 @@ jobs:
           test -n "${digest}"
           echo "reference=${IMAGE}@${digest}" >> "${GITHUB_OUTPUT}"
 
+      - name: Sign image for Binary Authorization
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Cloud Run evaluates the resolved platform manifest while GKE
+          # evaluates the reference as written, so sign the buildx index
+          # digest and every platform manifest digest beneath it.
+          keyversion="projects/${PROJECT_ID}/locations/${REGION}/keyRings/os-api-binauthz/cryptoKeys/release-signing/cryptoKeyVersions/1"
+          index_ref="${{ steps.image.outputs.reference }}"
+          platform_refs="$(docker buildx imagetools inspect "${index_ref}" --raw \
+            | jq -r '.manifests[] | select(.platform.os != "unknown") | .digest' \
+            | sed "s|^|${IMAGE}@|")"
+          for ref in "${index_ref}" ${platform_refs}; do
+            gcloud beta container binauthz attestations sign-and-create \
+              --project "${PROJECT_ID}" \
+              --artifact-url "${ref}" \
+              --attestor os-api-release \
+              --attestor-project "${PROJECT_ID}" \
+              --keyversion "${keyversion}"
+          done
+
       - name: Deploy private canary
         id: canary
         shell: bash

@@ -74,6 +74,11 @@ resource "google_cloud_run_v2_service" "api_canary" {
       }
 
       env {
+        name  = "ATTESTATION_AGENT_URL"
+        value = var.attestation_agent_url
+      }
+
+      env {
         name  = "APP_ORIGIN"
         value = "https://${var.public_api_domain}"
       }

@@ -56,6 +56,12 @@ Roll out with `scripts/model_rollout.sh`, which enforces three gates:
 
 The GPU deployment keeps `Recreate` because it owns a single dedicated TDX GPU node; treat GPU model rollouts as brief planned unavailability of the confidential GPU pool until capacity is diversified. Roll back manually at any time with `kubectl -n inference rollout undo deployment/<name>` — data and gateway config are unaffected by model rollbacks. The latest exercised rollout and automatic rollback are recorded in [the 2026-07-10 model rollout drill](recovery-drills/2026-07-10-model-rollout.md).
 
+## Confidential-compute attestation
+
+Clients can request cryptographic proof that confidential inference runs on genuine Intel TDX hardware bound to the deployed workload. A privileged DaemonSet (`deploy/kubernetes/attestation`) on each confidential node exposes a minimal quote agent that turns a 64-byte report-data value into a raw TDX quote via the kernel's `configfs-tsm` interface; it never sees prompts, keys, or customer data. `POST /v1/attestation` with `{"nonce": "<8-128 url-safe chars>"}` returns the quote plus the canonical binding it commits to: the client nonce, the gateway version and region, and the confidential backends with their pinned model revisions. The quote's report-data field is the SHA-512 of that binding, so a verifier confirms freshness (their nonce) and workload identity (versions/revisions) by recomputing the hash and checking it appears in the quote, then validating the quote against Intel's PCS certificate chain.
+
+The endpoint fails closed: if the agent is unreachable or returns an error, it responds `503 attestation_unavailable` and never substitutes unverifiable evidence. `ATTESTATION_AGENT_URL` per region points at the agent's internal load balancer; if that IP changes, update the Cloud Run env and Terraform var. What this proves is hardware-and-binding freshness; it is not yet a full remote-attestation PKI with quote-verification performed server-side, and the report-data binding covers configuration the gateway asserts rather than a measured boot of the model image — see the parity checklist for the remaining hardening.
+
 ## Billing reconciliation
 
 Wallet charges use `inference:<billing_id>` as an idempotency key and are retried three times. A `wallet_charge_failed` event means inference was delivered and local usage settled, but the wallet charge did not confirm. Re-run only the idempotent charge for that billing ID after verifying its Firestore usage event. Never synthesize a new billing ID for the same usage.
@@ -69,7 +75,23 @@ Wallet charges use `inference:<billing_id>` as an idempotency key and are retrie
 
 ## Supply chain
 
-Binary Authorization enforces a deny-by-default image allowlist on the inference GKE cluster and every gateway Cloud Run service: only images from the project's `sovereign-inference` Artifact Registry repository and the pinned `docker.io/vllm/*` model servers are admitted; Google-maintained GKE system images are exempted via the global policy. Enforcement is admission-time, so it never disrupts running workloads, and it is opt-in per workload — other clusters in the project are unaffected. A blocked deploy fails with `Denied by an ALWAYS_DENY admission rule`; fix the image source rather than editing the policy. The enforcement drill is recorded in [the 2026-07-10 Binary Authorization drill](recovery-drills/2026-07-10-binauthz.md).
+Binary Authorization enforces a deny-by-default policy on the inference clusters and every gateway Cloud Run service. Images from the project's `sovereign-inference` Artifact Registry repository must carry a signature from the `os-api-release` attestor (a Cloud KMS EC-P256 key); the pinned `docker.io/vllm/*` model servers are allowlisted by their digest-pinned references, and Google-maintained GKE system images are exempted via the global policy. Enforcement is admission-time, so it never disrupts running workloads, and it is opt-in per workload — other clusters in the project are unaffected.
+
+The GitHub deploy workflow signs every image it builds, for both the multi-arch index digest (what Cloud Run resolves) and each platform manifest digest (what GKE evaluates). To sign a digest by hand during a manual release or rollback drill:
+
+```bash
+gcloud beta container binauthz attestations sign-and-create \
+  --project=autonomous-lab-490610 \
+  --artifact-url="us-central1-docker.pkg.dev/autonomous-lab-490610/sovereign-inference/<repo>@sha256:<digest>" \
+  --attestor=os-api-release --attestor-project=autonomous-lab-490610 \
+  --keyversion="projects/autonomous-lab-490610/locations/us-central1/keyRings/os-api-binauthz/cryptoKeys/release-signing/cryptoKeyVersions/1"
+```
+
+Sign both the index digest and its `linux/amd64` platform digest (resolve them with `docker buildx imagetools inspect <ref> --raw`). An unsigned image fails with `denied by attestor ... No attestations found that were valid and signed by a key trusted by the attestor`; sign the digest rather than editing the policy. The enforcement and signing drills are recorded in [the 2026-07-10 Binary Authorization drill](recovery-drills/2026-07-10-binauthz.md).
+
+## Egress controls
+
+The model pods handle raw prompts and are the platform's highest exfiltration risk, so their egress is restricted with GKE Dataplane V2 policies: a standard NetworkPolicy denies all egress except DNS and in-cluster traffic, and an `FQDNNetworkPolicy` allows HTTPS only to the HuggingFace hostnames the servers pull weights from. A compromised model server therefore cannot open an arbitrary C2 channel or ship prompts to an unlisted host; a blocked destination times out (verified against `example.com:443`) while HuggingFace stays reachable. If a model source changes, update `deploy/kubernetes/base/egress-policy.yaml` — do not widen it to all HTTPS. The gateway runs on Cloud Run with VPC egress restricted to private ranges for in-VPC traffic; tightening its public egress further is future hardening.
 
 ## Site access gate
 
@@ -126,6 +148,10 @@ The latest completed exercise is recorded in [the 2026-07-10 recovery drill](rec
 
 The gateway runs in us-central1 (`sovereign-api`) and us-east4 (`sovereign-api-secondary`) behind the same global load balancer, on the same image digest, against the same nam7 Firestore database. Every response carries an `x-gateway-region` header identifying the serving region. Both internal model load balancers set `allowGlobalAccess`, and the vLLM NetworkPolicies admit both gateway subnets (10.20.0.0/20 and 10.30.0.0/24); a change to either breaks cross-region inference silently, so rerun the failover drill after touching them.
 
-Known regional single points of failure: Redis (rate limits and spend reservations) and the GKE model cluster both live in us-central1. A full us-central1 outage therefore still takes down inference and readiness in both regions. Do not advertise a regional-outage SLO until those are replicated.
+Each region is now independent for its regional dependencies. Every gateway region has its own Memorystore instance (`sovereign-inference-limits` in us-central1, `-limits-us-east4` in us-east4) and its own confidential model cluster (`sovereign-inference` and `sovereign-inference-us-east4`), selected through per-region `cloudrun-model-config` secrets. Spend limits and settlement remain globally consistent because they live in the multi-region Firestore database, not Redis.
+
+Because Redis is per-region and only backs rate limiting and admission control — which fail open — a Redis outage degrades one region rather than failing it. `/readyz` reflects this: it fails readiness only when Firestore (the system of record) is unreachable; Redis is reported as `degraded` but keeps the region ready and serving. A degraded region logs `redis_degraded` and raises the "serving with Redis degraded" alert; per-key RPM and per-backend `max_concurrency` are unenforced there until Redis recovers, while hard spend limits and Cloud Armor per-IP limits still apply. Consequence to remember: these limits are per-region bounds, so a cross-region traffic split can allow up to 2x a single region's configured rate before spend limits catch it.
+
+There is no remaining shared regional single point of failure in the serving path. GPU capacity is still a single dedicated node class (see the capacity section) and remains the one non-replicated resource.
 
 To fail away from a region, detach its NEG from the `os-api-edge` backend service and confirm the other region serves via the header; restore by re-running `terraform apply`, which is authoritative for the backend set. Failback routing is eventually consistent — judge recovery by the attached backend set and continuous 200s, not by which region serves your client. The latest exercise, including two defects the first attempt surfaced, is recorded in [the 2026-07-10 failover drill](recovery-drills/2026-07-10-failover.md).

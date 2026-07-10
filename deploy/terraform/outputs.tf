@@ -28,6 +28,24 @@ output "redis_auth_string" {
   sensitive = true
 }
 
+output "redis_secondary_host" {
+  value = try(google_redis_instance.rate_limits_secondary[0].host, null)
+}
+
+output "redis_secondary_port" {
+  value = try(google_redis_instance.rate_limits_secondary[0].port, null)
+}
+
+output "redis_secondary_ca_cert" {
+  value     = try(google_redis_instance.rate_limits_secondary[0].server_ca_certs[0].cert, null)
+  sensitive = true
+}
+
+output "redis_secondary_auth_string" {
+  value     = try(google_redis_instance.rate_limits_secondary[0].auth_string, null)
+  sensitive = true
+}
+
 output "get_credentials_command" {
   value = "gcloud container clusters get-credentials ${google_container_cluster.inference.name} --region ${var.region} --project ${var.project_id}"
 }

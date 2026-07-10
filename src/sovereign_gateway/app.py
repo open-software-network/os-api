@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
+import hashlib
 import json
 import logging
 import os
@@ -121,7 +123,13 @@ def _settings() -> tuple[
     rpm = int(os.getenv("REQUESTS_PER_MINUTE", "60"))
     redis_url = os.getenv("REDIS_URL")
     if redis_url:
-        redis_options: dict[str, Any] = {"decode_responses": True}
+        # Bound every Redis operation so a network partition degrades fast to
+        # the fail-open path instead of hanging the request (and /readyz).
+        redis_options: dict[str, Any] = {
+            "decode_responses": True,
+            "socket_connect_timeout": 1.0,
+            "socket_timeout": 1.0,
+        }
         redis_ca_cert = os.getenv("REDIS_CA_CERT_PATH")
         if redis_url.startswith("rediss://"):
             redis_options["ssl_cert_reqs"] = "required"
@@ -255,23 +263,31 @@ def create_app() -> FastAPI:
     @app.get("/readyz", include_in_schema=False)
     async def readyz(request: Request) -> Response:
         components: dict[str, str] = {}
-        if request.app.state.redis:
-            try:
-                await request.app.state.redis.ping()
-            except Exception:
-                components["redis"] = "unavailable"
-            else:
-                components["redis"] = "ready"
+        # Firestore is the system of record for keys, spend, and audit; it is
+        # required for correct operation, so readiness fails when it is down.
+        # Redis only backs rate limiting and admission control, which fail
+        # open, so a Redis outage is reported as "degraded" but does not block
+        # a region from starting or serving — otherwise the fail-open path
+        # could never engage for a fresh instance.
+        required_ok = True
         if request.app.state.managed_keys:
             try:
                 await request.app.state.managed_keys.healthcheck()
             except Exception:
                 components["firestore"] = "unavailable"
+                required_ok = False
             else:
                 components["firestore"] = "ready"
-        status = "ready" if all(value == "ready" for value in components.values()) else "not_ready"
+        if request.app.state.redis:
+            try:
+                await asyncio.wait_for(request.app.state.redis.ping(), timeout=2)
+            except Exception:
+                components["redis"] = "degraded"
+            else:
+                components["redis"] = "ready"
+        status = "ready" if required_ok else "not_ready"
         return JSONResponse(
-            status_code=200 if status == "ready" else 503,
+            status_code=200 if required_ok else 503,
             content={"status": status, "components": components},
         )
 
@@ -305,6 +321,86 @@ def create_app() -> FastAPI:
                     }
                     for model in config.models.values()
                 ],
+            }
+        )
+
+    @app.post("/v1/attestation")
+    async def attestation(request: Request) -> Response:
+        auth_error = await _authorize(request)
+        if auth_error:
+            return auth_error
+        agent_url = os.getenv("ATTESTATION_AGENT_URL", "").rstrip("/")
+        if not agent_url:
+            return openai_error(
+                503,
+                "Attestation evidence is not available in this deployment",
+                error_type="server_error",
+                code="attestation_unavailable",
+            )
+        try:
+            payload = json.loads(await request.body() or b"{}")
+        except json.JSONDecodeError:
+            return openai_error(400, "Request body must be JSON", code="invalid_request")
+        nonce = payload.get("nonce", "")
+        if not isinstance(nonce, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", nonce):
+            return openai_error(
+                400,
+                "nonce must be 8-128 URL-safe characters",
+                code="invalid_nonce",
+            )
+        config: GatewayConfig = request.app.state.config
+        binding = {
+            "nonce": nonce,
+            "gateway_version": __version__,
+            "gateway_region": os.getenv("GATEWAY_REGION", "local"),
+            "confidential_backends": sorted(
+                (
+                    {"backend": backend.name, "revision": backend.revision}
+                    for backend in config.backends.values()
+                    if backend.privacy == "confidential"
+                ),
+                key=lambda item: item["backend"],
+            ),
+            "issued_at": int(time.time()),
+        }
+        binding_canonical = json.dumps(binding, separators=(",", ":"), sort_keys=True)
+        report_data = hashlib.sha512(binding_canonical.encode()).hexdigest()
+        try:
+            upstream = await request.app.state.http.post(
+                f"{agent_url}/quote",
+                json={"report_data": report_data},
+                timeout=30,
+            )
+        except httpx.HTTPError:
+            upstream = None
+        if upstream is None or upstream.status_code != 200:
+            # Fail closed: never substitute unverifiable evidence.
+            logger.error(
+                json.dumps(
+                    {
+                        "severity": "ERROR",
+                        "event": "attestation_unavailable",
+                        "request_id": request.state.request_id,
+                    },
+                    separators=(",", ":"),
+                )
+            )
+            return openai_error(
+                503,
+                "Attestation evidence is temporarily unavailable",
+                error_type="server_error",
+                code="attestation_unavailable",
+            )
+        evidence = upstream.json()
+        return JSONResponse(
+            content={
+                "object": "attestation",
+                "format": "tdx.quote.v4",
+                "binding": binding,
+                "binding_canonical": binding_canonical,
+                "report_data_sha512": report_data,
+                "quote_provider": evidence.get("provider"),
+                "quote": evidence.get("quote"),
             }
         )
 
@@ -367,9 +463,27 @@ def create_app() -> FastAPI:
 
         capacity_held = False
         if backend.max_concurrency:
-            admitted = await request.app.state.concurrency.acquire(
-                backend.name, backend.max_concurrency
-            )
+            try:
+                admitted = await request.app.state.concurrency.acquire(
+                    backend.name, backend.max_concurrency
+                )
+                capacity_held = admitted
+            except Exception:
+                # Fail open: losing admission control degrades to upstream
+                # queueing, which beats rejecting all inference in the region.
+                logger.exception(
+                    json.dumps(
+                        {
+                            "severity": "WARNING",
+                            "event": "redis_degraded",
+                            "check": "concurrency",
+                            "request_id": request.state.request_id,
+                            "backend": backend.name,
+                        },
+                        separators=(",", ":"),
+                    )
+                )
+                admitted = True
             if not admitted:
                 logger.warning(
                     json.dumps(
@@ -390,13 +504,27 @@ def create_app() -> FastAPI:
                     code="model_overloaded",
                     headers={"retry-after": "10"},
                 )
-            capacity_held = True
 
         async def _free_capacity() -> None:
             nonlocal capacity_held
             if capacity_held:
                 capacity_held = False
-                await request.app.state.concurrency.release(backend.name)
+                try:
+                    await request.app.state.concurrency.release(backend.name)
+                except Exception:
+                    # The counter's expiry self-heals a missed release.
+                    logger.exception(
+                        json.dumps(
+                            {
+                                "severity": "WARNING",
+                                "event": "redis_degraded",
+                                "check": "concurrency_release",
+                                "request_id": request.state.request_id,
+                                "backend": backend.name,
+                            },
+                            separators=(",", ":"),
+                        )
+                    )
 
         billing = await _prepare_billing(request, route, payload, len(raw))
         if isinstance(billing, Response):
@@ -544,20 +672,23 @@ async def _authorize(request: Request) -> Response | None:
     try:
         allowed, remaining = await request.app.state.limiter.allow(principal.tenant_id)
     except Exception:
+        # Fail open: hard spend limits stay enforced in Firestore and Cloud
+        # Armor still caps per-IP rates at the edge, so availability wins over
+        # a temporarily unenforced per-key RPM. The alert on this event is the
+        # signal to fail the region away per the runbook.
         logger.exception(
             json.dumps(
                 {
-                    "event": "rate_limiter_unavailable",
+                    "severity": "WARNING",
+                    "event": "redis_degraded",
+                    "check": "rate_limit",
                     "request_id": request.state.request_id,
-                }
+                },
+                separators=(",", ":"),
             )
         )
-        return openai_error(
-            503,
-            "Rate-limit service is unavailable",
-            error_type="server_error",
-            code="rate_limiter_unavailable",
-        )
+        request.state.principal = principal
+        return None
     reset_at = (int(time.time()) // 60 + 1) * 60
     request.state.rate_limit_remaining = remaining
     request.state.rate_limit_reset = reset_at

@@ -1,3 +1,26 @@
+# Each region's gateway uses its own Redis so a regional Redis loss cannot
+# take down the other region. Redis holds only per-key rate windows and
+# per-backend in-flight counters; spend limits and settlement live in the
+# multi-region Firestore database, so they stay globally consistent. The
+# documented consequence: per-key RPM and per-backend max_concurrency are
+# per-region bounds (worst case 2x during a cross-region traffic split).
+resource "google_redis_instance" "rate_limits_secondary" {
+  count = var.enable_multi_region_control_plane ? 1 : 0
+
+  name                    = "${var.cluster_name}-limits-${var.secondary_region}"
+  region                  = var.secondary_region
+  tier                    = "STANDARD_HA"
+  memory_size_gb          = 1
+  redis_version           = "REDIS_7_2"
+  authorized_network      = google_compute_network.inference.id
+  connect_mode            = "DIRECT_PEERING"
+  auth_enabled            = true
+  transit_encryption_mode = "SERVER_AUTHENTICATION"
+  labels                  = var.labels
+
+  depends_on = [google_project_service.required]
+}
+
 resource "google_compute_subnetwork" "gateway_secondary" {
   count = var.enable_multi_region_control_plane ? 1 : 0
 
@@ -84,6 +107,11 @@ resource "google_cloud_run_v2_service" "public_api_secondary" {
       }
 
       env {
+        name  = "ATTESTATION_AGENT_URL"
+        value = var.attestation_agent_url_secondary
+      }
+
+      env {
         name  = "APP_ORIGIN"
         value = "https://${var.public_api_domain}"
       }
@@ -122,7 +150,7 @@ resource "google_cloud_run_v2_service" "public_api_secondary" {
         name = "REDIS_URL"
         value_source {
           secret_key_ref {
-            secret  = google_secret_manager_secret.runtime["gateway-redis-url"].secret_id
+            secret  = google_secret_manager_secret.runtime["gateway-redis-url-secondary"].secret_id
             version = "latest"
           }
         }
@@ -205,7 +233,7 @@ resource "google_cloud_run_v2_service" "public_api_secondary" {
     volumes {
       name = "models"
       secret {
-        secret       = google_secret_manager_secret.runtime["cloudrun-model-config"].secret_id
+        secret       = google_secret_manager_secret.runtime["cloudrun-model-config-secondary"].secret_id
         default_mode = 292
         items {
           version = "latest"
@@ -217,7 +245,7 @@ resource "google_cloud_run_v2_service" "public_api_secondary" {
     volumes {
       name = "redis-ca"
       secret {
-        secret       = google_secret_manager_secret.runtime["gateway-redis-ca"].secret_id
+        secret       = google_secret_manager_secret.runtime["gateway-redis-ca-secondary"].secret_id
         default_mode = 292
         items {
           version = "latest"

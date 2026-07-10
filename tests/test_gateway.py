@@ -211,6 +211,34 @@ def test_readiness_reports_dependency_state(client: TestClient) -> None:
     assert response.json() == {"status": "ready", "components": {}}
 
 
+def test_readiness_stays_ready_when_redis_degraded(client: TestClient) -> None:
+    class DownRedis:
+        async def ping(self) -> None:
+            raise ConnectionError("redis down")
+
+    client.app.state.redis = DownRedis()
+
+    response = client.get("/readyz")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ready"
+    assert body["components"]["redis"] == "degraded"
+
+
+def test_readiness_fails_when_firestore_down(client: TestClient) -> None:
+    class DownKeys:
+        async def healthcheck(self) -> None:
+            raise ConnectionError("firestore down")
+
+    client.app.state.managed_keys = DownKeys()
+
+    response = client.get("/readyz")
+
+    assert response.status_code == 503
+    assert response.json()["components"]["firestore"] == "unavailable"
+
+
 def test_unhandled_api_errors_use_safe_openai_shape(client: TestClient) -> None:
     async def broken_send(*args, **kwargs):
         raise RuntimeError("sensitive internal detail")

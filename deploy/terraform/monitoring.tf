@@ -304,6 +304,58 @@ resource "google_monitoring_alert_policy" "model_overloaded" {
   }
 }
 
+resource "google_logging_metric" "redis_degraded" {
+  count = var.enable_public_api && var.enable_monitoring ? 1 : 0
+
+  name        = "os_api_redis_degraded"
+  description = "Requests served with rate limiting or admission control failed open because Redis was unreachable"
+  filter      = "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=~\"^sovereign-api(-secondary)?$\" AND jsonPayload.event=\"redis_degraded\""
+
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+    unit        = "1"
+  }
+}
+
+resource "google_monitoring_alert_policy" "redis_degraded" {
+  count = var.enable_public_api && var.enable_monitoring ? 1 : 0
+
+  display_name          = "OpenSoftware API serving with Redis degraded"
+  combiner              = "OR"
+  notification_channels = local.alert_notification_channels
+
+  conditions {
+    display_name = "Rate limiting or admission control failing open"
+
+    condition_threshold {
+      filter          = "resource.type = \"cloud_run_revision\" AND metric.type = \"logging.googleapis.com/user/${google_logging_metric.redis_degraded[0].name}\""
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0
+      duration        = "120s"
+
+      aggregations {
+        alignment_period     = "60s"
+        per_series_aligner   = "ALIGN_DELTA"
+        cross_series_reducer = "REDUCE_SUM"
+      }
+    }
+  }
+
+  alert_strategy {
+    auto_close = "1800s"
+  }
+
+  documentation {
+    content   = "A gateway region is serving with Redis unreachable: per-key rate limits and per-backend admission control are failing open in that region. Hard spend limits remain enforced in Firestore and Cloud Armor still caps per-IP rates. Identify the affected region from the log entries, check the regional Memorystore instance, and if it will not recover promptly, detach that region's NEG from os-api-edge per the regional failover runbook."
+    mime_type = "text/markdown"
+  }
+
+  timeouts {
+    create = "5m"
+  }
+}
+
 resource "google_logging_metric" "upstream_failures" {
   count = var.enable_public_api && var.enable_monitoring ? 1 : 0
 

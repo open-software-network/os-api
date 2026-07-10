@@ -135,6 +135,30 @@ variable "enable_multi_region_control_plane" {
   default     = false
 }
 
+variable "enable_multi_region_model_plane" {
+  description = "Run a second confidential CPU model cluster in the secondary region so inference survives a primary-region loss. Adds roughly one c3-standard-4 node plus a GKE cluster fee while enabled."
+  type        = bool
+  default     = false
+}
+
+variable "operator_email" {
+  description = "Human operator account granted release-signing rights for manual releases and drills."
+  type        = string
+  default     = ""
+}
+
+variable "attestation_agent_url" {
+  description = "Internal URL of the TDX quote agent (deploy/kubernetes/attestation). Empty disables /v1/attestation, which then fails closed. If the agent's internal LB IP changes, update this value."
+  type        = string
+  default     = ""
+}
+
+variable "attestation_agent_url_secondary" {
+  description = "Internal URL of the TDX quote agent serving the secondary region."
+  type        = string
+  default     = ""
+}
+
 variable "enable_binary_authorization" {
   description = "Enforce the project Binary Authorization allowlist on the inference cluster and the gateway Cloud Run services."
   type        = bool

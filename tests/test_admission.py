@@ -85,6 +85,32 @@ def test_streaming_request_releases_capacity_after_stream(client: TestClient) ->
     assert limiter.releases == 1
 
 
+class FailingLimiter:
+    async def acquire(self, backend: str, limit: int) -> bool:
+        raise ConnectionError("redis down")
+
+    async def release(self, backend: str) -> None:
+        raise ConnectionError("redis down")
+
+    async def allow(self, principal: str) -> tuple[bool, int]:
+        raise ConnectionError("redis down")
+
+
+def test_redis_loss_fails_open_for_rate_limit_and_admission(client: TestClient) -> None:
+    failing = FailingLimiter()
+    client.app.state.limiter = failing
+    client.app.state.concurrency = failing
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"X-Confidential-Compute": "required"},
+        json={"model": "dual-model", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert "x-ratelimit-remaining-requests" not in response.headers
+
+
 def test_unlimited_backend_skips_admission_control(client: TestClient) -> None:
     limiter = RecordingLimiter(admit=False)
     client.app.state.concurrency = limiter
