@@ -150,7 +150,7 @@ variable "github_repository_owner_id" {
 variable "gateway_image" {
   description = "Digest-pinned gateway container deployed to Cloud Run."
   type        = string
-  default     = "us-central1-docker.pkg.dev/autonomous-lab-490610/sovereign-inference/gateway@sha256:e43b5dc8976fb12eb978256e4edff1d89c6f85fcdadd45030e0099298b2c21ef"
+  default     = "us-central1-docker.pkg.dev/autonomous-lab-490610/sovereign-inference/gateway@sha256:409e0860e8d21b604945ec81b307591d81f43d233c360f8812fbf1628ab1599d"
 }
 
 variable "deletion_protection" {
