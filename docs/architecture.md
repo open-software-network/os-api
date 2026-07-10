@@ -37,4 +37,4 @@ For stronger organizational isolation, move confidential serving to a separate p
 
 OpenSoftware Accounts owns user identity and the Credit wallet. Firestore owns SHA-256 API-key records, revocation, expiration, spend reservations, and immutable usage events. Memorystore owns short-lived distributed request counters. None of these stores prompt or completion text.
 
-GitHub Actions obtains short-lived GCP credentials through Workload Identity Federation. The provider accepts only the immutable numeric repository and organization IDs on `refs/heads/main`; no service-account key is stored in GitHub. A candidate revision receives zero traffic until its readiness and authenticated model-list smoke tests pass.
+GitHub Actions obtains short-lived GCP credentials through Workload Identity Federation. The provider accepts only the immutable numeric repository and organization IDs on `refs/heads/main`; no service-account key is stored in GitHub. A private IAM-gated canary service validates the exact image digest against Redis, Firestore, and authenticated model discovery before the digest is deployed to production.

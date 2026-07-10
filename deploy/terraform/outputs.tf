@@ -36,6 +36,10 @@ output "public_api_url" {
   value = try(google_cloud_run_v2_service.public_api[0].uri, null)
 }
 
+output "canary_api_url" {
+  value = try(google_cloud_run_v2_service.api_canary[0].uri, null)
+}
+
 output "production_edge_ip" {
   value = try(google_compute_global_address.public_api[0].address, null)
 }

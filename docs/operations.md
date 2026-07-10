@@ -9,10 +9,10 @@
 
 ## Release process
 
-The `Deploy production` GitHub workflow is manually dispatched from `main`. It authenticates with GCP Workload Identity Federation, builds an SBOM/provenance-attested image, pushes it to Artifact Registry, and deploys the image by digest to a zero-traffic candidate revision. It promotes the revision only after:
+The `Deploy production` GitHub workflow is manually dispatched from `main`. It authenticates with GCP Workload Identity Federation, builds an SBOM/provenance-attested image, pushes it to Artifact Registry, and deploys the image by digest to a private IAM-gated canary service. It deploys and promotes the identical digest to production only after:
 
-1. `/readyz` confirms Redis and Firestore access.
-2. An authenticated `/v1/models` call succeeds with the dedicated smoke key.
+1. The canary `/readyz` confirms Redis and Firestore access.
+2. An IAM-authenticated canary `/v1/models` call succeeds with the dedicated smoke key.
 3. The public readiness endpoint succeeds after traffic promotion.
 
 The previous revision remains available for rollback:
