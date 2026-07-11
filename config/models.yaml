@@ -1,17 +1,296 @@
-backends:
-  standard-vllm:
-    base_url: http://standard-vllm:8000
-    privacy: standard
-  confidential-vllm:
-    base_url: http://confidential-vllm.inference.svc.cluster.local:8000
-    privacy: confidential
+providers:
+  phala:
+    name: Phala Confidential AI
+    base_url: https://inference.phala.com
+    api_key_env: PHALA_API_KEY
+    adapter: phala
+    regions: [global]
+  venice:
+    name: Venice E2EE
+    base_url: https://api.venice.ai/api
+    api_key_env: VENICE_API_KEY
+    adapter: venice
+    regions: [global]
 
 models:
-  llama-3.1-8b-instruct:
-    upstream_model: meta-llama/Llama-3.1-8B-Instruct
-    standard_backend: standard-vllm
-    confidential_backend: confidential-vllm
-    owned_by: self-hosted
-    max_context_length: 8192
-    input_price_microusd_per_million: 100000
-    output_price_microusd_per_million: 200000
+  openai/gpt-oss-20b:
+    owned_by: openai
+    max_context_length: 128000
+    max_output_length: 128000
+    capabilities: [reasoning]
+  openai/gpt-oss-120b:
+    owned_by: openai
+    max_context_length: 128000
+    max_output_length: 128000
+    capabilities: [reasoning]
+  google/gemma-3-27b-it:
+    owned_by: google
+    max_context_length: 40000
+    max_output_length: 16384
+  qwen/qwen-2.5-7b-instruct:
+    owned_by: qwen
+    max_context_length: 32000
+    max_output_length: 32000
+  deepseek/deepseek-v4-flash:
+    owned_by: deepseek
+    max_context_length: 1000000
+    max_output_length: 65536
+    capabilities: [reasoning]
+  z-ai/glm-5.2:
+    owned_by: z-ai
+    max_context_length: 1000000
+    max_output_length: 131072
+    capabilities: [tools, tool_choice, structured_outputs, reasoning]
+  qwen/qwen3.6-27b:
+    owned_by: qwen
+    max_context_length: 256000
+    max_output_length: 262140
+    capabilities: [tools, reasoning]
+  moonshotai/kimi-k2.6:
+    owned_by: moonshotai
+    max_context_length: 262144
+    max_output_length: 262144
+    capabilities: [tools, tool_choice, structured_outputs, reasoning]
+
+endpoints:
+  phala-gpt-oss-20b:
+    model: openai/gpt-oss-20b
+    provider: phala
+    upstream_model: openai/gpt-oss-20b
+    priority: 10
+    capabilities: [tools, tool_choice, structured_outputs, reasoning]
+    privacy:
+      level: tee
+      execution: gpu-tee
+      retention: zero
+      attestation: phala-aci-receipt
+      transport: tee-terminated-tls
+    pricing:
+      input_per_million_usd: 0.04
+      output_per_million_usd: 0.15
+  venice-gpt-oss-20b-e2ee:
+    model: openai/gpt-oss-20b
+    provider: venice
+    upstream_model: e2ee-gpt-oss-20b-p
+    priority: 20
+    requires_client_encryption: true
+    capabilities: [reasoning]
+    privacy:
+      level: e2ee-tee
+      execution: gpu-tee
+      retention: zero
+      attestation: venice-tee-signature
+      transport: client-e2ee
+    pricing:
+      input_per_million_usd: 0.05
+      output_per_million_usd: 0.19
+
+  phala-gpt-oss-120b:
+    model: openai/gpt-oss-120b
+    provider: phala
+    upstream_model: openai/gpt-oss-120b
+    priority: 10
+    capabilities: [tools, tool_choice, structured_outputs, reasoning]
+    privacy:
+      level: tee
+      execution: gpu-tee
+      retention: zero
+      attestation: phala-aci-receipt
+      transport: tee-terminated-tls
+    pricing:
+      input_per_million_usd: 0.15
+      output_per_million_usd: 0.60
+  venice-gpt-oss-120b-e2ee:
+    model: openai/gpt-oss-120b
+    provider: venice
+    upstream_model: e2ee-gpt-oss-120b-p
+    priority: 20
+    requires_client_encryption: true
+    capabilities: [reasoning]
+    privacy:
+      level: e2ee-tee
+      execution: gpu-tee
+      retention: zero
+      attestation: venice-tee-signature
+      transport: client-e2ee
+    pricing:
+      input_per_million_usd: 0.13
+      output_per_million_usd: 0.65
+
+  phala-gemma-3-27b:
+    model: google/gemma-3-27b-it
+    provider: phala
+    upstream_model: google/gemma-3-27b-it
+    priority: 10
+    capabilities: [tools, tool_choice, structured_outputs]
+    privacy:
+      level: tee
+      execution: gpu-tee
+      retention: zero
+      attestation: phala-aci-receipt
+      transport: tee-terminated-tls
+    pricing:
+      input_per_million_usd: 0.15
+      output_per_million_usd: 0.46
+      cache_read_per_million_usd: 0.075
+  venice-gemma-3-27b-e2ee:
+    model: google/gemma-3-27b-it
+    provider: venice
+    upstream_model: e2ee-gemma-3-27b-p
+    priority: 20
+    requires_client_encryption: true
+    privacy:
+      level: e2ee-tee
+      execution: gpu-tee
+      retention: zero
+      attestation: venice-tee-signature
+      transport: client-e2ee
+    pricing:
+      input_per_million_usd: 0.14
+      output_per_million_usd: 0.50
+
+  phala-qwen-2.5-7b:
+    model: qwen/qwen-2.5-7b-instruct
+    provider: phala
+    upstream_model: qwen/qwen-2.5-7b-instruct
+    priority: 10
+    capabilities: [tools, tool_choice]
+    privacy:
+      level: tee
+      execution: gpu-tee
+      retention: zero
+      attestation: phala-aci-receipt
+      transport: tee-terminated-tls
+    pricing:
+      input_per_million_usd: 0.04
+      output_per_million_usd: 0.10
+  venice-qwen-2.5-7b-e2ee:
+    model: qwen/qwen-2.5-7b-instruct
+    provider: venice
+    upstream_model: e2ee-qwen-2-5-7b-p
+    priority: 20
+    requires_client_encryption: true
+    privacy:
+      level: e2ee-tee
+      execution: gpu-tee
+      retention: zero
+      attestation: venice-tee-signature
+      transport: client-e2ee
+    pricing:
+      input_per_million_usd: 0.05
+      output_per_million_usd: 0.13
+
+  phala-deepseek-v4-flash:
+    model: deepseek/deepseek-v4-flash
+    provider: phala
+    upstream_model: deepseek/deepseek-v4-flash
+    priority: 10
+    privacy:
+      level: tee
+      execution: gpu-tee
+      retention: zero
+      attestation: phala-aci-receipt
+      transport: tee-terminated-tls
+    pricing:
+      input_per_million_usd: 0.20
+      output_per_million_usd: 0.40
+  venice-deepseek-v4-flash-e2ee:
+    model: deepseek/deepseek-v4-flash
+    provider: venice
+    upstream_model: e2ee-deepseek-v4-flash
+    priority: 20
+    requires_client_encryption: true
+    capabilities: [tools, reasoning]
+    privacy:
+      level: e2ee-tee
+      execution: gpu-tee
+      retention: zero
+      attestation: venice-tee-signature
+      transport: client-e2ee
+    pricing:
+      input_per_million_usd: 0.182
+      output_per_million_usd: 0.373
+      cache_read_per_million_usd: 0.038
+
+  phala-glm-5.2:
+    model: z-ai/glm-5.2
+    provider: phala
+    upstream_model: z-ai/glm-5.2
+    priority: 10
+    capabilities: [tools, tool_choice, structured_outputs, reasoning]
+    privacy:
+      level: tee
+      execution: gpu-tee
+      retention: zero
+      attestation: phala-aci-receipt
+      transport: tee-terminated-tls
+    pricing:
+      input_per_million_usd: 1.40
+      output_per_million_usd: 4.40
+      cache_read_per_million_usd: 0.70
+  venice-glm-5.2-e2ee:
+    model: z-ai/glm-5.2
+    provider: venice
+    upstream_model: e2ee-glm-5-2-p
+    priority: 20
+    requires_client_encryption: true
+    capabilities: [tools, tool_choice, reasoning]
+    privacy:
+      level: e2ee-tee
+      execution: gpu-tee
+      retention: zero
+      attestation: venice-tee-signature
+      transport: client-e2ee
+    pricing:
+      input_per_million_usd: 1.75
+      output_per_million_usd: 5.75
+
+  phala-qwen3.6-27b:
+    model: qwen/qwen3.6-27b
+    provider: phala
+    upstream_model: qwen/qwen3.6-27b
+    priority: 10
+    privacy:
+      level: tee
+      execution: gpu-tee
+      retention: zero
+      attestation: phala-aci-receipt
+      transport: tee-terminated-tls
+    pricing:
+      input_per_million_usd: 0.32
+      output_per_million_usd: 2.70
+      cache_read_per_million_usd: 0.15
+  venice-qwen3.6-27b-e2ee:
+    model: qwen/qwen3.6-27b
+    provider: venice
+    upstream_model: e2ee-qwen3-6-27b
+    priority: 20
+    requires_client_encryption: true
+    capabilities: [tools, reasoning]
+    privacy:
+      level: e2ee-tee
+      execution: gpu-tee
+      retention: zero
+      attestation: venice-tee-signature
+      transport: client-e2ee
+    pricing:
+      input_per_million_usd: 0.346
+      output_per_million_usd: 3.46
+      cache_read_per_million_usd: 0.171
+
+  phala-kimi-k2.6:
+    model: moonshotai/kimi-k2.6
+    provider: phala
+    upstream_model: moonshotai/kimi-k2.6
+    priority: 10
+    capabilities: [tools, tool_choice, structured_outputs, reasoning]
+    privacy:
+      level: tee
+      execution: gpu-tee
+      retention: zero
+      attestation: phala-aci-receipt
+      transport: tee-terminated-tls
+    pricing:
+      input_per_million_usd: 1.09
+      output_per_million_usd: 4.60
+      cache_read_per_million_usd: 0.37

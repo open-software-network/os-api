@@ -5,6 +5,7 @@ metadata:
   namespace: inference
   annotations:
     networking.gke.io/load-balancer-type: Internal
+    networking.gke.io/internal-load-balancer-allow-global-access: "true"
 spec:
   selector:
     app: standard-vllm
@@ -28,6 +29,9 @@ spec:
     - from:
         - ipBlock:
             cidr: 10.20.0.0/20
+        - ipBlock:
+            # us-east4 gateway subnet; internal passthrough LB preserves source IP
+            cidr: 10.30.0.0/24
       ports:
         - protocol: TCP
           port: 8000
@@ -39,6 +43,7 @@ metadata:
   namespace: inference
   annotations:
     networking.gke.io/load-balancer-type: Internal
+    networking.gke.io/internal-load-balancer-allow-global-access: "true"
 spec:
   selector:
     app: confidential-vllm
@@ -62,6 +67,9 @@ spec:
     - from:
         - ipBlock:
             cidr: 10.20.0.0/20
+        - ipBlock:
+            # us-east4 gateway subnet; internal passthrough LB preserves source IP
+            cidr: 10.30.0.0/24
       ports:
         - protocol: TCP
           port: 8000

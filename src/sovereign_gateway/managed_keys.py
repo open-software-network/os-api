@@ -102,11 +102,14 @@ class ManagedKeyRepository(Protocol):
 
     async def list_usage(self, user_id: str, limit: int = 50) -> list[dict[str, Any]]: ...
 
+    async def list_audit_events(self, user_id: str, limit: int = 1000) -> list[dict[str, Any]]: ...
+
 
 class InMemoryKeyRepository:
     def __init__(self) -> None:
         self.records: dict[str, dict[str, Any]] = {}
         self.usage: dict[str, dict[str, Any]] = {}
+        self.audit: dict[str, dict[str, Any]] = {}
         self._lock = asyncio.Lock()
 
     async def healthcheck(self) -> None:
@@ -154,6 +157,15 @@ class InMemoryKeyRepository:
         }
         async with self._lock:
             self.records[key_id] = item
+            audit_id, event = _new_audit_event(
+                user_id,
+                "api_key.created",
+                key_id=key_id,
+                key_name=name,
+                expires_at=expires_at,
+                spend_limit_microusd=spend_limit_microusd,
+            )
+            self.audit[audit_id] = event
         return CreatedApiKey(_to_record(key_id, item), raw_key)
 
     async def list_keys(self, user_id: str) -> list[ApiKeyRecord]:
@@ -170,7 +182,16 @@ class InMemoryKeyRepository:
             item = self.records.get(key_id)
             if not item or item["user_id"] != user_id:
                 return False
+            if item.get("revoked_at"):
+                return True
             item["revoked_at"] = datetime.now(UTC)
+            audit_id, event = _new_audit_event(
+                user_id,
+                "api_key.revoked",
+                key_id=key_id,
+                key_name=item["name"],
+            )
+            self.audit[audit_id] = event
             return True
 
     async def reserve(self, key_id: str, billing_id: str, estimate_microusd: int) -> None:
@@ -215,6 +236,12 @@ class InMemoryKeyRepository:
                     **usage,
                 }
             )
+            audit_id, audit_event = _new_audit_event(
+                item["user_id"],
+                "inference.settled",
+                **_settlement_audit_fields(key_id, billing_id, actual_microusd, usage),
+            )
+            self.audit[audit_id] = audit_event
 
     async def release(self, key_id: str, billing_id: str, reason: str) -> None:
         async with self._lock:
@@ -226,6 +253,15 @@ class InMemoryKeyRepository:
                 0, item["spend_reserved_microusd"] - int(event["estimate_microusd"])
             )
             event.update({"status": "released", "reason": reason, "settled_at": datetime.now(UTC)})
+            audit_id, audit_event = _new_audit_event(
+                item["user_id"],
+                "inference.released",
+                key_id=key_id,
+                billing_id=billing_id,
+                status="released",
+                reason=reason,
+            )
+            self.audit[audit_id] = audit_event
 
     async def list_usage(self, user_id: str, limit: int = 50) -> list[dict[str, Any]]:
         async with self._lock:
@@ -237,12 +273,28 @@ class InMemoryKeyRepository:
         rows.sort(key=lambda row: row["created_at"], reverse=True)
         return [_public_usage(row) for row in rows[:limit]]
 
+    async def list_audit_events(self, user_id: str, limit: int = 1000) -> list[dict[str, Any]]:
+        async with self._lock:
+            rows = [
+                dict(row, id=row_id)
+                for row_id, row in self.audit.items()
+                if row["user_id"] == user_id
+            ]
+        rows.sort(key=lambda row: row["occurred_at"], reverse=True)
+        return [_public_audit_event(row) for row in rows[: max(1, min(limit, 5000))]]
+
 
 class FirestoreKeyRepository:
-    def __init__(self, project: str | None = None, prefix: str = "sovereign") -> None:
-        self.client = firestore.Client(project=project or None)
+    def __init__(
+        self,
+        project: str | None = None,
+        prefix: str = "sovereign",
+        database: str | None = None,
+    ) -> None:
+        self.client = firestore.Client(project=project or None, database=database or None)
         self.keys = self.client.collection(f"{prefix}_api_keys")
         self.usage = self.client.collection(f"{prefix}_usage")
+        self.audit = self.client.collection(f"{prefix}_audit_events")
 
     async def healthcheck(self) -> None:
         def probe() -> None:
@@ -294,8 +346,26 @@ class FirestoreKeyRepository:
                 "reservations": {},
                 "revoked_at": None,
             }
+            key_ref = self.keys.document(key_id)
+            audit_ref = self.audit.document()
+            audit_event = _audit_event_payload(
+                user_id,
+                "api_key.created",
+                key_id=key_id,
+                key_name=name,
+                expires_at=expires_at,
+                spend_limit_microusd=spend_limit_microusd,
+            )
+
             try:
-                await asyncio.to_thread(self.keys.document(key_id).create, item)
+                await asyncio.to_thread(
+                    _create_key_with_audit,
+                    self.client,
+                    key_ref,
+                    item,
+                    audit_ref,
+                    audit_event,
+                )
             except Exception as exc:
                 if exc.__class__.__name__ == "AlreadyExists":
                     continue
@@ -316,6 +386,7 @@ class FirestoreKeyRepository:
     async def revoke_key(self, user_id: str, key_id: str) -> bool:
         def revoke() -> bool:
             ref = self.keys.document(key_id)
+            audit_ref = self.audit.document()
             transaction = self.client.transaction()
 
             @firestore.transactional
@@ -324,7 +395,18 @@ class FirestoreKeyRepository:
                 item = snapshot.to_dict() if snapshot.exists else None
                 if not item or item.get("user_id") != user_id:
                     return False
+                if item.get("revoked_at"):
+                    return True
                 transaction.update(ref, {"revoked_at": datetime.now(UTC)})
+                transaction.create(
+                    audit_ref,
+                    _audit_event_payload(
+                        user_id,
+                        "api_key.revoked",
+                        key_id=key_id,
+                        key_name=item.get("name"),
+                    ),
+                )
                 return True
 
             return update(transaction)
@@ -400,6 +482,7 @@ class FirestoreKeyRepository:
     ) -> None:
         key_ref = self.keys.document(key_id)
         usage_ref = self.usage.document(billing_id)
+        audit_ref = self.audit.document()
         transaction = self.client.transaction()
 
         @firestore.transactional
@@ -423,12 +506,26 @@ class FirestoreKeyRepository:
             event_update: dict[str, Any] = {"settled_at": now}
             if actual_microusd is None:
                 event_update.update({"status": "released", "reason": release_reason})
+                audit_event = _audit_event_payload(
+                    item["user_id"],
+                    "inference.released",
+                    key_id=key_id,
+                    billing_id=billing_id,
+                    status="released",
+                    reason=release_reason,
+                )
             else:
                 actual = max(0, actual_microusd)
                 key_update["spend_used_microusd"] = int(item.get("spend_used_microusd", 0)) + actual
                 event_update.update({"status": "settled", "actual_microusd": actual, **usage})
+                audit_event = _audit_event_payload(
+                    item["user_id"],
+                    "inference.settled",
+                    **_settlement_audit_fields(key_id, billing_id, actual, usage),
+                )
             transaction.update(key_ref, key_update)
             transaction.update(usage_ref, event_update)
+            transaction.create(audit_ref, audit_event)
 
         update(transaction)
 
@@ -446,6 +543,20 @@ class FirestoreKeyRepository:
         )
         return [_public_usage(row) for row in rows[:limit]]
 
+    async def list_audit_events(self, user_id: str, limit: int = 1000) -> list[dict[str, Any]]:
+        def fetch() -> list[dict[str, Any]]:
+            return [
+                dict(snapshot.to_dict() or {}, id=snapshot.id)
+                for snapshot in self.audit.where("user_id", "==", user_id).stream()
+            ]
+
+        rows = await asyncio.to_thread(fetch)
+        rows.sort(
+            key=lambda row: row.get("occurred_at", datetime.min.replace(tzinfo=UTC)),
+            reverse=True,
+        )
+        return [_public_audit_event(row) for row in rows[: max(1, min(limit, 5000))]]
+
 
 def build_managed_repository() -> ManagedKeyRepository | None:
     if os.getenv("ENABLE_MANAGED_KEYS", "false").lower() not in {"1", "true", "yes"}:
@@ -453,6 +564,7 @@ def build_managed_repository() -> ManagedKeyRepository | None:
     return FirestoreKeyRepository(
         project=os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCP_PROJECT"),
         prefix=os.getenv("FIRESTORE_COLLECTION_PREFIX", "sovereign"),
+        database=os.getenv("FIRESTORE_DATABASE_ID") or None,
     )
 
 
@@ -534,3 +646,65 @@ def _active_reservations(value: Any, now: datetime) -> dict[str, dict[str, Any]]
             "expires_at": _as_utc(raw["expires_at"]),
         }
     return active
+
+
+def _new_audit_event(user_id: str, event_type: str, **details: Any) -> tuple[str, dict[str, Any]]:
+    return f"audit_{secrets.token_urlsafe(12)}", _audit_event_payload(
+        user_id, event_type, **details
+    )
+
+
+def _create_key_with_audit(
+    client: Any,
+    key_ref: Any,
+    item: dict[str, Any],
+    audit_ref: Any,
+    audit_event: dict[str, Any],
+) -> None:
+    batch = client.batch()
+    batch.create(key_ref, item)
+    batch.create(audit_ref, audit_event)
+    batch.commit()
+
+
+def _audit_event_payload(user_id: str, event_type: str, **details: Any) -> dict[str, Any]:
+    return {
+        "user_id": user_id,
+        "event_type": event_type,
+        "occurred_at": datetime.now(UTC),
+        **{key: value for key, value in details.items() if value is not None},
+    }
+
+
+def _settlement_audit_fields(
+    key_id: str,
+    billing_id: str,
+    actual_microusd: int,
+    usage: dict[str, Any],
+) -> dict[str, Any]:
+    fields: dict[str, Any] = {
+        "key_id": key_id,
+        "billing_id": billing_id,
+        "status": "settled",
+        "actual_microusd": max(0, actual_microusd),
+    }
+    for key in (
+        "request_id",
+        "model",
+        "privacy",
+        "backend",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+    ):
+        if usage.get(key) is not None:
+            fields[key] = usage[key]
+    return fields
+
+
+def _public_audit_event(row: dict[str, Any]) -> dict[str, Any]:
+    public = {key: value for key, value in row.items() if key != "user_id"}
+    for key in ("occurred_at", "expires_at"):
+        if isinstance(public.get(key), datetime):
+            public[key] = _as_utc(public[key]).isoformat()
+    return public

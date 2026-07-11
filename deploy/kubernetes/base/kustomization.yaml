@@ -7,4 +7,5 @@ resources:
   - vllm-standard.yaml
   - vllm-confidential.yaml
   - network-policy.yaml
+  - egress-policy.yaml
 

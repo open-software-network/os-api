@@ -9,6 +9,12 @@ variable "region" {
   default     = "us-central1"
 }
 
+variable "secondary_region" {
+  description = "Second Cloud Run gateway region used by the global production edge."
+  type        = string
+  default     = "us-east4"
+}
+
 variable "system_node_zone" {
   description = "Zone for the system and ordinary GPU node pools."
   type        = string
@@ -117,6 +123,82 @@ variable "enable_monitoring" {
   default     = true
 }
 
+variable "enable_firestore_backups" {
+  description = "Enable Firestore PITR plus scheduled managed exports to a retention-protected bucket. Existing databases must be imported into Terraform state before apply."
+  type        = bool
+  default     = false
+}
+
+variable "enable_multi_region_control_plane" {
+  description = "Create a secondary Cloud Run gateway and a multi-region Firestore system of record."
+  type        = bool
+  default     = false
+}
+
+variable "enable_multi_region_model_plane" {
+  description = "Run a second confidential CPU model cluster in the secondary region so inference survives a primary-region loss. Adds roughly one c3-standard-4 node plus a GKE cluster fee while enabled."
+  type        = bool
+  default     = false
+}
+
+variable "operator_email" {
+  description = "Human operator account granted release-signing rights for manual releases and drills."
+  type        = string
+  default     = ""
+}
+
+variable "attestation_agent_url" {
+  description = "Internal URL of the TDX quote agent (deploy/kubernetes/attestation). Empty disables /v1/attestation, which then fails closed. If the agent's internal LB IP changes, update this value."
+  type        = string
+  default     = ""
+}
+
+variable "attestation_agent_url_secondary" {
+  description = "Internal URL of the TDX quote agent serving the secondary region."
+  type        = string
+  default     = ""
+}
+
+variable "enable_binary_authorization" {
+  description = "Enforce the project Binary Authorization allowlist on the inference cluster and the gateway Cloud Run services."
+  type        = bool
+  default     = false
+}
+
+variable "multi_region_firestore_database_id" {
+  description = "Named Firestore database used by the multi-region control plane."
+  type        = string
+  default     = "os-api-global"
+}
+
+variable "multi_region_firestore_location" {
+  description = "Firestore multi-region whose read-write regions align with the gateway regions."
+  type        = string
+  default     = "nam7"
+}
+
+variable "firestore_backup_retention_days" {
+  description = "Minimum number of days that Firestore export objects cannot be deleted."
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.firestore_backup_retention_days >= 7
+    error_message = "Firestore backup retention must be at least seven days."
+  }
+}
+
+variable "firestore_backup_delete_after_days" {
+  description = "Age at which retained Firestore exports are removed automatically."
+  type        = number
+  default     = 90
+
+  validation {
+    condition     = var.firestore_backup_delete_after_days > var.firestore_backup_retention_days
+    error_message = "Firestore backup deletion age must exceed its retention period."
+  }
+}
+
 variable "alert_notification_channels" {
   description = "Cloud Monitoring notification channel resource names attached to API alerts."
   type        = list(string)
@@ -150,7 +232,7 @@ variable "github_repository_owner_id" {
 variable "gateway_image" {
   description = "Digest-pinned gateway container deployed to Cloud Run."
   type        = string
-  default     = "us-central1-docker.pkg.dev/autonomous-lab-490610/sovereign-inference/gateway@sha256:409e0860e8d21b604945ec81b307591d81f43d233c360f8812fbf1628ab1599d"
+  default     = "us-central1-docker.pkg.dev/autonomous-lab-490610/sovereign-inference/gateway@sha256:47b4bf42a464f9ae12c37be569eebdc58e5f2f449ff40347567acbaf4f0464f6"
 }
 
 variable "deletion_protection" {

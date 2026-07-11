@@ -40,9 +40,13 @@ patches:
             standard-vllm:
               base_url: http://standard-vllm:8000
               privacy: standard
+              revision: vllm-openai@6d8429e38e37
+              max_concurrency: 8
             confidential-vllm-cpu:
               base_url: http://confidential-vllm-cpu:8000
               privacy: confidential
+              revision: vllm-openai-cpu@89e1fbe82903
+              max_concurrency: 8
           models:
             qwen2.5-0.5b-instruct:
               upstream_model: Qwen/Qwen2.5-0.5B-Instruct

@@ -45,6 +45,8 @@ backends:
     base_url: http://tee.internal
     api_key_env: TEE_UPSTREAM_KEY
     privacy: confidential
+    revision: vllm-openai@testdigest0001
+    max_concurrency: 4
 models:
   dual-model:
     upstream_model: org/real-model

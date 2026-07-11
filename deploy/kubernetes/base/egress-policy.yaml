@@ -1,0 +1,61 @@
+# Default-deny egress for the model pods, which handle raw prompts and are the
+# highest data-exfiltration risk in the platform. Allowed egress:
+#   - DNS to kube-dns (name resolution)
+#   - HTTPS only, and only to the HuggingFace hostnames the servers pull weights
+#     from, via a GKE Dataplane V2 FQDNNetworkPolicy
+# Everything else — arbitrary ports, plaintext, unlisted hosts — is dropped, so
+# a compromised model server cannot open a C2 channel or ship prompts out.
+#
+# Requires the cluster's managed FQDN network policy feature
+# (enable_fqdn_network_policy). The standard NetworkPolicy below owns the
+# default-deny and the DNS/private allowances; the FQDNNetworkPolicy adds the
+# HuggingFace HTTPS allowance by hostname.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: model-egress-baseline
+  namespace: inference
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values: [confidential-vllm, standard-vllm]
+  policyTypes: [Egress]
+  egress:
+    # DNS resolution.
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # In-cluster traffic to the gateway/model services stays open so the
+    # gateway can reach model pods and pods can reach each other's services.
+    - to:
+        - podSelector: {}
+---
+apiVersion: networking.gke.io/v1alpha1
+kind: FQDNNetworkPolicy
+metadata:
+  name: model-egress-huggingface
+  namespace: inference
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values: [confidential-vllm, standard-vllm]
+  egress:
+    - matches:
+        - name: huggingface.co
+        - name: cdn-lfs.huggingface.co
+        - name: cdn-lfs-us-1.huggingface.co
+        - name: cas-bridge.xethub.hf.co
+      ports:
+        - protocol: TCP
+          port: 443

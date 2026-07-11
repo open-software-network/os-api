@@ -16,6 +16,8 @@ env:
   REGION: us-central1
   SERVICE: sovereign-api
   CANARY_SERVICE: sovereign-api-canary
+  SECONDARY_SERVICE: sovereign-api-secondary
+  SECONDARY_REGION: us-east4
   IMAGE: us-central1-docker.pkg.dev/autonomous-lab-490610/sovereign-inference/gateway
 
 jobs:
@@ -37,6 +39,13 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Validate hosted provider catalog and pricing
+        run: |
+          uv sync --locked
+          uv run python scripts/validate_provider_catalog.py
+
       - name: Build and push immutable image
         id: image
         shell: bash
@@ -54,6 +63,27 @@ jobs:
           test -n "${digest}"
           echo "reference=${IMAGE}@${digest}" >> "${GITHUB_OUTPUT}"
 
+      - name: Sign image for Binary Authorization
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Cloud Run evaluates the resolved platform manifest while GKE
+          # evaluates the reference as written, so sign the buildx index
+          # digest and every platform manifest digest beneath it.
+          keyversion="projects/${PROJECT_ID}/locations/${REGION}/keyRings/os-api-binauthz/cryptoKeys/release-signing/cryptoKeyVersions/1"
+          index_ref="${{ steps.image.outputs.reference }}"
+          platform_refs="$(docker buildx imagetools inspect "${index_ref}" --raw \
+            | jq -r '.manifests[] | select(.platform.os != "unknown") | .digest' \
+            | sed "s|^|${IMAGE}@|")"
+          for ref in "${index_ref}" ${platform_refs}; do
+            gcloud beta container binauthz attestations sign-and-create \
+              --project "${PROJECT_ID}" \
+              --artifact-url "${ref}" \
+              --attestor os-api-release \
+              --attestor-project "${PROJECT_ID}" \
+              --keyversion "${keyversion}"
+          done
+
       - name: Deploy private canary
         id: canary
         shell: bash
@@ -65,6 +95,7 @@ jobs:
             --region "${REGION}" \
             --image "${{ steps.image.outputs.reference }}" \
             --revision-suffix "${suffix}" \
+            --update-env-vars "MODEL_CONFIG_PATH=/app/config/models.yaml" \
             --quiet
           canary_url="$(gcloud run services describe "${CANARY_SERVICE}" \
             --project "${PROJECT_ID}" \
@@ -100,7 +131,31 @@ jobs:
             -H "X-Serverless-Authorization: Bearer ${identity_token}" \
             -H "Authorization: Bearer ${smoke_key}" \
             "${CANARY_URL}/v1/models" \
-            | jq -e '.object == "list" and (.data | length > 0)' >/dev/null
+            | jq -e '.object == "list" and any(.data[]; .id == "openai/gpt-oss-20b")' >/dev/null
+
+          headers_file="$(mktemp)"
+          body_file="$(mktemp)"
+          trap 'rm -f "${headers_file}" "${body_file}"' EXIT
+          curl --fail --silent --show-error --max-time 120 \
+            --dump-header "${headers_file}" \
+            --output "${body_file}" \
+            -H "X-Serverless-Authorization: Bearer ${identity_token}" \
+            -H "Authorization: Bearer ${smoke_key}" \
+            -H "Content-Type: application/json" \
+            -H "X-Confidential-Compute: required" \
+            -X POST "${CANARY_URL}/v1/chat/completions" \
+            --data '{"model":"openai/gpt-oss-20b","messages":[{"role":"user","content":"Reply with exactly: private-ready"}],"max_tokens":16,"privacy":{"minimum":"tee","require_zero_retention":true,"require_response_proof":true}}'
+          jq -e '.choices[0].message.content | type == "string"' "${body_file}" >/dev/null
+          grep -Eiq '^x-os-provider: phala\r?$' "${headers_file}"
+          grep -Eiq '^x-os-privacy-level: tee\r?$' "${headers_file}"
+          grep -Eiq '^x-os-attestation-status: present\r?$' "${headers_file}"
+          generation_id="$(awk 'BEGIN{IGNORECASE=1} /^x-os-generation-id:/ {gsub("\r", "", $2); print $2}' "${headers_file}")"
+          test -n "${generation_id}"
+          curl --fail --silent --show-error --max-time 30 \
+            -H "X-Serverless-Authorization: Bearer ${identity_token}" \
+            -H "Authorization: Bearer ${smoke_key}" \
+            "${CANARY_URL}/v1/privacy/receipts/${generation_id}" \
+            | jq -e '.provider == "phala" and .privacy.level == "tee" and .evidence.status == "present"' >/dev/null
 
       - name: Deploy production revision without traffic
         id: production
@@ -115,6 +170,24 @@ jobs:
             --image "${{ steps.image.outputs.reference }}" \
             --revision-suffix "${suffix}" \
             --no-traffic \
+            --update-env-vars "MODEL_CONFIG_PATH=/app/config/models.yaml" \
+            --quiet
+          echo "revision=${revision}" >> "${GITHUB_OUTPUT}"
+
+      - name: Deploy secondary-region revision without traffic
+        id: secondary
+        shell: bash
+        run: |
+          set -euo pipefail
+          suffix="gh-${GITHUB_RUN_ID}"
+          revision="${SECONDARY_SERVICE}-${suffix}"
+          gcloud run deploy "${SECONDARY_SERVICE}" \
+            --project "${PROJECT_ID}" \
+            --region "${SECONDARY_REGION}" \
+            --image "${{ steps.image.outputs.reference }}" \
+            --revision-suffix "${suffix}" \
+            --no-traffic \
+            --update-env-vars "MODEL_CONFIG_PATH=/app/config/models.yaml" \
             --quiet
           echo "revision=${revision}" >> "${GITHUB_OUTPUT}"
 
@@ -126,6 +199,16 @@ jobs:
             --project "${PROJECT_ID}" \
             --region "${REGION}" \
             --to-revisions "${{ steps.production.outputs.revision }}=100" \
+            --quiet
+
+      - name: Promote secondary-region revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud run services update-traffic "${SECONDARY_SERVICE}" \
+            --project "${PROJECT_ID}" \
+            --region "${SECONDARY_REGION}" \
+            --to-revisions "${{ steps.secondary.outputs.revision }}=100" \
             --quiet
 
       - name: Verify public endpoint

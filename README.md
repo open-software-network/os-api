@@ -1,6 +1,10 @@
 # OpenSoftware API
 
-OpenSoftware API is a self-hosted, OpenAI-compatible model API for GCP. It routes each model request to either an ordinary GPU pool or an H100 + Intel TDX confidential-compute pool and exposes the actual privacy class on every response.
+OpenSoftware API is an OpenAI-compatible router for verifiably private model inference. It routes
+each request across hosted TEE/E2EE providers such as Phala and Venice, enforces a fail-closed
+privacy policy, normalizes provider behavior, performs same-model fallbacks, and exposes evidence
+and the selected privacy class on every response. Self-hosted GCP GPU endpoints remain supported as
+another provider type, but are not required for the hosted-provider deployment.
 
 This repository is an original infrastructure implementation. It does not copy Venice.ai code, private APIs, branding, or product UI.
 
@@ -17,6 +21,9 @@ This repository is an original infrastructure implementation. It does not copy V
 - OpenSoftware Credit wallet authorization and idempotent settlement
 - SHA-256-hashed credentials and Redis-backed request limits
 - Per-model standard/confidential routing with a no-downgrade guarantee
+- Multi-provider endpoint routing by privacy, capabilities, price, health, and region
+- Same-model fallbacks with circuit breaking and charge-on-success billing
+- Tenant-scoped normalized privacy receipts and provider evidence metadata
 - vLLM backends and GKE manifests for L4 and confidential H100 nodes
 - Terraform for a private GKE cluster, GPU node pools, VPC/NAT, Artifact Registry, Memorystore, and Secret Manager
 - Live global HTTPS load balancer, Certificate Manager, Cloud Armor, uptime checks, and billing/5xx alerts; direct Cloud Run ingress is blocked
@@ -64,7 +71,10 @@ export MODEL_CONFIG_PATH=config/models.yaml
 uv run uvicorn sovereign_gateway.app:app --port 8080 --no-access-log
 ```
 
-The gateway expects the configured vLLM endpoints to be reachable. On a Linux NVIDIA host, start the included local GPU profile with `docker compose --profile gpu up --build`. On a laptop, run the test suite, which uses an in-process OpenAI-compatible mock:
+The default catalog expects `PHALA_API_KEY` and `VENICE_API_KEY`. Production readiness fails closed
+when an enabled provider credential is absent. The legacy self-hosted profile is still available on
+a Linux NVIDIA host with `docker compose --profile gpu up --build`. On a laptop, run the test suite,
+which uses in-process OpenAI-compatible mocks:
 
 ```bash
 uv run --extra dev pytest
@@ -76,12 +86,14 @@ Create a real key with `python scripts/create_api_key.py TENANT_ID`; put only th
 ## GCP deployment
 
 1. Review [architecture](docs/architecture.md), [threat model](docs/threat-model.md), and [operations](docs/operations.md).
-2. Obtain L4 quota for ordinary serving and **preemptible H100 quota** in a zone that supports NVIDIA Confidential Computing.
-3. Build and push the gateway image to the Artifact Registry repository created by Terraform.
-4. Run Terraform from `deploy/terraform`.
-5. Create the Kubernetes secrets described in `deploy/kubernetes/base/secrets.example.yaml`; never commit their values.
-6. Update the two model IDs/images in the manifests, then run `kubectl apply -k deploy/kubernetes/base`.
-7. Enable the global HTTPS load balancer and complete the Certificate Manager DNS authorization before restricting Cloud Run ingress.
+2. Review [private provider routing](docs/private-routing.md), including the privacy taxonomy and
+   E2EE boundary.
+3. Add hosted-provider API keys to Secret Manager, or obtain GPU quota when enabling self-hosted endpoints.
+4. Build and push the gateway image to the Artifact Registry repository created by Terraform.
+5. Run Terraform from `deploy/terraform`.
+6. Create the Kubernetes secrets described in `deploy/kubernetes/base/secrets.example.yaml`; never commit their values.
+7. Apply the appropriate hosted-provider or self-hosted Kubernetes overlay when using GKE.
+8. Enable the global HTTPS load balancer and complete the Certificate Manager DNS authorization before restricting Cloud Run ingress.
 
 The confidential node pool is disabled by default because GCP rejects creation without zone-specific preemptible H100 quota. Enable it only after quota and capacity are confirmed:
 
@@ -94,4 +106,4 @@ For a lower-cost validation of TDX scheduling and fail-closed API routing, Terra
 
 ## Remaining production boundaries
 
-The first control plane is live, including login, key lifecycle, hard spend limits, usage metering, and wallet settlement. Before broad commercial launch, add abuse automation, multi-region routing, model rollout automation, reserved GPU capacity, externally verifiable attestation, and customer audit exports. These are sequenced in [operations](docs/operations.md).
+The first control plane is live, including login, key lifecycle, hard spend limits, usage metering, and wallet settlement. The remaining launch controls and measurable exit criteria are tracked in the [production parity checklist](docs/production-parity.md) and sequenced in [operations](docs/operations.md).

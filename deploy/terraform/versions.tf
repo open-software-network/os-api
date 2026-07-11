@@ -17,4 +17,9 @@ terraform {
 provider "google" {
   project = var.project_id
   region  = var.region
+
+  # Some APIs (for example Binary Authorization attestor IAM) reject
+  # user-credential calls without an explicit quota project.
+  user_project_override = true
+  billing_project       = var.project_id
 }

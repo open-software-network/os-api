@@ -25,9 +25,13 @@ def test_public_home_and_docs_render(client: TestClient) -> None:
     assert "Developer docs" in docs.text
 
 
-def test_site_basic_auth_does_not_replace_api_key_auth(
-    client: TestClient, monkeypatch
-) -> None:
+def test_responses_identify_gateway_region(client: TestClient) -> None:
+    response = client.get("/v1/models")
+
+    assert response.headers["x-gateway-region"] == "local"
+
+
+def test_site_basic_auth_does_not_replace_api_key_auth(client: TestClient, monkeypatch) -> None:
     monkeypatch.setenv("SITE_BASIC_AUTH_USERNAME", "alongside")
     monkeypatch.setenv("SITE_BASIC_AUTH_PASSWORD", "test-password")
 
@@ -86,6 +90,25 @@ def test_required_routes_to_confidential_backend(
     assert json.loads(upstream_requests[-1].content)["model"] == "org/real-model"
 
 
+def test_responses_identify_model_revision_when_pinned(
+    client: TestClient, upstream_requests: list[httpx.Request]
+) -> None:
+    pinned = client.post(
+        "/v1/chat/completions",
+        headers={"X-Confidential-Compute": "required"},
+        json={"model": "dual-model", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    unpinned = client.post(
+        "/v1/chat/completions",
+        json={"model": "standard-only", "messages": []},
+    )
+
+    assert pinned.headers["x-model-backend"] == "tee"
+    assert pinned.headers["x-model-revision"] == "vllm-openai@testdigest0001"
+    assert unpinned.status_code == 200
+    assert "x-model-revision" not in unpinned.headers
+
+
 def test_required_never_downgrades(
     client: TestClient, upstream_requests: list[httpx.Request]
 ) -> None:
@@ -124,7 +147,7 @@ def test_streaming_is_passed_through(client: TestClient) -> None:
 
     assert response.status_code == 200
     assert response.headers["x-compute-privacy"] == "standard"
-    assert 'data: {"id":"chunk-1"}' in body
+    assert 'data: {"id":"chunk-1","model":"dual-model"}' in body
     assert "data: [DONE]" in body
 
 
@@ -184,6 +207,34 @@ def test_readiness_reports_dependency_state(client: TestClient) -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ready", "components": {}}
+
+
+def test_readiness_stays_ready_when_redis_degraded(client: TestClient) -> None:
+    class DownRedis:
+        async def ping(self) -> None:
+            raise ConnectionError("redis down")
+
+    client.app.state.redis = DownRedis()
+
+    response = client.get("/readyz")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ready"
+    assert body["components"]["redis"] == "degraded"
+
+
+def test_readiness_fails_when_firestore_down(client: TestClient) -> None:
+    class DownKeys:
+        async def healthcheck(self) -> None:
+            raise ConnectionError("firestore down")
+
+    client.app.state.managed_keys = DownKeys()
+
+    response = client.get("/readyz")
+
+    assert response.status_code == 503
+    assert response.json()["components"]["firestore"] == "unavailable"
 
 
 def test_unhandled_api_errors_use_safe_openai_shape(client: TestClient) -> None:

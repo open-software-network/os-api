@@ -7,6 +7,14 @@ resource "google_cloud_run_v2_service" "api_canary" {
   deletion_protection = true
   labels              = var.labels
 
+  dynamic "binary_authorization" {
+    for_each = var.enable_binary_authorization ? [1] : []
+
+    content {
+      use_default = true
+    }
+  }
+
   template {
     service_account                  = google_service_account.api_runtime.email
     execution_environment            = "EXECUTION_ENVIRONMENT_GEN2"
@@ -27,7 +35,7 @@ resource "google_cloud_run_v2_service" "api_canary" {
 
       env {
         name  = "MODEL_CONFIG_PATH"
-        value = "/etc/sovereign/models.yaml"
+        value = "/app/config/models.yaml"
       }
 
       env {
@@ -53,6 +61,21 @@ resource "google_cloud_run_v2_service" "api_canary" {
       env {
         name  = "FIRESTORE_COLLECTION_PREFIX"
         value = "sovereign"
+      }
+
+      env {
+        name  = "FIRESTORE_DATABASE_ID"
+        value = local.active_firestore_database_id
+      }
+
+      env {
+        name  = "GATEWAY_REGION"
+        value = var.region
+      }
+
+      env {
+        name  = "ATTESTATION_AGENT_URL"
+        value = var.attestation_agent_url
       }
 
       env {
@@ -130,6 +153,26 @@ resource "google_cloud_run_v2_service" "api_canary" {
         }
       }
 
+      env {
+        name = "PHALA_API_KEY"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.runtime["phala-api-key"].secret_id
+            version = "latest"
+          }
+        }
+      }
+
+      env {
+        name = "VENICE_API_KEY"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.runtime["venice-api-key"].secret_id
+            version = "latest"
+          }
+        }
+      }
+
       resources {
         limits = {
           cpu    = "1"
@@ -146,7 +189,7 @@ resource "google_cloud_run_v2_service" "api_canary" {
         failure_threshold     = 20
 
         http_get {
-          path = "/healthz"
+          path = "/readyz"
           port = 8080
         }
       }

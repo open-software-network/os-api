@@ -10,18 +10,31 @@ flowchart LR
   G --> R["Memorystore rate limits"]
   G --> F["Firestore keys and usage"]
   G --> O["OpenSoftware Accounts wallet"]
-  G -->|"disabled or fallback"| S["Standard vLLM on L4"]
-  G -->|"required or preferred"| T["vLLM on H100 + Intel TDX"]
-  S --> M["Model weights"]
-  T --> M
+  G --> P["Privacy and capability filter"]
+  P --> H["Health / price / latency router"]
+  H --> PH["Phala GPU TEE"]
+  H --> VE["Venice E2EE + TEE"]
+  H -. "optional owned endpoint" .-> T["OpenSoftware vLLM + TDX"]
+  PH --> R["Normalized privacy receipt"]
+  VE --> R
+  T --> R
 ```
 
-The gateway is the policy enforcement point. Public model IDs are decoupled from Hugging Face/vLLM model IDs, and each public model declares its permitted backends. A request marked `required` can select only the confidential backend. This invariant is covered by tests. The edge rate limit is availability protection only; authenticated per-key limits and spend reservations remain authoritative in the gateway.
+The gateway is the policy enforcement point. Public model IDs are decoupled from provider model
+IDs, and each public model declares one or more endpoints with privacy, capability, pricing, and
+evidence metadata. Filtering occurs before ranking or fallback, so a request marked `required`
+cannot select a non-TEE endpoint. Provider failures can fall back only to another endpoint for the
+same canonical model. These invariants are covered by tests. The edge rate limit is availability
+protection only; authenticated per-key limits and spend reservations remain authoritative in the
+gateway.
 
 ## Trust boundaries
 
 - Certificate Manager terminates public TLS at the global load balancer. Cloud Armor applies an approximate source-IP throttle without inspecting prompt bodies. Cloud Run ingress rejects direct internet paths after edge cutover.
 - The gateway authenticates tenant keys, applies request limits, makes the privacy decision, and streams bytes. It intentionally has no prompt database.
+- Hosted provider credentials come from Secret Manager and are never exposed to API clients.
+- Provider evidence is recorded as present or missing until cryptographic verification succeeds;
+  the gateway does not equate an evidence header with verified attestation.
 - Standard vLLM nodes protect data at rest and in transit but do not provide memory encryption against the cloud/hypervisor boundary.
 - Confidential H100 nodes use Confidential GKE Nodes with Intel TDX. Their manifest requires the `TDX` node label as well as the H100 GPU label.
 - vLLM services are private ClusterIP endpoints isolated by NetworkPolicy. Do not pass backend API keys on the vLLM command line because vLLM logs non-default startup arguments.

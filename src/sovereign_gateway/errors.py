@@ -9,6 +9,7 @@ def openai_error(
     *,
     error_type: str = "invalid_request_error",
     code: str | None = None,
+    headers: dict[str, str] | None = None,
 ) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
@@ -20,4 +21,5 @@ def openai_error(
                 "code": code,
             }
         },
+        headers=headers,
     )

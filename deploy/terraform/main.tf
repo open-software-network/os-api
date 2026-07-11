@@ -1,10 +1,15 @@
 locals {
   services = toset([
     "artifactregistry.googleapis.com",
+    "binaryauthorization.googleapis.com",
     "compute.googleapis.com",
     "confidentialcomputing.googleapis.com",
     "container.googleapis.com",
     "certificatemanager.googleapis.com",
+    "cloudscheduler.googleapis.com",
+    "cloudkms.googleapis.com",
+    "cloudresourcemanager.googleapis.com",
+    "containeranalysis.googleapis.com",
     "firestore.googleapis.com",
     "iam.googleapis.com",
     "iamcredentials.googleapis.com",
@@ -14,6 +19,7 @@ locals {
     "run.googleapis.com",
     "secretmanager.googleapis.com",
     "siteverification.googleapis.com",
+    "storage.googleapis.com",
   ])
 }
 
@@ -122,9 +128,12 @@ resource "google_secret_manager_secret" "runtime" {
   for_each = toset([
     "app-client-api-key",
     "cloudrun-model-config",
+    "cloudrun-model-config-secondary",
     "gateway-api-key-hashes",
     "gateway-redis-ca",
+    "gateway-redis-ca-secondary",
     "gateway-redis-url",
+    "gateway-redis-url-secondary",
     "os-accounts-app-api-key",
     "os-accounts-client-id",
     "site-basic-auth-password",
@@ -132,6 +141,8 @@ resource "google_secret_manager_secret" "runtime" {
     "confidential-vllm-api-key",
     "huggingface-token",
     "smoke-client-api-key",
+    "phala-api-key",
+    "venice-api-key",
   ])
 
   secret_id = each.value
@@ -159,12 +170,17 @@ resource "google_project_iam_member" "api_runtime_firestore" {
 resource "google_secret_manager_secret_iam_member" "api_runtime" {
   for_each = toset([
     "cloudrun-model-config",
+    "cloudrun-model-config-secondary",
     "gateway-api-key-hashes",
     "gateway-redis-ca",
+    "gateway-redis-ca-secondary",
     "gateway-redis-url",
+    "gateway-redis-url-secondary",
     "os-accounts-app-api-key",
     "os-accounts-client-id",
     "site-basic-auth-password",
+    "phala-api-key",
+    "venice-api-key",
   ])
 
   project   = var.project_id
@@ -186,6 +202,14 @@ resource "google_cloud_run_v2_service" "public_api" {
   deletion_protection = true
   labels              = var.labels
 
+  dynamic "binary_authorization" {
+    for_each = var.enable_binary_authorization ? [1] : []
+
+    content {
+      use_default = true
+    }
+  }
+
   template {
     service_account                  = google_service_account.api_runtime.email
     execution_environment            = "EXECUTION_ENVIRONMENT_GEN2"
@@ -206,7 +230,7 @@ resource "google_cloud_run_v2_service" "public_api" {
 
       env {
         name  = "MODEL_CONFIG_PATH"
-        value = "/etc/sovereign/models.yaml"
+        value = "/app/config/models.yaml"
       }
 
       env {
@@ -232,6 +256,21 @@ resource "google_cloud_run_v2_service" "public_api" {
       env {
         name  = "FIRESTORE_COLLECTION_PREFIX"
         value = "sovereign"
+      }
+
+      env {
+        name  = "FIRESTORE_DATABASE_ID"
+        value = local.active_firestore_database_id
+      }
+
+      env {
+        name  = "GATEWAY_REGION"
+        value = var.region
+      }
+
+      env {
+        name  = "ATTESTATION_AGENT_URL"
+        value = var.attestation_agent_url
       }
 
       env {
@@ -310,6 +349,26 @@ resource "google_cloud_run_v2_service" "public_api" {
         }
       }
 
+      env {
+        name = "PHALA_API_KEY"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.runtime["phala-api-key"].secret_id
+            version = "latest"
+          }
+        }
+      }
+
+      env {
+        name = "VENICE_API_KEY"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.runtime["venice-api-key"].secret_id
+            version = "latest"
+          }
+        }
+      }
+
       resources {
         limits = {
           cpu    = "1"
@@ -326,7 +385,7 @@ resource "google_cloud_run_v2_service" "public_api" {
         failure_threshold     = 20
 
         http_get {
-          path = "/healthz"
+          path = "/readyz"
           port = 8080
         }
       }
@@ -446,12 +505,13 @@ resource "google_container_cluster" "inference" {
   network    = google_compute_network.inference.id
   subnetwork = google_compute_subnetwork.gke.id
 
-  remove_default_node_pool = true
-  initial_node_count       = 1
-  deletion_protection      = var.deletion_protection
-  networking_mode          = "VPC_NATIVE"
-  datapath_provider        = "ADVANCED_DATAPATH"
-  enable_shielded_nodes    = true
+  remove_default_node_pool   = true
+  initial_node_count         = 1
+  deletion_protection        = var.deletion_protection
+  networking_mode            = "VPC_NATIVE"
+  datapath_provider          = "ADVANCED_DATAPATH"
+  enable_fqdn_network_policy = true
+  enable_shielded_nodes      = true
 
   release_channel {
     channel = "RAPID"
@@ -477,6 +537,14 @@ resource "google_container_cluster" "inference" {
 
   workload_identity_config {
     workload_pool = "${var.project_id}.svc.id.goog"
+  }
+
+  dynamic "binary_authorization" {
+    for_each = var.enable_binary_authorization ? [1] : []
+
+    content {
+      evaluation_mode = "PROJECT_SINGLETON_POLICY_ENFORCE"
+    }
   }
 
   secret_manager_config {
