@@ -55,9 +55,7 @@ def test_audit_routes_are_tenant_isolated(client: TestClient, monkeypatch) -> No
     client.cookies.set("osapi_access", "session-a")
 
     response = client.get("/api/audit?limit=100", headers={"Authorization": ""})
-    exported = client.get(
-        "/api/audit/export?format=jsonl", headers={"Authorization": ""}
-    )
+    exported = client.get("/api/audit/export?format=jsonl", headers={"Authorization": ""})
 
     assert response.status_code == 200
     assert [event["key_name"] for event in response.json()["data"]] == ["Tenant A"]

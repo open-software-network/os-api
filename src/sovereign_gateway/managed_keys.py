@@ -102,9 +102,7 @@ class ManagedKeyRepository(Protocol):
 
     async def list_usage(self, user_id: str, limit: int = 50) -> list[dict[str, Any]]: ...
 
-    async def list_audit_events(
-        self, user_id: str, limit: int = 1000
-    ) -> list[dict[str, Any]]: ...
+    async def list_audit_events(self, user_id: str, limit: int = 1000) -> list[dict[str, Any]]: ...
 
 
 class InMemoryKeyRepository:
@@ -275,9 +273,7 @@ class InMemoryKeyRepository:
         rows.sort(key=lambda row: row["created_at"], reverse=True)
         return [_public_usage(row) for row in rows[:limit]]
 
-    async def list_audit_events(
-        self, user_id: str, limit: int = 1000
-    ) -> list[dict[str, Any]]:
+    async def list_audit_events(self, user_id: str, limit: int = 1000) -> list[dict[str, Any]]:
         async with self._lock:
             rows = [
                 dict(row, id=row_id)
@@ -547,9 +543,7 @@ class FirestoreKeyRepository:
         )
         return [_public_usage(row) for row in rows[:limit]]
 
-    async def list_audit_events(
-        self, user_id: str, limit: int = 1000
-    ) -> list[dict[str, Any]]:
+    async def list_audit_events(self, user_id: str, limit: int = 1000) -> list[dict[str, Any]]:
         def fetch() -> list[dict[str, Any]]:
             return [
                 dict(snapshot.to_dict() or {}, id=snapshot.id)
@@ -654,9 +648,7 @@ def _active_reservations(value: Any, now: datetime) -> dict[str, dict[str, Any]]
     return active
 
 
-def _new_audit_event(
-    user_id: str, event_type: str, **details: Any
-) -> tuple[str, dict[str, Any]]:
+def _new_audit_event(user_id: str, event_type: str, **details: Any) -> tuple[str, dict[str, Any]]:
     return f"audit_{secrets.token_urlsafe(12)}", _audit_event_payload(
         user_id, event_type, **details
     )

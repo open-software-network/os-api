@@ -1,0 +1,364 @@
+from __future__ import annotations
+
+import asyncio
+import time
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from typing import Any, Literal
+
+from .config import PRIVACY_LEVELS, Endpoint, GatewayConfig
+
+
+class RoutingError(ValueError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+@dataclass(frozen=True)
+class PrivacyPolicy:
+    minimum: str = "tee"
+    require_zero_retention: bool = False
+    require_response_proof: bool = False
+    allow_downgrade: bool = False
+    confidential_disabled: bool = False
+
+
+@dataclass(frozen=True)
+class ProviderPolicy:
+    order: tuple[str, ...] = ()
+    only: tuple[str, ...] = ()
+    ignore: tuple[str, ...] = ()
+    allow_fallbacks: bool = True
+    require_parameters: bool = True
+    sort: Literal["price", "latency", "throughput", "priority"] = "priority"
+    max_input_price_microusd_per_million: int | None = None
+    max_output_price_microusd_per_million: int | None = None
+    regions: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RoutingPolicy:
+    privacy: PrivacyPolicy
+    provider: ProviderPolicy
+    required_capabilities: frozenset[str] = frozenset()
+    client_encrypted: bool = False
+
+
+@dataclass
+class EndpointStats:
+    attempts: int = 0
+    successes: int = 0
+    consecutive_failures: int = 0
+    circuit_open_until: float = 0
+    latencies: deque[float] = field(default_factory=lambda: deque(maxlen=256))
+    throughputs: deque[float] = field(default_factory=lambda: deque(maxlen=256))
+
+    @property
+    def healthy(self) -> bool:
+        return time.monotonic() >= self.circuit_open_until
+
+    @property
+    def success_rate(self) -> float:
+        return self.successes / self.attempts if self.attempts else 1.0
+
+    @property
+    def latency(self) -> float:
+        return sum(self.latencies) / len(self.latencies) if self.latencies else float("inf")
+
+    @property
+    def throughput(self) -> float:
+        return sum(self.throughputs) / len(self.throughputs) if self.throughputs else 0.0
+
+
+class EndpointHealth:
+    """Process-local fast health state.
+
+    Provider failures are also emitted as structured logs. This state prevents
+    repeatedly selecting a known-bad endpoint within one gateway instance;
+    managed deployments can replace it with shared Redis state later without
+    changing routing semantics.
+    """
+
+    def __init__(self, failure_threshold: int = 3, cooldown_seconds: int = 30) -> None:
+        self.failure_threshold = failure_threshold
+        self.cooldown_seconds = cooldown_seconds
+        self._stats: dict[str, EndpointStats] = defaultdict(EndpointStats)
+        self._lock = asyncio.Lock()
+
+    def get(self, endpoint_id: str) -> EndpointStats:
+        return self._stats[endpoint_id]
+
+    async def success(
+        self, endpoint_id: str, latency_seconds: float, output_tokens: int | None = None
+    ) -> None:
+        async with self._lock:
+            stats = self._stats[endpoint_id]
+            stats.attempts += 1
+            stats.successes += 1
+            stats.consecutive_failures = 0
+            stats.circuit_open_until = 0
+            stats.latencies.append(latency_seconds)
+            if output_tokens and latency_seconds > 0:
+                stats.throughputs.append(output_tokens / latency_seconds)
+
+    async def failure(self, endpoint_id: str) -> None:
+        async with self._lock:
+            stats = self._stats[endpoint_id]
+            stats.attempts += 1
+            stats.consecutive_failures += 1
+            if stats.consecutive_failures >= self.failure_threshold:
+                stats.circuit_open_until = time.monotonic() + self.cooldown_seconds
+
+
+def parse_routing_policy(
+    payload: dict[str, Any],
+    confidential_header: str | None,
+    client_encrypted: bool = False,
+) -> RoutingPolicy:
+    privacy_raw = payload.get("privacy", {})
+    if privacy_raw is None:
+        privacy_raw = {}
+    if not isinstance(privacy_raw, dict):
+        raise RoutingError("invalid_privacy_policy", "privacy must be an object")
+
+    header = (confidential_header or "preferred").lower()
+    if header not in {"required", "preferred", "disabled"}:
+        raise RoutingError(
+            "invalid_privacy_preference",
+            "X-Confidential-Compute must be required, preferred, or disabled",
+        )
+    if header == "disabled":
+        default_minimum = "standard"
+    else:
+        default_minimum = "tee"
+    minimum = str(privacy_raw.get("minimum", default_minimum))
+    if minimum not in PRIVACY_LEVELS:
+        raise RoutingError("invalid_privacy_policy", f"Unknown privacy level {minimum!r}")
+    allow_downgrade = bool(privacy_raw.get("allow_downgrade", header == "preferred"))
+    # "required" is an unconditional fail-closed override.
+    if header == "required":
+        allow_downgrade = False
+        if PRIVACY_LEVELS[minimum] < PRIVACY_LEVELS["tee"]:
+            minimum = "tee"
+    if header == "disabled":
+        allow_downgrade = False
+
+    provider_raw = payload.get("provider", {})
+    if provider_raw is None:
+        provider_raw = {}
+    if not isinstance(provider_raw, dict):
+        raise RoutingError("invalid_provider_policy", "provider must be an object")
+    sort_raw = provider_raw.get("sort", "priority")
+    sort_by = sort_raw.get("by", "priority") if isinstance(sort_raw, dict) else sort_raw
+    if sort_by not in {"price", "latency", "throughput", "priority"}:
+        raise RoutingError("invalid_provider_policy", f"Unknown provider sort {sort_by!r}")
+    max_price = provider_raw.get("max_price", {}) or {}
+    if not isinstance(max_price, dict):
+        raise RoutingError("invalid_provider_policy", "provider.max_price must be an object")
+
+    required = _infer_capabilities(payload)
+    return RoutingPolicy(
+        privacy=PrivacyPolicy(
+            minimum=minimum,
+            require_zero_retention=bool(privacy_raw.get("require_zero_retention", False)),
+            require_response_proof=bool(privacy_raw.get("require_response_proof", False)),
+            allow_downgrade=allow_downgrade,
+            confidential_disabled=header == "disabled",
+        ),
+        provider=ProviderPolicy(
+            order=_strings(provider_raw.get("order", []), "provider.order"),
+            only=_strings(provider_raw.get("only", []), "provider.only"),
+            ignore=_strings(provider_raw.get("ignore", []), "provider.ignore"),
+            allow_fallbacks=bool(provider_raw.get("allow_fallbacks", True)),
+            require_parameters=bool(provider_raw.get("require_parameters", True)),
+            sort=sort_by,
+            max_input_price_microusd_per_million=_usd_price(max_price.get("input")),
+            max_output_price_microusd_per_million=_usd_price(max_price.get("output")),
+            regions=_strings(provider_raw.get("regions", []), "provider.regions"),
+        ),
+        required_capabilities=required,
+        client_encrypted=client_encrypted,
+    )
+
+
+def route_endpoints(
+    config: GatewayConfig,
+    model_id: str,
+    policy: RoutingPolicy,
+    health: EndpointHealth,
+) -> list[Endpoint]:
+    candidates = config.endpoints_for(model_id)
+    candidates = [
+        endpoint
+        for endpoint in candidates
+        if not endpoint.requires_client_encryption or policy.client_encrypted
+    ]
+    if policy.client_encrypted:
+        # Client ciphertext and key-agreement headers are provider/model
+        # specific. Never forward them to a plaintext or different endpoint.
+        candidates = [endpoint for endpoint in candidates if endpoint.requires_client_encryption]
+    provider_policy = policy.provider
+    if provider_policy.only:
+        candidates = [
+            endpoint for endpoint in candidates if endpoint.provider in provider_policy.only
+        ]
+    if provider_policy.ignore:
+        candidates = [
+            endpoint for endpoint in candidates if endpoint.provider not in provider_policy.ignore
+        ]
+    if provider_policy.regions:
+        allowed_regions = set(provider_policy.regions)
+        candidates = [
+            endpoint
+            for endpoint in candidates
+            if allowed_regions.intersection(
+                endpoint.regions or config.providers[endpoint.provider].regions
+            )
+        ]
+    candidates = [endpoint for endpoint in candidates if _privacy_matches(endpoint, policy)]
+    if provider_policy.require_parameters:
+        candidates = [
+            endpoint
+            for endpoint in candidates
+            if policy.required_capabilities.issubset(
+                endpoint.capabilities or config.models[model_id].capabilities
+            )
+        ]
+    if provider_policy.max_input_price_microusd_per_million is not None:
+        candidates = [
+            endpoint
+            for endpoint in candidates
+            if endpoint.input_price_microusd_per_million
+            <= provider_policy.max_input_price_microusd_per_million
+        ]
+    if provider_policy.max_output_price_microusd_per_million is not None:
+        candidates = [
+            endpoint
+            for endpoint in candidates
+            if endpoint.output_price_microusd_per_million
+            <= provider_policy.max_output_price_microusd_per_million
+        ]
+    if not candidates and policy.privacy.allow_downgrade and not policy.client_encrypted:
+        candidates = config.endpoints_for(model_id)
+        candidates = [endpoint for endpoint in candidates if not endpoint.confidential]
+        if provider_policy.only:
+            candidates = [
+                endpoint for endpoint in candidates if endpoint.provider in provider_policy.only
+            ]
+        if provider_policy.ignore:
+            candidates = [
+                endpoint
+                for endpoint in candidates
+                if endpoint.provider not in provider_policy.ignore
+            ]
+        if provider_policy.require_parameters:
+            candidates = [
+                endpoint
+                for endpoint in candidates
+                if policy.required_capabilities.issubset(
+                    endpoint.capabilities or config.models[model_id].capabilities
+                )
+            ]
+        if provider_policy.max_input_price_microusd_per_million is not None:
+            candidates = [
+                endpoint
+                for endpoint in candidates
+                if endpoint.input_price_microusd_per_million
+                <= provider_policy.max_input_price_microusd_per_million
+            ]
+        if provider_policy.max_output_price_microusd_per_million is not None:
+            candidates = [
+                endpoint
+                for endpoint in candidates
+                if endpoint.output_price_microusd_per_million
+                <= provider_policy.max_output_price_microusd_per_million
+            ]
+    if not candidates:
+        raise RoutingError(
+            "privacy_requirements_unavailable",
+            f"Model {model_id!r} has no endpoint satisfying the request policy",
+        )
+
+    order_index = {provider: index for index, provider in enumerate(provider_policy.order)}
+
+    def key(endpoint: Endpoint) -> tuple[Any, ...]:
+        stats = health.get(endpoint.id)
+        healthy_rank = 0 if stats.healthy else 1
+        explicit_rank = order_index.get(endpoint.provider, len(order_index))
+        if provider_policy.sort == "price":
+            metric: float = (
+                endpoint.input_price_microusd_per_million
+                + endpoint.output_price_microusd_per_million
+            )
+        elif provider_policy.sort == "latency":
+            metric = stats.latency
+        elif provider_policy.sort == "throughput":
+            metric = -stats.throughput
+        else:
+            metric = endpoint.priority
+        return healthy_rank, explicit_rank, metric, -stats.success_rate, endpoint.id
+
+    candidates.sort(key=key)
+    return candidates if provider_policy.allow_fallbacks else candidates[:1]
+
+
+def _privacy_matches(endpoint: Endpoint, policy: RoutingPolicy) -> bool:
+    privacy = policy.privacy
+    if privacy.confidential_disabled and endpoint.confidential:
+        return False
+    if not _satisfies_minimum_privacy(endpoint, privacy.minimum):
+        return False
+    if privacy.require_zero_retention and endpoint.privacy.retention != "zero":
+        return False
+    if privacy.require_response_proof and endpoint.privacy.attestation in {"none", "gateway"}:
+        return False
+    return True
+
+
+def _satisfies_minimum_privacy(endpoint: Endpoint, minimum: str) -> bool:
+    level = endpoint.privacy.level
+    if minimum == "standard":
+        return True
+    if minimum == "no-retention":
+        return endpoint.privacy.retention == "zero" or level == "no-retention"
+    if minimum == "tee":
+        return level in {"tee", "verified-tee", "signed-output", "e2ee-tee"}
+    if minimum == "verified-tee":
+        return level in {"verified-tee", "signed-output"}
+    if minimum == "signed-output":
+        return level == "signed-output"
+    if minimum == "e2ee-tee":
+        return level == "e2ee-tee"
+    return False
+
+
+def _infer_capabilities(payload: dict[str, Any]) -> frozenset[str]:
+    capabilities: set[str] = set()
+    if payload.get("tools"):
+        capabilities.add("tools")
+    if payload.get("tool_choice") is not None:
+        capabilities.add("tool_choice")
+    if payload.get("response_format") is not None:
+        capabilities.add("structured_outputs")
+    if payload.get("reasoning") is not None or payload.get("reasoning_effort") is not None:
+        capabilities.add("reasoning")
+    return frozenset(capabilities)
+
+
+def _strings(value: Any, name: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise RoutingError("invalid_provider_policy", f"{name} must be a list of strings")
+    return tuple(value)
+
+
+def _usd_price(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise RoutingError("invalid_provider_policy", "max_price values must be numbers") from exc
+    if parsed < 0:
+        raise RoutingError("invalid_provider_policy", "max_price values cannot be negative")
+    return round(parsed * 1_000_000)

@@ -35,7 +35,7 @@ resource "google_cloud_run_v2_service" "api_canary" {
 
       env {
         name  = "MODEL_CONFIG_PATH"
-        value = "/etc/sovereign/models.yaml"
+        value = "/app/config/models.yaml"
       }
 
       env {
@@ -148,6 +148,26 @@ resource "google_cloud_run_v2_service" "api_canary" {
         value_source {
           secret_key_ref {
             secret  = google_secret_manager_secret.runtime["site-basic-auth-password"].secret_id
+            version = "latest"
+          }
+        }
+      }
+
+      env {
+        name = "PHALA_API_KEY"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.runtime["phala-api-key"].secret_id
+            version = "latest"
+          }
+        }
+      }
+
+      env {
+        name = "VENICE_API_KEY"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.runtime["venice-api-key"].secret_id
             version = "latest"
           }
         }

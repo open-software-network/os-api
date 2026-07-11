@@ -31,9 +31,7 @@ def test_responses_identify_gateway_region(client: TestClient) -> None:
     assert response.headers["x-gateway-region"] == "local"
 
 
-def test_site_basic_auth_does_not_replace_api_key_auth(
-    client: TestClient, monkeypatch
-) -> None:
+def test_site_basic_auth_does_not_replace_api_key_auth(client: TestClient, monkeypatch) -> None:
     monkeypatch.setenv("SITE_BASIC_AUTH_USERNAME", "alongside")
     monkeypatch.setenv("SITE_BASIC_AUTH_PASSWORD", "test-password")
 
@@ -149,7 +147,7 @@ def test_streaming_is_passed_through(client: TestClient) -> None:
 
     assert response.status_code == 200
     assert response.headers["x-compute-privacy"] == "standard"
-    assert 'data: {"id":"chunk-1"}' in body
+    assert 'data: {"id":"chunk-1","model":"dual-model"}' in body
     assert "data: [DONE]" in body
 
 

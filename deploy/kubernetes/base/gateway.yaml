@@ -51,6 +51,22 @@ spec:
                   key: redis-url
             - name: REDIS_CA_CERT_PATH
               value: /etc/redis/ca.pem
+            - name: PHALA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-secrets
+                  key: phala-api-key
+                  optional: true
+            - name: VENICE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-secrets
+                  key: venice-api-key
+                  optional: true
+            - name: ENDPOINT_FAILURE_THRESHOLD
+              value: "3"
+            - name: ENDPOINT_CIRCUIT_COOLDOWN_SECONDS
+              value: "30"
           volumeMounts:
             - name: models
               mountPath: /etc/sovereign

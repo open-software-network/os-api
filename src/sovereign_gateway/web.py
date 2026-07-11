@@ -276,8 +276,7 @@ async def api_audit_export(request: Request, format: str = "jsonl") -> Response:
     export_format = format.lower()
     if export_format == "jsonl":
         content = "".join(
-            f"{json.dumps(event, separators=(',', ':'), sort_keys=True)}\n"
-            for event in events
+            f"{json.dumps(event, separators=(',', ':'), sort_keys=True)}\n" for event in events
         )
         media_type = "application/x-ndjson"
     elif export_format == "csv":
@@ -288,11 +287,7 @@ async def api_audit_export(request: Request, format: str = "jsonl") -> Response:
     response = Response(
         content=content,
         media_type=media_type,
-        headers={
-            "content-disposition": (
-                f'attachment; filename="os-api-audit.{export_format}"'
-            )
-        },
+        headers={"content-disposition": (f'attachment; filename="os-api-audit.{export_format}"')},
     )
     if session.rotated:
         _set_session_cookies(response, session.rotated)

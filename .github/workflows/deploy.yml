@@ -39,6 +39,13 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Validate hosted provider catalog and pricing
+        run: |
+          uv sync --locked
+          uv run python scripts/validate_provider_catalog.py
+
       - name: Build and push immutable image
         id: image
         shell: bash
@@ -88,6 +95,7 @@ jobs:
             --region "${REGION}" \
             --image "${{ steps.image.outputs.reference }}" \
             --revision-suffix "${suffix}" \
+            --update-env-vars "MODEL_CONFIG_PATH=/app/config/models.yaml" \
             --quiet
           canary_url="$(gcloud run services describe "${CANARY_SERVICE}" \
             --project "${PROJECT_ID}" \
@@ -123,7 +131,31 @@ jobs:
             -H "X-Serverless-Authorization: Bearer ${identity_token}" \
             -H "Authorization: Bearer ${smoke_key}" \
             "${CANARY_URL}/v1/models" \
-            | jq -e '.object == "list" and (.data | length > 0)' >/dev/null
+            | jq -e '.object == "list" and any(.data[]; .id == "openai/gpt-oss-20b")' >/dev/null
+
+          headers_file="$(mktemp)"
+          body_file="$(mktemp)"
+          trap 'rm -f "${headers_file}" "${body_file}"' EXIT
+          curl --fail --silent --show-error --max-time 120 \
+            --dump-header "${headers_file}" \
+            --output "${body_file}" \
+            -H "X-Serverless-Authorization: Bearer ${identity_token}" \
+            -H "Authorization: Bearer ${smoke_key}" \
+            -H "Content-Type: application/json" \
+            -H "X-Confidential-Compute: required" \
+            -X POST "${CANARY_URL}/v1/chat/completions" \
+            --data '{"model":"openai/gpt-oss-20b","messages":[{"role":"user","content":"Reply with exactly: private-ready"}],"max_tokens":16,"privacy":{"minimum":"tee","require_zero_retention":true,"require_response_proof":true}}'
+          jq -e '.choices[0].message.content | type == "string"' "${body_file}" >/dev/null
+          grep -Eiq '^x-os-provider: phala\r?$' "${headers_file}"
+          grep -Eiq '^x-os-privacy-level: tee\r?$' "${headers_file}"
+          grep -Eiq '^x-os-attestation-status: present\r?$' "${headers_file}"
+          generation_id="$(awk 'BEGIN{IGNORECASE=1} /^x-os-generation-id:/ {gsub("\r", "", $2); print $2}' "${headers_file}")"
+          test -n "${generation_id}"
+          curl --fail --silent --show-error --max-time 30 \
+            -H "X-Serverless-Authorization: Bearer ${identity_token}" \
+            -H "Authorization: Bearer ${smoke_key}" \
+            "${CANARY_URL}/v1/privacy/receipts/${generation_id}" \
+            | jq -e '.provider == "phala" and .privacy.level == "tee" and .evidence.status == "present"' >/dev/null
 
       - name: Deploy production revision without traffic
         id: production
@@ -138,6 +170,7 @@ jobs:
             --image "${{ steps.image.outputs.reference }}" \
             --revision-suffix "${suffix}" \
             --no-traffic \
+            --update-env-vars "MODEL_CONFIG_PATH=/app/config/models.yaml" \
             --quiet
           echo "revision=${revision}" >> "${GITHUB_OUTPUT}"
 
@@ -154,6 +187,7 @@ jobs:
             --image "${{ steps.image.outputs.reference }}" \
             --revision-suffix "${suffix}" \
             --no-traffic \
+            --update-env-vars "MODEL_CONFIG_PATH=/app/config/models.yaml" \
             --quiet
           echo "revision=${revision}" >> "${GITHUB_OUTPUT}"
 
