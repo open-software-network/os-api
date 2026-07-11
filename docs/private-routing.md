@@ -48,6 +48,31 @@ Supported provider controls are `order`, `only`, `ignore`, `allow_fallbacks`,
 `regions`. Tool, structured-output, and reasoning parameters automatically become required endpoint
 capabilities.
 
+## Automatic model selection
+
+Use the synthetic model ID `open-software/auto` (or `auto`) and set `auto.cost_quality` from `0`
+(lowest estimated request cost) to `1` (highest configured quality). The router first removes models
+that cannot satisfy the request's privacy, provider, price, capability, or context requirements. It
+then ranks the remaining models using the request's estimated input/output token mix. Automatic
+routing never weakens an explicit requirement.
+
+```json
+{
+  "model": "open-software/auto",
+  "auto": {"cost_quality": 0.7},
+  "messages": [{"role": "user", "content": "Analyze this meeting"}],
+  "tools": [{"type": "function", "function": {"name": "save_note"}}],
+  "privacy": {"minimum": "tee", "require_zero_retention": true}
+}
+```
+
+The successful response identifies the actual canonical model in both its `model` field and the
+`X-OS-Auto-Selected-Model` header. Quality scores are explicit, version-controlled catalog inputs,
+not provider marketing labels. Models without a score are excluded from automatic selection. A
+catalog release must update scores only from a documented evaluation snapshot and rerun the router
+regression suite. Explicit model IDs remain available when reproducibility matters more than
+automatic optimization.
+
 ## Fallback rules
 
 Fallbacks occur only between endpoints for the same canonical model. A timeout, connection error,
@@ -123,3 +148,11 @@ If an enabled provider declares `api_key_env` and the key is absent, `/readyz` r
 
 Provider integrations must not log request or response bodies. Debug modes that expose transformed
 messages are forbidden in production.
+
+## Venice compatibility for June
+
+The dormant compatibility surface implements the Venice endpoints consumed by June API: typed
+model catalogs, audio transcription, and augment search/scrape. It is enabled only with
+`VENICE_COMPAT_ENABLED=true` and only static service API keys may call it. These responses declare
+`X-OS-Billing-Owner: caller`, so June remains the single billing authority during a reversible
+canary. See `docs/os-june-venice-migration.md` for the no-cutover procedure.

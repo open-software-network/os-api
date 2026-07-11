@@ -40,16 +40,18 @@ providers:
 models:
   openai/gpt-oss-20b:
     max_context_length: 131072
-    capabilities: [tools, structured_outputs, reasoning]
+    quality_score: 90
+    capabilities: [tools, tool_choice, structured_outputs, reasoning]
   backup/private-model:
     max_context_length: 32768
+    quality_score: 40
 endpoints:
   phala-gpt-oss-20b:
     model: openai/gpt-oss-20b
     provider: phala
     upstream_model: phala/gpt-oss-20b
     priority: 10
-    capabilities: [tools, structured_outputs, reasoning]
+    capabilities: [tools, tool_choice, structured_outputs, reasoning]
     privacy:
       level: tee
       execution: gpu-tee
@@ -63,7 +65,7 @@ endpoints:
     provider: venice
     upstream_model: tee-gpt-oss-20b
     priority: 20
-    capabilities: [tools, structured_outputs, reasoning]
+    capabilities: [tools, tool_choice, structured_outputs, reasoning]
     privacy:
       level: tee
       execution: gpu-tee
@@ -83,8 +85,8 @@ endpoints:
       retention: zero
       attestation: phala-aci-receipt
     pricing:
-      input_per_million_usd: 0.10
-      output_per_million_usd: 0.20
+      input_per_million_usd: 0.01
+      output_per_million_usd: 0.02
 """
 
 
@@ -96,11 +98,33 @@ def routed_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[T
     monkeypatch.setenv("API_KEY_HASHES", f"router={hashlib.sha256(API_KEY.encode()).hexdigest()}")
     monkeypatch.setenv("PHALA_API_KEY", "phala-secret")
     monkeypatch.setenv("VENICE_API_KEY", "venice-secret")
+    monkeypatch.setenv("VENICE_COMPAT_ENABLED", "true")
     monkeypatch.delenv("REDIS_URL", raising=False)
     calls: list[str] = []
 
     def upstream(request: httpx.Request) -> httpx.Response:
         calls.append(str(request.url))
+        if request.url.path.endswith("/audio/transcriptions"):
+            assert request.headers["authorization"] == "Bearer venice-secret"
+            assert b'name="model"' in request.content
+            assert b"nvidia/parakeet-tdt-0.6b-v3" in request.content
+            assert b'filename="audio.wav"' in request.content
+            assert b"private-name.wav" not in request.content
+            return httpx.Response(200, json={"text": "hello", "language": "en"})
+        if "/augment/" in request.url.path:
+            if request.url.path.endswith("/search"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "results": [
+                            {"title": "Result", "url": "https://example.com", "content": "x"}
+                        ]
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={"url": "https://example.com", "content": "page", "format": "markdown"},
+            )
         payload = json.loads(request.content)
         if request.url.host == "phala.test" and payload["model"] != "backup/private-model":
             return httpx.Response(503, json={"error": "temporarily unavailable"})
@@ -149,6 +173,90 @@ def test_endpoint_config_and_price_sorting(tmp_path: Path) -> None:
     assert endpoints[0].input_price_microusd_per_million == 40_000
 
 
+def test_auto_cost_slider_selects_cheapest_eligible_model(routed_client: TestClient) -> None:
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "open-software/auto",
+            "auto": {"cost_quality": 0},
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["x-os-auto-selected-model"] == "backup/private-model"
+    assert response.json()["model"] == "backup/private-model"
+
+
+def test_auto_quality_slider_selects_highest_quality_model(routed_client: TestClient) -> None:
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "auto",
+            "cost_quality": 1,
+            "messages": [],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["x-os-auto-selected-model"] == "openai/gpt-oss-20b"
+
+
+def test_auto_filters_models_that_lack_required_tools(routed_client: TestClient) -> None:
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "auto",
+            "auto": {"cost_quality": 0},
+            "messages": [],
+            "tools": [{"type": "function", "function": {"name": "lookup"}}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["x-os-auto-selected-model"] == "openai/gpt-oss-20b"
+
+
+def test_auto_forwards_hermes_shape_with_selected_model(routed_client: TestClient) -> None:
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "open-software/auto",
+            "auto": {"cost_quality": 1},
+            "messages": [
+                {"role": "system", "content": "Use tools when needed."},
+                {"role": "user", "content": "Save a note."},
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "save_note",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+            "max_completion_tokens": 32768,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["x-os-auto-selected-model"] == "openai/gpt-oss-20b"
+
+
+@pytest.mark.parametrize("value", [-0.01, 1.01, "quality"])
+def test_auto_rejects_invalid_slider(routed_client: TestClient, value: object) -> None:
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={"model": "auto", "auto": {"cost_quality": value}, "messages": []},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_auto_policy"
+
+
 def test_fallback_preserves_privacy_and_reports_provider(routed_client: TestClient) -> None:
     response = routed_client.post(
         "/v1/chat/completions",
@@ -171,6 +279,31 @@ def test_fallback_preserves_privacy_and_reports_provider(routed_client: TestClie
     generation = routed_client.get("/v1/generation?id=gen-private-1")
     assert generation.status_code == 200
     assert generation.json()["data"]["endpoint"] == "venice-gpt-oss-20b"
+
+
+@pytest.mark.parametrize(
+    ("legacy_id", "canonical_id"),
+    [
+        ("zai-org-glm-5-2", "openai/gpt-oss-20b"),
+        ("nvidia-nemotron-3-nano-30b-a3b", "backup/private-model"),
+    ],
+)
+def test_legacy_june_model_aliases_are_resolved(
+    routed_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_id: str,
+    canonical_id: str,
+) -> None:
+    from sovereign_gateway import app as app_module
+
+    monkeypatch.setitem(app_module.MODEL_ALIASES, legacy_id, canonical_id)
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={"model": legacy_id, "messages": [{"role": "user", "content": "hello"}]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["model"] == canonical_id
 
 
 def test_e2ee_endpoint_requires_client_encryption_headers() -> None:
@@ -232,6 +365,7 @@ def test_explicit_model_fallback_preserves_policy(routed_client: TestClient) -> 
 
 def test_model_and_endpoint_catalogs_expose_privacy(routed_client: TestClient) -> None:
     models = routed_client.get("/v1/models").json()["data"]
+    assert models[0]["id"] == "open-software/auto"
     model = next(item for item in models if item["id"] == "openai/gpt-oss-20b")
     assert model["providers"] == ["phala", "venice"]
     assert model["privacy_levels"] == ["tee"]
@@ -239,6 +373,82 @@ def test_model_and_endpoint_catalogs_expose_privacy(routed_client: TestClient) -
     endpoints = routed_client.get("/v1/models/openai/gpt-oss-20b/endpoints")
     assert endpoints.status_code == 200
     assert len(endpoints.json()["data"]) == 2
+
+
+def test_venice_catalog_shape_supports_june_bootstrap(routed_client: TestClient) -> None:
+    text_models = routed_client.get("/v1/models?type=text")
+    asr_models = routed_client.get("/v1/models?type=asr")
+
+    assert text_models.status_code == 200
+    auto = next(item for item in text_models.json()["data"] if item["id"] == "open-software/auto")
+    assert auto["model_spec"]["pricing"]["input"]["usd"] > 0
+    assert auto["model_spec"]["capabilities"]["supportsFunctionCalling"] is True
+    text = next(item for item in text_models.json()["data"] if item["id"] == "openai/gpt-oss-20b")
+    assert text["type"] == "text"
+    assert text["model_spec"]["pricing"]["input"]["usd"] == 0.04
+    assert text["model_spec"]["availableContextTokens"] == 131072
+    assert text["model_spec"]["capabilities"]["supportsFunctionCalling"] is True
+    assert asr_models.status_code == 200
+    assert asr_models.json()["data"][0]["type"] == "asr"
+    assert asr_models.json()["data"][0]["model_spec"]["pricing"]["per_audio_second"]
+
+
+def test_audio_transcription_matches_venice_upstream_contract(routed_client: TestClient) -> None:
+    response = routed_client.post(
+        "/v1/audio/transcriptions",
+        data={"model": "nvidia/parakeet-tdt-0.6b-v3", "response_format": "json"},
+        files={"file": ("private-name.wav", b"RIFF-audio", "audio/wav")},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"text": "hello", "language": "en"}
+    assert response.headers["x-os-billing-owner"] == "caller"
+    assert response.headers["x-os-provider"] == "venice"
+
+
+def test_audio_transcription_rejects_unpriced_model(routed_client: TestClient) -> None:
+    response = routed_client.post(
+        "/v1/audio/transcriptions",
+        data={"model": "unknown"},
+        files={"file": ("audio.wav", b"RIFF-audio", "audio/wav")},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "model_not_found"
+
+
+def test_augment_search_matches_venice_upstream_contract(routed_client: TestClient) -> None:
+    response = routed_client.post(
+        "/v1/augment/search",
+        json={"query": "private inference", "limit": 99, "search_provider": "brave"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["results"][0]["url"] == "https://example.com"
+    assert response.headers["x-os-billing-owner"] == "caller"
+
+
+def test_augment_scrape_matches_venice_upstream_contract(routed_client: TestClient) -> None:
+    response = routed_client.post("/v1/augment/scrape", json={"url": "https://93.184.216.34/page"})
+
+    assert response.status_code == 200
+    assert response.json()["format"] == "markdown"
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "http://example.com",
+        "https://localhost/admin",
+        "https://127.0.0.1/private",
+        "https://169.254.169.254/metadata",
+        "file:///etc/passwd",
+    ],
+)
+def test_augment_scrape_blocks_ssrf_targets(routed_client: TestClient, target: str) -> None:
+    response = routed_client.post("/v1/augment/scrape", json={"url": target})
+
+    assert response.status_code == 400
 
 
 def test_endpoint_cost_accounts_for_cache_prices(tmp_path: Path) -> None:

@@ -138,3 +138,27 @@ endpoints:
 
     with pytest.raises(ConfigurationError, match="no independent measurement-policy verifier"):
         GatewayConfig.load(path)
+
+
+def test_rejects_quality_score_outside_closed_range(tmp_path: Path) -> None:
+    path = tmp_path / "invalid.yaml"
+    path.write_text(
+        """
+providers:
+  provider:
+    base_url: https://provider.invalid
+models:
+  private/model:
+    quality_score: 101
+endpoints:
+  endpoint:
+    model: private/model
+    provider: provider
+    pricing:
+      input_per_million_usd: 1
+      output_per_million_usd: 1
+"""
+    )
+
+    with pytest.raises(ConfigurationError, match="between 0 and 100"):
+        GatewayConfig.load(path)

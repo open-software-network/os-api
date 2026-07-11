@@ -168,6 +168,17 @@ def test_unknown_model_uses_openai_error_shape(client: TestClient) -> None:
     }
 
 
+def test_venice_compatibility_surface_is_dormant_by_default(client: TestClient) -> None:
+    response = client.post(
+        "/v1/audio/transcriptions",
+        data={"model": "nvidia/parakeet-tdt-0.6b-v3"},
+        files={"file": ("audio.wav", b"RIFF-audio", "audio/wav")},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "not_found"
+
+
 def test_request_id_is_preserved(client: TestClient) -> None:
     response = client.get("/healthz", headers={"X-Request-ID": "request-from-client"})
 

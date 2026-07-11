@@ -14,39 +14,47 @@ providers:
 
 models:
   openai/gpt-oss-20b:
+    quality_score: 58
     owned_by: openai
     max_context_length: 128000
     max_output_length: 128000
     capabilities: [reasoning]
   openai/gpt-oss-120b:
+    quality_score: 78
     owned_by: openai
     max_context_length: 128000
     max_output_length: 128000
     capabilities: [reasoning]
   google/gemma-3-27b-it:
+    quality_score: 65
     owned_by: google
     max_context_length: 40000
     max_output_length: 16384
   qwen/qwen-2.5-7b-instruct:
+    quality_score: 45
     owned_by: qwen
     max_context_length: 32000
     max_output_length: 32000
   deepseek/deepseek-v4-flash:
+    quality_score: 76
     owned_by: deepseek
     max_context_length: 1000000
     max_output_length: 65536
     capabilities: [reasoning]
   z-ai/glm-5.2:
+    quality_score: 94
     owned_by: z-ai
     max_context_length: 1000000
     max_output_length: 131072
     capabilities: [tools, tool_choice, structured_outputs, reasoning]
   qwen/qwen3.6-27b:
+    quality_score: 84
     owned_by: qwen
     max_context_length: 256000
     max_output_length: 262140
     capabilities: [tools, reasoning]
   moonshotai/kimi-k2.6:
+    quality_score: 92
     owned_by: moonshotai
     max_context_length: 262144
     max_output_length: 262144
