@@ -44,7 +44,8 @@ models:
   z-ai/glm-5.2:
     quality_score: 94
     owned_by: z-ai
-    max_context_length: 1000000
+    # Minimum across enabled Phala/Venice endpoints; Venice E2EE is 524,288.
+    max_context_length: 524288
     max_output_length: 131072
     capabilities: [tools, tool_choice, structured_outputs, reasoning]
   qwen/qwen3.6-27b:
@@ -56,8 +57,9 @@ models:
   moonshotai/kimi-k2.6:
     quality_score: 92
     owned_by: moonshotai
-    max_context_length: 262144
-    max_output_length: 262144
+    # Venice's private endpoint advertises 256,000 tokens.
+    max_context_length: 256000
+    max_output_length: 256000
     capabilities: [tools, tool_choice, structured_outputs, reasoning]
 
 endpoints:
@@ -124,6 +126,21 @@ endpoints:
     pricing:
       input_per_million_usd: 0.13
       output_per_million_usd: 0.65
+  venice-gpt-oss-120b-private:
+    model: openai/gpt-oss-120b
+    provider: venice
+    upstream_model: openai-gpt-oss-120b
+    priority: 100
+    capabilities: [tools, tool_choice, reasoning]
+    privacy:
+      level: no-retention
+      execution: standard
+      retention: zero
+      attestation: none
+      transport: tls
+    pricing:
+      input_per_million_usd: 0.07
+      output_per_million_usd: 0.30
 
   phala-gemma-3-27b:
     model: google/gemma-3-27b-it
@@ -156,6 +173,21 @@ endpoints:
     pricing:
       input_per_million_usd: 0.14
       output_per_million_usd: 0.50
+  venice-gemma-3-27b-private:
+    model: google/gemma-3-27b-it
+    provider: venice
+    upstream_model: google-gemma-3-27b-it
+    priority: 100
+    capabilities: [tools, tool_choice, structured_outputs]
+    privacy:
+      level: no-retention
+      execution: standard
+      retention: zero
+      attestation: none
+      transport: tls
+    pricing:
+      input_per_million_usd: 0.12
+      output_per_million_usd: 0.20
 
   phala-qwen-2.5-7b:
     model: qwen/qwen-2.5-7b-instruct
@@ -252,6 +284,22 @@ endpoints:
     pricing:
       input_per_million_usd: 1.75
       output_per_million_usd: 5.75
+  venice-glm-5.2-private:
+    model: z-ai/glm-5.2
+    provider: venice
+    upstream_model: zai-org-glm-5-2
+    priority: 100
+    capabilities: [tools, tool_choice, structured_outputs, reasoning]
+    privacy:
+      level: no-retention
+      execution: standard
+      retention: zero
+      attestation: none
+      transport: tls
+    pricing:
+      input_per_million_usd: 1.40
+      output_per_million_usd: 4.40
+      cache_read_per_million_usd: 0.26
 
   phala-qwen3.6-27b:
     model: qwen/qwen3.6-27b
@@ -285,6 +333,21 @@ endpoints:
       input_per_million_usd: 0.346
       output_per_million_usd: 3.46
       cache_read_per_million_usd: 0.171
+  venice-qwen3.6-27b-private:
+    model: qwen/qwen3.6-27b
+    provider: venice
+    upstream_model: qwen3-6-27b
+    priority: 100
+    capabilities: [tools, tool_choice, structured_outputs, reasoning]
+    privacy:
+      level: no-retention
+      execution: standard
+      retention: zero
+      attestation: none
+      transport: tls
+    pricing:
+      input_per_million_usd: 0.325
+      output_per_million_usd: 3.25
 
   phala-kimi-k2.6:
     model: moonshotai/kimi-k2.6
@@ -302,3 +365,19 @@ endpoints:
       input_per_million_usd: 1.09
       output_per_million_usd: 4.60
       cache_read_per_million_usd: 0.37
+  venice-kimi-k2.6-private:
+    model: moonshotai/kimi-k2.6
+    provider: venice
+    upstream_model: kimi-k2-6
+    priority: 100
+    capabilities: [tools, tool_choice, structured_outputs, reasoning]
+    privacy:
+      level: no-retention
+      execution: standard
+      retention: zero
+      attestation: none
+      transport: tls
+    pricing:
+      input_per_million_usd: 0.75
+      output_per_million_usd: 3.50
+      cache_read_per_million_usd: 0.16

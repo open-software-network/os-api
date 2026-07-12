@@ -21,6 +21,7 @@ from sovereign_gateway.routing import (
     RoutingError,
     parse_routing_policy,
     route_endpoints,
+    select_auto_models,
 )
 
 API_KEY = "sk-routing-test"
@@ -112,6 +113,10 @@ def routed_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[T
             assert b"private-name.wav" not in request.content
             return httpx.Response(200, json={"text": "hello", "language": "en"})
         if "/augment/" in request.url.path:
+            if b"invalid-content-type" in request.content:
+                return httpx.Response(
+                    200, text="<script>alert(1)</script>", headers={"content-type": "text/html"}
+                )
             if request.url.path.endswith("/search"):
                 return httpx.Response(
                     200,
@@ -257,6 +262,47 @@ def test_auto_rejects_invalid_slider(routed_client: TestClient, value: object) -
     assert response.json()["error"]["code"] == "invalid_auto_policy"
 
 
+def test_auto_context_filter_uses_conservative_utf8_bound(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(CONFIG)
+    config = GatewayConfig.load(path)
+    payload = {
+        "model": "auto",
+        "messages": [{"role": "user", "content": "界" * 12_000}],
+        "max_tokens": 1,
+    }
+    policy = parse_routing_policy(payload, None)
+
+    models = select_auto_models(config, policy, EndpointHealth(), payload)
+
+    assert "backup/private-model" not in models
+    assert models == ["openai/gpt-oss-20b"]
+
+
+def test_auto_excludes_model_when_requested_output_exceeds_model_limit(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        CONFIG.replace(
+            "max_context_length: 131072",
+            "max_context_length: 131072\n    max_output_length: 32768",
+        ).replace(
+            "max_context_length: 32768",
+            "max_context_length: 65536\n    max_output_length: 65536",
+        )
+    )
+    config = GatewayConfig.load(path)
+    payload = {
+        "model": "auto",
+        "messages": [{"role": "user", "content": "short"}],
+        "max_tokens": 40_000,
+    }
+    policy = parse_routing_policy(payload, None)
+
+    models = select_auto_models(config, policy, EndpointHealth(), payload)
+
+    assert models == ["backup/private-model"]
+
+
 def test_fallback_preserves_privacy_and_reports_provider(routed_client: TestClient) -> None:
     response = routed_client.post(
         "/v1/chat/completions",
@@ -333,6 +379,49 @@ def test_e2ee_endpoint_requires_client_encryption_headers() -> None:
         route_endpoints(config, "openai/gpt-oss-20b", independently_verified, health)
 
 
+def test_preferred_privacy_appends_zero_retention_venice_fallback() -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    payload = {"model": "openai/gpt-oss-120b", "privacy": {"require_zero_retention": True}}
+    preferred = parse_routing_policy(payload, None)
+    required = parse_routing_policy(payload, "required")
+
+    preferred_endpoints = route_endpoints(
+        config, "openai/gpt-oss-120b", preferred, EndpointHealth()
+    )
+    required_endpoints = route_endpoints(config, "openai/gpt-oss-120b", required, EndpointHealth())
+
+    assert [endpoint.id for endpoint in preferred_endpoints] == [
+        "phala-gpt-oss-120b",
+        "venice-gpt-oss-120b-private",
+    ]
+    assert [endpoint.id for endpoint in required_endpoints] == ["phala-gpt-oss-120b"]
+
+
+def test_production_auto_slider_is_monotonic_for_quality_and_primary_cost() -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    health = EndpointHealth()
+    observed: list[tuple[float, int]] = []
+
+    for value in (0, 0.1, 0.25, 0.5, 0.75, 0.9, 1):
+        payload = {
+            "model": "open-software/auto",
+            "messages": [{"role": "user", "content": "Summarize this meeting."}],
+            "max_tokens": 1_000,
+            "auto": {"cost_quality": value},
+        }
+        policy = parse_routing_policy(payload, None)
+        model_id = select_auto_models(config, policy, health, payload)[0]
+        endpoint = route_endpoints(config, model_id, policy, health)[0]
+        request_cost = (
+            endpoint.input_price_microusd_per_million
+            + 1_000 * endpoint.output_price_microusd_per_million
+        )
+        observed.append((config.models[model_id].quality_score or 0, request_cost))
+
+    assert [quality for quality, _ in observed] == sorted(quality for quality, _ in observed)
+    assert [cost for _, cost in observed] == sorted(cost for _, cost in observed)
+
+
 def test_provider_controls_can_disable_fallback(routed_client: TestClient) -> None:
     response = routed_client.post(
         "/v1/chat/completions",
@@ -382,7 +471,10 @@ def test_venice_catalog_shape_supports_june_bootstrap(routed_client: TestClient)
     assert text_models.status_code == 200
     auto = next(item for item in text_models.json()["data"] if item["id"] == "open-software/auto")
     assert auto["model_spec"]["pricing"]["input"]["usd"] > 0
+    assert auto["model_spec"]["pricing"]["input"]["usd"] == 0.05
+    assert auto["model_spec"]["pricing"]["output"]["usd"] == 0.19
     assert auto["model_spec"]["capabilities"]["supportsFunctionCalling"] is True
+    assert auto["model_spec"]["availableContextTokens"] == 131072
     text = next(item for item in text_models.json()["data"] if item["id"] == "openai/gpt-oss-20b")
     assert text["type"] == "text"
     assert text["model_spec"]["pricing"]["input"]["usd"] == 0.04
@@ -417,6 +509,48 @@ def test_audio_transcription_rejects_unpriced_model(routed_client: TestClient) -
     assert response.json()["error"]["code"] == "model_not_found"
 
 
+def test_audio_transcription_rejects_oversized_body_before_parsing(
+    routed_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MAX_AUDIO_BYTES", "8")
+    response = routed_client.post(
+        "/v1/audio/transcriptions",
+        data={"model": "nvidia/parakeet-tdt-0.6b-v3"},
+        files={"file": ("audio.wav", b"x" * 70_000, "audio/wav")},
+    )
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "request_too_large"
+
+
+def test_audio_transcription_caps_chunked_body_while_parsing(
+    routed_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MAX_AUDIO_BYTES", "8")
+    boundary = "chunked-test"
+    body = (
+        (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="model"\r\n\r\n'
+            "nvidia/parakeet-tdt-0.6b-v3\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="file"; filename="audio.wav"\r\n'
+            "Content-Type: audio/wav\r\n\r\n"
+        ).encode()
+        + b"x" * 70_000
+        + f"\r\n--{boundary}--\r\n".encode()
+    )
+
+    response = routed_client.post(
+        "/v1/audio/transcriptions",
+        headers={"content-type": f"multipart/form-data; boundary={boundary}"},
+        content=(chunk for chunk in (body[:100], body[100:])),
+    )
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "request_too_large"
+
+
 def test_augment_search_matches_venice_upstream_contract(routed_client: TestClient) -> None:
     response = routed_client.post(
         "/v1/augment/search",
@@ -426,6 +560,40 @@ def test_augment_search_matches_venice_upstream_contract(routed_client: TestClie
     assert response.status_code == 200
     assert response.json()["results"][0]["url"] == "https://example.com"
     assert response.headers["x-os-billing-owner"] == "caller"
+
+
+def test_augment_rejects_oversized_json_before_parsing(
+    routed_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MAX_AUGMENT_REQUEST_BYTES", "32")
+    response = routed_client.post("/v1/augment/search", json={"query": "x" * 100})
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "request_too_large"
+
+
+def test_augment_caps_chunked_json_while_reading(
+    routed_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MAX_AUGMENT_REQUEST_BYTES", "32")
+    body = b'{"query":"' + b"x" * 100 + b'"}'
+
+    response = routed_client.post(
+        "/v1/augment/search",
+        headers={"content-type": "application/json"},
+        content=(chunk for chunk in (body[:16], body[16:])),
+    )
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "request_too_large"
+
+
+def test_augment_never_relays_active_upstream_content_type(routed_client: TestClient) -> None:
+    response = routed_client.post("/v1/augment/search", json={"query": "invalid-content-type"})
+
+    assert response.status_code == 502
+    assert response.headers["content-type"].startswith("application/json")
+    assert "<script>" not in response.text
 
 
 def test_augment_scrape_matches_venice_upstream_contract(routed_client: TestClient) -> None:

@@ -67,7 +67,9 @@ def select_auto_models(
     if not 0 <= quality_weight <= 1:
         raise RoutingError("invalid_auto_policy", "auto.cost_quality must be between 0 and 1")
 
-    prompt_tokens = max(1, len(json.dumps(payload, separators=(",", ":"))) // 4)
+    # UTF-8 bytes are a conservative tokenizer-independent upper bound for
+    # byte-fallback model tokenizers, including CJK and large tool schemas.
+    prompt_tokens = max(1, len(json.dumps(payload, separators=(",", ":")).encode("utf-8")))
     requested_output = payload.get("max_completion_tokens", payload.get("max_tokens", 2048))
     try:
         output_tokens = max(1, int(requested_output))
@@ -80,20 +82,20 @@ def select_auto_models(
             continue
         if model.max_context_length is not None and model.max_context_length < required_context:
             continue
+        if model.max_output_length is not None and model.max_output_length < output_tokens:
+            continue
         try:
             endpoints = route_endpoints(config, model_id, policy, health)
         except RoutingError:
             continue
-        cheapest = min(
-            endpoints,
-            key=lambda endpoint: (
-                prompt_tokens * endpoint.input_price_microusd_per_million
-                + output_tokens * endpoint.output_price_microusd_per_million
-            ),
-        )
+        # route_endpoints has already applied the caller's requested provider
+        # ordering. Estimate the endpoint that will actually be attempted
+        # first; using a cheaper fallback here would make the cost end of the
+        # slider select a model whose normal execution costs more than scored.
+        selected = endpoints[0]
         cost = (
-            prompt_tokens * cheapest.input_price_microusd_per_million
-            + output_tokens * cheapest.output_price_microusd_per_million
+            prompt_tokens * selected.input_price_microusd_per_million
+            + output_tokens * selected.output_price_microusd_per_million
         )
         ranked.append((model_id, model.quality_score, float(cost)))
     if not ranked:
@@ -309,41 +311,24 @@ def route_endpoints(
             if endpoint.output_price_microusd_per_million
             <= provider_policy.max_output_price_microusd_per_million
         ]
-    if not candidates and policy.privacy.allow_downgrade and not policy.client_encrypted:
-        candidates = config.endpoints_for(model_id)
-        candidates = [endpoint for endpoint in candidates if not endpoint.confidential]
-        if provider_policy.only:
-            candidates = [
-                endpoint for endpoint in candidates if endpoint.provider in provider_policy.only
-            ]
-        if provider_policy.ignore:
-            candidates = [
-                endpoint
-                for endpoint in candidates
-                if endpoint.provider not in provider_policy.ignore
-            ]
-        if provider_policy.require_parameters:
-            candidates = [
-                endpoint
-                for endpoint in candidates
-                if policy.required_capabilities.issubset(
-                    endpoint.capabilities or config.models[model_id].capabilities
-                )
-            ]
-        if provider_policy.max_input_price_microusd_per_million is not None:
-            candidates = [
-                endpoint
-                for endpoint in candidates
-                if endpoint.input_price_microusd_per_million
-                <= provider_policy.max_input_price_microusd_per_million
-            ]
-        if provider_policy.max_output_price_microusd_per_million is not None:
-            candidates = [
-                endpoint
-                for endpoint in candidates
-                if endpoint.output_price_microusd_per_million
-                <= provider_policy.max_output_price_microusd_per_million
-            ]
+    if policy.privacy.allow_downgrade and not policy.client_encrypted:
+        downgrade_policy = RoutingPolicy(
+            privacy=PrivacyPolicy(
+                minimum="standard",
+                require_zero_retention=policy.privacy.require_zero_retention,
+                require_response_proof=policy.privacy.require_response_proof,
+                allow_downgrade=False,
+                confidential_disabled=True,
+            ),
+            provider=policy.provider,
+            required_capabilities=policy.required_capabilities,
+        )
+        try:
+            downgrade = route_endpoints(config, model_id, downgrade_policy, health)
+        except RoutingError:
+            downgrade = []
+        seen = {endpoint.id for endpoint in candidates}
+        candidates.extend(endpoint for endpoint in downgrade if endpoint.id not in seen)
     if not candidates:
         raise RoutingError(
             "privacy_requirements_unavailable",

@@ -73,12 +73,22 @@ catalog release must update scores only from a documented evaluation snapshot an
 regression suite. Explicit model IDs remain available when reproducibility matters more than
 automatic optimization.
 
+The initial score snapshot and its limitations are recorded in
+[`auto-quality-policy.md`](auto-quality-policy.md). The slider is an ordinal product policy, not a
+claim that one scalar captures every workload. Requests still filter on tools, structured outputs,
+context, privacy, and provider constraints before quality ranking.
+
 ## Fallback rules
 
 Fallbacks occur only between endpoints for the same canonical model. A timeout, connection error,
 HTTP 408/409/425/429, or 5xx response may trigger the next endpoint. Customer errors are returned
-without retry. Privacy filters are applied before the attempt list is constructed, so a fallback
-cannot weaken the requested privacy guarantee. Only the successful endpoint is billed.
+without retry. Only the successful endpoint is billed.
+
+`X-Confidential-Compute: required` and `privacy.allow_downgrade: false` fail closed and never weaken
+the requested privacy guarantee. The default `preferred` policy attempts TEE endpoints first and
+may then use a configured zero-retention private endpoint without a hardware execution proof. The
+response reports the actual privacy level and endpoint in headers. Set the header to `required`
+when availability must never take precedence over confidential compute.
 
 Semantic model fallback is opt-in through an ordered `models` array. Every model in the array is
 independently filtered by the same privacy, provider, region, price, and capability policy. The
@@ -126,6 +136,12 @@ requires Venice's attestation result to be successful, verifies the returned non
 attested signing key to the model public key selected by the client. A mismatch fails closed. This
 is a freshness and key-binding check using Venice's server-side verifier; it is not represented as
 independent hardware-quote verification.
+
+For web scrape compatibility, os-api performs an HTTPS/public-address DNS preflight and Venice
+independently resolves and rejects private or reserved targets at fetch time. The latter enforcement
+is required because a preflight alone is not connection-bound and cannot prevent DNS rebinding. The
+July 12, 2026 canary explicitly verified Venice rejects loopback and link-local metadata targets
+with `400`; reverify this contract before changing augmentation providers.
 
 ## Catalog operations
 

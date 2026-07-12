@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 from collections.abc import Iterator
@@ -70,10 +71,15 @@ models:
         upstream_requests.append(request)
         payload: dict[str, Any] = json.loads(request.content)
         if payload.get("stream"):
+            content = b'data: {"id":"chunk-1"}\n\ndata: [DONE]\n\n'
+            headers = {"content-type": "text/event-stream"}
+            if payload.get("metadata", {}).get("gzip_test"):
+                content = gzip.compress(content)
+                headers["content-encoding"] = "gzip"
             return httpx.Response(
                 200,
-                headers={"content-type": "text/event-stream"},
-                stream=AsyncBytesStream(b'data: {"id":"chunk-1"}\n\ndata: [DONE]\n\n'),
+                headers=headers,
+                stream=AsyncBytesStream(content),
             )
         return httpx.Response(
             200,

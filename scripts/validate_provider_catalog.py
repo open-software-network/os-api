@@ -42,9 +42,23 @@ async def main() -> int:
             prompt = _per_token_price(model, "prompt")
             completion = _per_token_price(model, "completion")
             cache_read = _per_token_price(model, "input_cache_read")
+            context_length = int(model.get("context_length", 0))
+            supported_parameters = set(model.get("supported_parameters", []))
+            live_capabilities = {
+                "tools": "tools" in supported_parameters,
+                "tool_choice": "tool_choice" in supported_parameters,
+                "structured_outputs": bool(
+                    {"response_format", "structured_outputs"}.intersection(supported_parameters)
+                ),
+                "reasoning": bool(
+                    {"reasoning", "reasoning_effort", "include_reasoning"}.intersection(
+                        supported_parameters
+                    )
+                ),
+            }
         else:
             capabilities = model.get("model_spec", {}).get("capabilities", {})
-            if not capabilities.get("supportsTeeAttestation"):
+            if endpoint.confidential and not capabilities.get("supportsTeeAttestation"):
                 errors.append(f"{endpoint.id}: provider no longer reports TEE attestation")
             if endpoint.requires_client_encryption and not capabilities.get("supportsE2EE"):
                 errors.append(f"{endpoint.id}: provider no longer reports E2EE support")
@@ -52,6 +66,24 @@ async def main() -> int:
             prompt = _usd_price(pricing, "input")
             completion = _usd_price(pricing, "output")
             cache_read = _usd_price(pricing, "cache_input")
+            context_length = int(model.get("model_spec", {}).get("availableContextTokens", 0))
+            live_capabilities = {
+                "tools": bool(capabilities.get("supportsFunctionCalling")),
+                "tool_choice": bool(capabilities.get("supportsFunctionCalling")),
+                "structured_outputs": bool(capabilities.get("supportsResponseSchema")),
+                "reasoning": bool(capabilities.get("supportsReasoning")),
+            }
+        configured_model = config.models[endpoint.model_id]
+        if configured_model.max_context_length and (
+            not context_length or configured_model.max_context_length > context_length
+        ):
+            errors.append(
+                f"{endpoint.id}: canonical context={configured_model.max_context_length} "
+                f"exceeds live context={context_length}"
+            )
+        for capability in endpoint.capabilities:
+            if capability in live_capabilities and not live_capabilities[capability]:
+                errors.append(f"{endpoint.id}: provider no longer reports {capability}")
         _check_price(errors, endpoint, "input", prompt)
         _check_price(errors, endpoint, "output", completion)
         _check_price(errors, endpoint, "cache_read", cache_read)

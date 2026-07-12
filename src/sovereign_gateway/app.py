@@ -27,6 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, ValidationError
 from redis.asyncio import Redis
 from starlette.datastructures import UploadFile
+from starlette.formparsers import MultiPartParser
 
 from . import __version__
 from .accounts import AccountsClient, WalletGrant
@@ -137,18 +138,26 @@ def _auto_catalog_model(config: GatewayConfig, created: int) -> dict[str, Any]:
             "pricing": {
                 "input": {
                     "usd": max(
-                        model.input_price_microusd_per_million for model in config.models.values()
+                        (
+                            endpoint.input_price_microusd_per_million
+                            for endpoint in config.endpoints.values()
+                        ),
+                        default=0,
                     )
                     / 1_000_000
                 },
                 "output": {
                     "usd": max(
-                        model.output_price_microusd_per_million for model in config.models.values()
+                        (
+                            endpoint.output_price_microusd_per_million
+                            for endpoint in config.endpoints.values()
+                        ),
+                        default=0,
                     )
                     / 1_000_000
                 },
             },
-            "availableContextTokens": min(
+            "availableContextTokens": max(
                 (
                     model.max_context_length
                     for model in config.models.values()
@@ -668,8 +677,20 @@ def create_app() -> FastAPI:
         compat_error = await _authorize_compat(request)
         if compat_error:
             return compat_error
+        max_audio_bytes = int(os.getenv("MAX_AUDIO_BYTES", "26214400"))
+        body_error = _content_length_error(request, max_audio_bytes + 65_536)
+        if body_error:
+            return body_error
         try:
-            form = await request.form()
+            form = await MultiPartParser(
+                request.headers,
+                _limited_request_stream(request, max_audio_bytes + 65_536),
+                max_files=1,
+                max_fields=5,
+                max_part_size=65_536,
+            ).parse()
+        except RequestBodyTooLarge:
+            return openai_error(413, "Request body is too large", code="request_too_large")
         except Exception:
             return openai_error(400, "Request must be valid multipart form data")
         model = str(form.get("model", "")).strip()
@@ -678,7 +699,6 @@ def create_app() -> FastAPI:
             return openai_error(404, f"Model {model!r} does not exist", code="model_not_found")
         if not isinstance(upload, UploadFile):
             return openai_error(400, "file is required", code="invalid_request")
-        max_audio_bytes = int(os.getenv("MAX_AUDIO_BYTES", "26214400"))
         audio = await upload.read(max_audio_bytes + 1)
         if len(audio) > max_audio_bytes:
             return openai_error(413, "Audio file is too large", code="request_too_large")
@@ -707,10 +727,8 @@ def create_app() -> FastAPI:
             )
         except httpx.HTTPError:
             return openai_error(502, "Audio transcription provider failed")
-        return Response(
-            content=upstream.content,
-            status_code=upstream.status_code,
-            media_type=upstream.headers.get("content-type", "application/json"),
+        return _compat_json_response(
+            upstream,
             headers={"x-os-provider": "venice", "x-os-billing-owner": "caller"},
         )
 
@@ -721,8 +739,16 @@ def create_app() -> FastAPI:
         compat_error = await _authorize_compat(request)
         if compat_error:
             return compat_error
+        max_augment_bytes = int(os.getenv("MAX_AUGMENT_REQUEST_BYTES", "16384"))
+        body_error = _content_length_error(request, max_augment_bytes)
+        if body_error:
+            return body_error
         try:
-            payload = await request.json()
+            raw = await _read_request_body_limited(request, max_augment_bytes)
+        except RequestBodyTooLarge:
+            return openai_error(413, "Request body is too large", code="request_too_large")
+        try:
+            payload = json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError):
             return openai_error(400, "Request body must be JSON", code="invalid_request")
         if not isinstance(payload, dict):
@@ -757,10 +783,8 @@ def create_app() -> FastAPI:
             )
         except httpx.HTTPError:
             return openai_error(502, "Web augmentation provider failed")
-        return Response(
-            content=upstream.content,
-            status_code=upstream.status_code,
-            media_type=upstream.headers.get("content-type", "application/json"),
+        return _compat_json_response(
+            upstream,
             headers={"x-os-provider": "venice", "x-os-billing-owner": "caller"},
         )
 
@@ -1538,7 +1562,49 @@ async def _authorize_compat(request: Request) -> Response | None:
     return None
 
 
+def _content_length_error(request: Request, maximum: int) -> Response | None:
+    raw = request.headers.get("content-length")
+    if raw is None:
+        return None
+    try:
+        if int(raw) > maximum:
+            return openai_error(413, "Request body is too large", code="request_too_large")
+    except ValueError:
+        return openai_error(400, "Content-Length must be an integer", code="invalid_request")
+    return None
+
+
+class RequestBodyTooLarge(ValueError):
+    pass
+
+
+async def _limited_request_stream(request: Request, maximum: int) -> AsyncIterator[bytes]:
+    received = 0
+    async for chunk in request.stream():
+        received += len(chunk)
+        if received > maximum:
+            raise RequestBodyTooLarge
+        yield chunk
+
+
+async def _read_request_body_limited(request: Request, maximum: int) -> bytes:
+    chunks = [chunk async for chunk in _limited_request_stream(request, maximum)]
+    return b"".join(chunks)
+
+
+def _compat_json_response(upstream: httpx.Response, headers: dict[str, str]) -> Response:
+    try:
+        content = upstream.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return openai_error(502, "Compatibility provider returned invalid JSON")
+    return JSONResponse(content=content, status_code=upstream.status_code, headers=headers)
+
+
 async def _public_https_url(raw: str) -> bool:
+    # This is a local defense-in-depth preflight, not a connection-bound DNS
+    # pin. The Venice scrape service independently resolves the target and
+    # rejects private/reserved destinations at fetch time; keep that provider
+    # contract in the production canary tests before enabling compatibility.
     try:
         parsed = urlsplit(raw)
         if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
@@ -1726,7 +1792,11 @@ async def _metered_stream(
     pending = b""
     usage: dict[str, Any] | None = None
     try:
-        async for chunk in upstream.aiter_raw():
+        # Providers such as Venice may gzip SSE even when the downstream
+        # response should remain a normal event stream. Iterate decoded bytes;
+        # forwarding raw compressed chunks without Content-Encoding produces
+        # an unreadable stream and also prevents usage settlement.
+        async for chunk in upstream.aiter_bytes():
             pending += chunk
             lines = pending.split(b"\n")
             pending = lines.pop()

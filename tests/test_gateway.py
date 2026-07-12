@@ -151,6 +151,25 @@ def test_streaming_is_passed_through(client: TestClient) -> None:
     assert "data: [DONE]" in body
 
 
+def test_gzip_compressed_upstream_stream_is_decoded(client: TestClient) -> None:
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers={"X-Confidential-Compute": "disabled"},
+        json={
+            "model": "dual-model",
+            "stream": True,
+            "messages": [],
+            "metadata": {"gzip_test": True},
+        },
+    ) as response:
+        body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    assert 'data: {"id":"chunk-1","model":"dual-model"}' in body
+    assert "data: [DONE]" in body
+
+
 def test_unknown_model_uses_openai_error_shape(client: TestClient) -> None:
     response = client.post(
         "/v1/embeddings",
