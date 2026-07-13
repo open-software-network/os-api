@@ -131,6 +131,10 @@ def routed_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[T
                 json={"url": "https://example.com", "content": "page", "format": "markdown"},
             )
         payload = json.loads(request.content)
+        if payload.get("metadata", {}).get("force_primary_400") and payload["model"] != (
+            "backup/private-model"
+        ):
+            return httpx.Response(400, json={"error": "model-specific schema rejection"})
         if request.url.host == "phala.test" and payload["model"] != "backup/private-model":
             return httpx.Response(503, json={"error": "temporarily unavailable"})
         return httpx.Response(
@@ -262,6 +266,54 @@ def test_auto_forwards_hermes_shape_with_selected_model(routed_client: TestClien
 
     assert response.status_code == 200
     assert response.headers["x-os-auto-selected-model"] == "openai/gpt-oss-20b"
+
+
+def test_auto_falls_back_to_next_model_after_provider_400(routed_client: TestClient) -> None:
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "open-software/auto",
+            "auto": {"cost_quality": 1},
+            "messages": [{"role": "user", "content": "hello"}],
+            "metadata": {"force_primary_400": True},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["x-os-auto-selected-model"] == "backup/private-model"
+    assert response.json()["model"] == "backup/private-model"
+
+
+def test_explicit_model_preserves_provider_400(routed_client: TestClient) -> None:
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "openai/gpt-oss-20b",
+            "messages": [{"role": "user", "content": "hello"}],
+            "metadata": {"force_primary_400": True},
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "model-specific schema rejection"}
+
+
+def test_auto_preserves_provider_400_when_fallbacks_are_disabled(
+    routed_client: TestClient,
+) -> None:
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "open-software/auto",
+            "auto": {"cost_quality": 1},
+            "messages": [{"role": "user", "content": "hello"}],
+            "metadata": {"force_primary_400": True},
+            "provider": {"allow_fallbacks": False},
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "model-specific schema rejection"}
 
 
 @pytest.mark.parametrize("value", [-0.01, 1.01, "quality"])

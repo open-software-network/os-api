@@ -1003,6 +1003,22 @@ def create_app() -> FastAPI:
                 content = await upstream.aread()
                 await upstream.aclose()
                 await free_capacity()
+                # A provider can reject a request for model-specific reasons
+                # (unsupported schema details, temporary model deployment
+                # drift, or a stale catalog entry). Auto promises a working
+                # route, not a particular model, so continue across the ranked
+                # model frontier. Explicit model requests retain the provider's
+                # original 4xx response for OpenAI-compatible semantics.
+                if auto_requested and policy.provider.allow_fallbacks:
+                    await request.app.state.endpoint_health.failure(endpoint.id)
+                    failures.append(
+                        {
+                            "endpoint": endpoint.id,
+                            "status": upstream.status_code,
+                            "body_bytes": len(content),
+                        }
+                    )
+                    continue
                 await _release_billing(request, billing, f"upstream_{upstream.status_code}")
                 return Response(
                     content=content,
