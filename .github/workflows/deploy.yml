@@ -106,21 +106,31 @@ jobs:
           test -n "${canary_url}"
           echo "url=${canary_url}" >> "${GITHUB_OUTPUT}"
 
+      - name: Mint canary identity token
+        id: canary-auth
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          token_format: id_token
+          id_token_audience: ${{ steps.canary.outputs.url }}
+
       - name: Smoke test private canary
         shell: bash
         env:
           CANARY_URL: ${{ steps.canary.outputs.url }}
+          CANARY_ID_TOKEN: ${{ steps.canary-auth.outputs.id_token }}
         run: |
           set -euo pipefail
           smoke_key="$(gcloud secrets versions access latest \
             --project "${PROJECT_ID}" \
             --secret smoke-client-api-key)"
           echo "::add-mask::${smoke_key}"
-          identity_token="$(gcloud auth print-identity-token --audiences="${CANARY_URL}")"
-          echo "::add-mask::${identity_token}"
+          echo "::add-mask::${CANARY_ID_TOKEN}"
           for attempt in {1..12}; do
             if curl --fail --silent --show-error --max-time 15 \
-              -H "X-Serverless-Authorization: Bearer ${identity_token}" \
+              -H "X-Serverless-Authorization: Bearer ${CANARY_ID_TOKEN}" \
               "${CANARY_URL}/readyz" >/dev/null; then
               break
             fi
@@ -130,7 +140,7 @@ jobs:
             sleep 5
           done
           curl --fail --silent --show-error --max-time 30 \
-            -H "X-Serverless-Authorization: Bearer ${identity_token}" \
+            -H "X-Serverless-Authorization: Bearer ${CANARY_ID_TOKEN}" \
             -H "Authorization: Bearer ${smoke_key}" \
             "${CANARY_URL}/v1/models" \
             | jq -e '.object == "list" and any(.data[]; .id == "openai/gpt-oss-20b")' >/dev/null
@@ -141,7 +151,7 @@ jobs:
           curl --fail --silent --show-error --max-time 120 \
             --dump-header "${headers_file}" \
             --output "${body_file}" \
-            -H "X-Serverless-Authorization: Bearer ${identity_token}" \
+            -H "X-Serverless-Authorization: Bearer ${CANARY_ID_TOKEN}" \
             -H "Authorization: Bearer ${smoke_key}" \
             -H "Content-Type: application/json" \
             -H "X-Confidential-Compute: required" \
@@ -154,7 +164,7 @@ jobs:
           generation_id="$(awk 'BEGIN{IGNORECASE=1} /^x-os-generation-id:/ {gsub("\r", "", $2); print $2}' "${headers_file}")"
           test -n "${generation_id}"
           curl --fail --silent --show-error --max-time 30 \
-            -H "X-Serverless-Authorization: Bearer ${identity_token}" \
+            -H "X-Serverless-Authorization: Bearer ${CANARY_ID_TOKEN}" \
             -H "Authorization: Bearer ${smoke_key}" \
             "${CANARY_URL}/v1/privacy/receipts/${generation_id}" \
             | jq -e '.provider == "phala" and .privacy.level == "tee" and .evidence.status == "present"' >/dev/null
