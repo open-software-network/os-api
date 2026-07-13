@@ -31,7 +31,8 @@ def main() -> int:
     phala = [item for item in phala_response.json()["data"] if item.get("is_tee") is True]
     generated: dict[str, dict[str, Any]] = {"models": {}, "endpoints": {}}
     for item in sorted(venice, key=lambda value: str(value["id"])):
-        _add_venice(generated, item)
+        if item["id"] not in curated:
+            _add_venice(generated, item)
     for item in sorted(phala, key=lambda value: str(value["id"])):
         if item["id"] not in curated and item["id"] not in generated["models"]:
             _add_phala(generated, item)
@@ -41,8 +42,9 @@ def main() -> int:
         + yaml.safe_dump(generated, sort_keys=False, allow_unicode=True, width=1000)
     )
     print(
-        f"Wrote {len(venice)} Venice models and "
-        f"{len(generated['models']) - len(venice)} additional Phala TEE models to {output}"
+        f"Wrote {len([item for item in venice if item['id'] not in curated])} Venice models and "
+        f"{len(generated['models']) - len([item for item in venice if item['id'] not in curated])} "
+        f"additional Phala TEE models to {output}"
     )
     return 0
 
