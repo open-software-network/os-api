@@ -48,12 +48,48 @@ Supported provider controls are `order`, `only`, `ignore`, `allow_fallbacks`,
 `regions`. Tool, structured-output, and reasoning parameters automatically become required endpoint
 capabilities.
 
+## Automatic model selection
+
+Use the synthetic model ID `open-software/auto` (or `auto`) and set `auto.cost_quality` from `0`
+(lowest estimated request cost) to `1` (highest configured quality). The router first removes models
+that cannot satisfy the request's privacy, provider, price, capability, or context requirements. It
+then ranks the remaining models using the request's estimated input/output token mix. Automatic
+routing never weakens an explicit requirement. When `cost_quality` is omitted, the router defaults
+to `1` so quality is preferred unless the caller explicitly chooses a lower-cost policy.
+
+```json
+{
+  "model": "open-software/auto",
+  "auto": {"cost_quality": 0.7},
+  "messages": [{"role": "user", "content": "Analyze this meeting"}],
+  "tools": [{"type": "function", "function": {"name": "save_note"}}],
+  "privacy": {"minimum": "tee", "require_zero_retention": true}
+}
+```
+
+The successful response identifies the actual canonical model in both its `model` field and the
+`X-OS-Auto-Selected-Model` header. Quality scores are explicit, version-controlled catalog inputs,
+not provider marketing labels. Models without a score are excluded from automatic selection. A
+catalog release must update scores only from a documented evaluation snapshot and rerun the router
+regression suite. Explicit model IDs remain available when reproducibility matters more than
+automatic optimization.
+
+The initial score snapshot and its limitations are recorded in
+[`auto-quality-policy.md`](auto-quality-policy.md). The slider is an ordinal product policy, not a
+claim that one scalar captures every workload. Requests still filter on tools, structured outputs,
+context, privacy, and provider constraints before quality ranking.
+
 ## Fallback rules
 
 Fallbacks occur only between endpoints for the same canonical model. A timeout, connection error,
 HTTP 408/409/425/429, or 5xx response may trigger the next endpoint. Customer errors are returned
-without retry. Privacy filters are applied before the attempt list is constructed, so a fallback
-cannot weaken the requested privacy guarantee. Only the successful endpoint is billed.
+without retry. Only the successful endpoint is billed.
+
+`X-Confidential-Compute: required` and `privacy.allow_downgrade: false` fail closed and never weaken
+the requested privacy guarantee. The default `preferred` policy attempts TEE endpoints first and
+may then use a configured zero-retention private endpoint without a hardware execution proof. The
+response reports the actual privacy level and endpoint in headers. Set the header to `required`
+when availability must never take precedence over confidential compute.
 
 Semantic model fallback is opt-in through an ordered `models` array. Every model in the array is
 independently filtered by the same privacy, provider, region, price, and capability policy. The
@@ -102,6 +138,12 @@ attested signing key to the model public key selected by the client. A mismatch 
 is a freshness and key-binding check using Venice's server-side verifier; it is not represented as
 independent hardware-quote verification.
 
+For web scrape compatibility, os-api performs an HTTPS/public-address DNS preflight and Venice
+independently resolves and rejects private or reserved targets at fetch time. The latter enforcement
+is required because a preflight alone is not connection-bound and cannot prevent DNS rebinding. The
+July 12, 2026 canary explicitly verified Venice rejects loopback and link-local metadata targets
+with `400`; reverify this contract before changing augmentation providers.
+
 ## Catalog operations
 
 The catalog in `config/models.yaml` is fail-fast validated at application startup. Before every
@@ -123,3 +165,11 @@ If an enabled provider declares `api_key_env` and the key is absent, `/readyz` r
 
 Provider integrations must not log request or response bodies. Debug modes that expose transformed
 messages are forbidden in production.
+
+## Venice compatibility for June
+
+The dormant compatibility surface implements the Venice endpoints consumed by June API: typed
+model catalogs, audio transcription, and augment search/scrape. It is enabled only with
+`VENICE_COMPAT_ENABLED=true` and only static service API keys may call it. These responses declare
+`X-OS-Billing-Owner: caller`, so June remains the single billing authority during a reversible
+canary. See `docs/os-june-venice-migration.md` for the no-cutover procedure.

@@ -105,6 +105,7 @@ class ModelRoute:
     input_modalities: tuple[str, ...] = ("text",)
     output_modalities: tuple[str, ...] = ("text",)
     created: int | None = None
+    quality_score: float | None = None
 
     # Compatibility fields used by the existing web UI and tests. Pricing is
     # populated with the cheapest enabled endpoint for the model.
@@ -297,6 +298,7 @@ def _load_endpoint_config(raw: dict[str, Any]) -> GatewayConfig:
                 item.get("output_modalities", ["text"]), f"model {model_id} output modalities"
             ),
             created=item.get("created"),
+            quality_score=_optional_score(item.get("quality_score"), model_id),
             input_price_microusd_per_million=min(
                 endpoint.input_price_microusd_per_million for endpoint in prices
             ),
@@ -439,6 +441,17 @@ def _optional_positive_int(value: Any, model_id: str) -> int | None:
     if not isinstance(value, int) or value < 1:
         raise ConfigurationError(f"model {model_id!r} length limits must be positive integers")
     return value
+
+
+def _optional_score(value: Any, model_id: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigurationError(f"model {model_id!r} quality_score must be a number")
+    score = float(value)
+    if not 0 <= score <= 100:
+        raise ConfigurationError(f"model {model_id!r} quality_score must be between 0 and 100")
+    return score
 
 
 def _string_tuple(value: Any, field_name: str) -> tuple[str, ...]:

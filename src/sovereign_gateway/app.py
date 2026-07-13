@@ -4,11 +4,13 @@ import asyncio
 import base64
 import binascii
 import hashlib
+import ipaddress
 import json
 import logging
 import os
 import re
 import secrets
+import socket
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -16,6 +18,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, Request
@@ -23,6 +26,8 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, ValidationError
 from redis.asyncio import Redis
+from starlette.datastructures import UploadFile
+from starlette.formparsers import MultiPartParser
 
 from . import __version__
 from .accounts import AccountsClient, WalletGrant
@@ -45,7 +50,14 @@ from .rate_limit import (
     RedisFixedWindowLimiter,
 )
 from .receipts import build_receipt_repository
-from .routing import EndpointHealth, RoutingError, parse_routing_policy, route_endpoints
+from .routing import (
+    AUTO_MODEL_IDS,
+    EndpointHealth,
+    RoutingError,
+    parse_routing_policy,
+    route_endpoints,
+    select_auto_models,
+)
 from .web import router as web_router
 
 logger = logging.getLogger("sovereign_gateway")
@@ -71,10 +83,98 @@ PROXY_PATHS = {"chat/completions", "completions", "embeddings"}
 PACKAGE_DIR = Path(__file__).resolve().parent
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 SITE_AUTH_EXEMPT_PATHS = frozenset({"/healthz", "/readyz", "/v1"})
+DEFAULT_ASR_MODELS = ("nvidia/parakeet-tdt-0.6b-v3",)
+MODEL_ALIASES = {
+    "zai-org-glm-5-2": "z-ai/glm-5.2",
+    "kimi-k2-6": "moonshotai/kimi-k2.6",
+    "zai-org-glm-5-1": "z-ai/glm-5.2",
+    "zai-org-glm-5": "z-ai/glm-5.2",
+    "nvidia-nemotron-3-nano-30b-a3b": "qwen/qwen-2.5-7b-instruct",
+}
 
 
 def _site_auth_protects_path(path: str) -> bool:
     return path not in SITE_AUTH_EXEMPT_PATHS and not path.startswith("/v1/")
+
+
+def _compat_enabled() -> bool:
+    return os.getenv("VENICE_COMPAT_ENABLED", "false").lower() in {"1", "true", "yes"}
+
+
+def _asr_models() -> tuple[str, ...]:
+    raw = os.getenv("ASR_MODEL_ALLOWLIST", "")
+    models = tuple(dict.fromkeys(item.strip() for item in raw.split(",") if item.strip()))
+    return models or DEFAULT_ASR_MODELS
+
+
+def _venice_capabilities(capabilities: frozenset[str]) -> dict[str, bool]:
+    names: dict[str, bool] = {}
+    if "tools" in capabilities:
+        names["supportsFunctionCalling"] = True
+    if "reasoning" in capabilities:
+        names["supportsReasoning"] = True
+        names["supportsReasoningEffort"] = True
+    if "structured_outputs" in capabilities:
+        names["supportsResponseSchema"] = True
+    return names
+
+
+def _auto_catalog_model(config: GatewayConfig, created: int) -> dict[str, Any]:
+    # June owns billing on the compatibility path, so advertise conservative
+    # maximum rates. Actual provider cost can only be lower than its hold.
+    return {
+        "id": "open-software/auto",
+        "object": "model",
+        "type": "text",
+        "created": created,
+        "owned_by": "open-software",
+        "description": "Privacy-safe automatic cost and quality routing",
+        "supported_parameters": ["auto.cost_quality", "privacy", "provider"],
+        "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
+        "model_spec": {
+            "name": "Automatic private model",
+            "description": "Automatically selects an eligible private model",
+            "privacy": "private",
+            "pricing": {
+                "input": {
+                    "usd": max(
+                        (
+                            endpoint.input_price_microusd_per_million
+                            for endpoint in config.endpoints.values()
+                        ),
+                        default=0,
+                    )
+                    / 1_000_000
+                },
+                "output": {
+                    "usd": max(
+                        (
+                            endpoint.output_price_microusd_per_million
+                            for endpoint in config.endpoints.values()
+                        ),
+                        default=0,
+                    )
+                    / 1_000_000
+                },
+            },
+            "availableContextTokens": max(
+                (
+                    model.max_context_length
+                    for model in config.models.values()
+                    if model.max_context_length is not None
+                ),
+                default=32_768,
+            ),
+            "capabilities": {
+                "supportsFunctionCalling": True,
+                "supportsReasoning": True,
+                "supportsReasoningEffort": True,
+                "supportsResponseSchema": True,
+            },
+            "traits": ["automatic"],
+            "offline": False,
+        },
+    }
 
 
 def _site_basic_auth_error(request: Request) -> Response | None:
@@ -313,13 +413,49 @@ def create_app() -> FastAPI:
             return auth_error
         config: GatewayConfig = request.app.state.config
         created = int(time.time())
+        requested_type = request.query_params.get("type")
+        if requested_type == "asr":
+            return JSONResponse(
+                content={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": model_id,
+                            "object": "model",
+                            "type": "asr",
+                            "created": created,
+                            "owned_by": "private-network",
+                            "model_spec": {
+                                "name": model_id.rsplit("/", 1)[-1],
+                                "description": "Private speech recognition",
+                                "privacy": "private",
+                                "pricing": {
+                                    "per_audio_second": {
+                                        "usd": float(
+                                            os.getenv("ASR_PRICE_PER_SECOND_USD", "0.0001")
+                                        )
+                                    }
+                                },
+                                "capabilities": {},
+                                "traits": ["prompt"],
+                                "offline": False,
+                            },
+                        }
+                        for model_id in _asr_models()
+                    ],
+                }
+            )
+        if requested_type not in {None, "", "text"}:
+            return openai_error(422, "type must be text or asr", code="model_type_invalid")
         return JSONResponse(
             content={
                 "object": "list",
-                "data": [
+                "data": [_auto_catalog_model(config, created)]
+                + [
                     {
                         "id": model.id,
                         "object": "model",
+                        "type": "text",
                         "created": created,
                         "owned_by": model.owned_by,
                         "privacy_modes": config.privacy_modes_for(model.id),
@@ -343,6 +479,31 @@ def create_app() -> FastAPI:
                         },
                         "max_context_length": model.max_context_length,
                         "context_length": model.max_context_length,
+                        "quality_score": model.quality_score,
+                        "model_spec": {
+                            "name": model.id.rsplit("/", 1)[-1],
+                            "description": None,
+                            "privacy": "private",
+                            "pricing": {
+                                "input": {
+                                    "usd": model.input_price_microusd_per_million / 1_000_000
+                                },
+                                "output": {
+                                    "usd": model.output_price_microusd_per_million / 1_000_000
+                                },
+                            },
+                            "availableContextTokens": model.max_context_length,
+                            "capabilities": _venice_capabilities(
+                                frozenset(model.capabilities).union(
+                                    *(
+                                        endpoint.capabilities
+                                        for endpoint in config.endpoints_for(model.id)
+                                    )
+                                )
+                            ),
+                            "traits": [],
+                            "offline": False,
+                        },
                         "pricing": {
                             "input_per_million_usd": (
                                 model.input_price_microusd_per_million / 1_000_000
@@ -511,6 +672,122 @@ def create_app() -> FastAPI:
             }
         )
 
+    @app.post("/v1/audio/transcriptions")
+    async def audio_transcriptions(request: Request) -> Response:
+        compat_error = await _authorize_compat(request)
+        if compat_error:
+            return compat_error
+        max_audio_bytes = int(os.getenv("MAX_AUDIO_BYTES", "26214400"))
+        body_error = _content_length_error(request, max_audio_bytes + 65_536)
+        if body_error:
+            return body_error
+        try:
+            form = await MultiPartParser(
+                request.headers,
+                _limited_request_stream(request, max_audio_bytes + 65_536),
+                max_files=1,
+                max_fields=5,
+                max_part_size=65_536,
+            ).parse()
+        except RequestBodyTooLarge:
+            return openai_error(413, "Request body is too large", code="request_too_large")
+        except Exception:
+            return openai_error(400, "Request must be valid multipart form data")
+        model = str(form.get("model", "")).strip()
+        upload = form.get("file")
+        if model not in _asr_models():
+            return openai_error(404, f"Model {model!r} does not exist", code="model_not_found")
+        if not isinstance(upload, UploadFile):
+            return openai_error(400, "file is required", code="invalid_request")
+        audio = await upload.read(max_audio_bytes + 1)
+        if len(audio) > max_audio_bytes:
+            return openai_error(413, "Audio file is too large", code="request_too_large")
+        if not audio:
+            return openai_error(400, "Audio file is empty", code="invalid_request")
+        provider = request.app.state.config.providers.get("venice")
+        if not provider or not provider.enabled or not provider.api_key:
+            return openai_error(503, "Audio transcription provider is unavailable")
+        data = {"model": model, "response_format": str(form.get("response_format", "json"))}
+        for optional in ("language", "prompt", "temperature"):
+            value = form.get(optional)
+            if isinstance(value, str) and value:
+                data[optional] = value
+        try:
+            upstream = await request.app.state.http.post(
+                f"{provider.base_url}/v1/audio/transcriptions",
+                headers={"authorization": f"Bearer {provider.api_key}"},
+                data=data,
+                files={
+                    "file": (
+                        "audio.wav",
+                        audio,
+                        upload.content_type or "application/octet-stream",
+                    )
+                },
+            )
+        except httpx.HTTPError:
+            return openai_error(502, "Audio transcription provider failed")
+        return _compat_json_response(
+            upstream,
+            headers={"x-os-provider": "venice", "x-os-billing-owner": "caller"},
+        )
+
+    @app.post("/v1/augment/{operation}")
+    async def augment(operation: str, request: Request) -> Response:
+        if operation not in {"search", "scrape"}:
+            return openai_error(404, "Unknown API endpoint", code="not_found")
+        compat_error = await _authorize_compat(request)
+        if compat_error:
+            return compat_error
+        max_augment_bytes = int(os.getenv("MAX_AUGMENT_REQUEST_BYTES", "16384"))
+        body_error = _content_length_error(request, max_augment_bytes)
+        if body_error:
+            return body_error
+        try:
+            raw = await _read_request_body_limited(request, max_augment_bytes)
+        except RequestBodyTooLarge:
+            return openai_error(413, "Request body is too large", code="request_too_large")
+        try:
+            payload = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return openai_error(400, "Request body must be JSON", code="invalid_request")
+        if not isinstance(payload, dict):
+            return openai_error(400, "Request body must be an object", code="invalid_request")
+        if operation == "search":
+            query = payload.get("query")
+            if not isinstance(query, str) or not query.strip() or len(query) > 400:
+                return openai_error(400, "query must contain 1-400 characters")
+            limit = payload.get("limit")
+            if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool)):
+                return openai_error(400, "limit must be an integer")
+            if limit is not None:
+                payload["limit"] = max(1, min(20, limit))
+            if payload.get("search_provider", "brave") not in {"brave", "google"}:
+                return openai_error(400, "search_provider must be brave or google")
+        else:
+            target = payload.get("url")
+            if (
+                not isinstance(target, str)
+                or len(target) > 4096
+                or not await _public_https_url(target)
+            ):
+                return openai_error(400, "url must be a public HTTPS URL")
+        provider = request.app.state.config.providers.get("venice")
+        if not provider or not provider.enabled or not provider.api_key:
+            return openai_error(503, "Web augmentation provider is unavailable")
+        try:
+            upstream = await request.app.state.http.post(
+                f"{provider.base_url}/v1/augment/{operation}",
+                headers={"authorization": f"Bearer {provider.api_key}"},
+                json=payload,
+            )
+        except httpx.HTTPError:
+            return openai_error(502, "Web augmentation provider failed")
+        return _compat_json_response(
+            upstream,
+            headers={"x-os-provider": "venice", "x-os-billing-owner": "caller"},
+        )
+
     @app.post("/v1/{proxy_path:path}")
     async def routed_inference(proxy_path: str, request: Request) -> Response:
         if proxy_path not in PROXY_PATHS:
@@ -561,8 +838,13 @@ def create_app() -> FastAPI:
             requested_models = list(dict.fromkeys(requested_models_raw))
             if parsed.model not in requested_models:
                 requested_models.insert(0, parsed.model)
+        requested_models = [MODEL_ALIASES.get(model_id, model_id) for model_id in requested_models]
+        requested_models = list(dict.fromkeys(requested_models))
+        auto_requested = parsed.model in AUTO_MODEL_IDS
         unknown_models = [
-            model_id for model_id in requested_models if model_id not in config.models
+            model_id
+            for model_id in requested_models
+            if model_id not in config.models and model_id not in AUTO_MODEL_IDS
         ]
         if unknown_models:
             return openai_error(
@@ -577,6 +859,15 @@ def create_app() -> FastAPI:
                     and request.headers.get("x-venice-tee-model-pub-key")
                 ),
             )
+            if auto_requested:
+                if requested_models != [parsed.model]:
+                    raise RoutingError(
+                        "invalid_auto_policy",
+                        "auto cannot be combined with explicit model fallbacks",
+                    )
+                requested_models = select_auto_models(
+                    config, policy, request.app.state.endpoint_health, payload
+                )
             candidates: list[Endpoint] = []
             routing_errors: list[RoutingError] = []
             for model_id in requested_models:
@@ -650,6 +941,11 @@ def create_app() -> FastAPI:
                         logger.exception("endpoint concurrency release failed")
 
             outbound = dict(payload)
+            outbound.pop("auto", None)
+            outbound.pop("cost_quality", None)
+            outbound.pop("models", None)
+            if auto_requested:
+                outbound["model"] = endpoint.model_id
             if parsed.stream:
                 stream_options = outbound.get("stream_options")
                 if not isinstance(stream_options, dict):
@@ -731,6 +1027,8 @@ def create_app() -> FastAPI:
                 else None
             )
             response_headers = _endpoint_headers(endpoint, evidence, privacy_label)
+            if auto_requested:
+                response_headers["x-os-auto-selected-model"] = endpoint.model_id
             content_type = upstream.headers.get("content-type", "application/json")
             generation_id = request.state.request_id
             await _store_privacy_receipt(request, generation_id, endpoint, evidence)
@@ -1247,6 +1545,101 @@ async def _authorize(request: Request) -> Response | None:
     return None
 
 
+async def _authorize_compat(request: Request) -> Response | None:
+    if not _compat_enabled():
+        return openai_error(404, "Unknown API endpoint", code="not_found")
+    auth_error = await _authorize(request)
+    if auth_error:
+        return auth_error
+    principal: Principal = request.state.principal
+    if principal.key_id is not None:
+        return openai_error(
+            403,
+            "Compatibility endpoints require a service API key with caller-owned billing",
+            error_type="permission_error",
+            code="service_key_required",
+        )
+    return None
+
+
+def _content_length_error(request: Request, maximum: int) -> Response | None:
+    raw = request.headers.get("content-length")
+    if raw is None:
+        return None
+    try:
+        if int(raw) > maximum:
+            return openai_error(413, "Request body is too large", code="request_too_large")
+    except ValueError:
+        return openai_error(400, "Content-Length must be an integer", code="invalid_request")
+    return None
+
+
+class RequestBodyTooLarge(ValueError):
+    pass
+
+
+async def _limited_request_stream(request: Request, maximum: int) -> AsyncIterator[bytes]:
+    received = 0
+    async for chunk in request.stream():
+        received += len(chunk)
+        if received > maximum:
+            raise RequestBodyTooLarge
+        yield chunk
+
+
+async def _read_request_body_limited(request: Request, maximum: int) -> bytes:
+    chunks = [chunk async for chunk in _limited_request_stream(request, maximum)]
+    return b"".join(chunks)
+
+
+def _compat_json_response(upstream: httpx.Response, headers: dict[str, str]) -> Response:
+    try:
+        content = upstream.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return openai_error(502, "Compatibility provider returned invalid JSON")
+    return JSONResponse(content=content, status_code=upstream.status_code, headers=headers)
+
+
+async def _public_https_url(raw: str) -> bool:
+    # This is a local defense-in-depth preflight, not a connection-bound DNS
+    # pin. The Venice scrape service independently resolves the target and
+    # rejects private/reserved destinations at fetch time; keep that provider
+    # contract in the production canary tests before enabling compatibility.
+    try:
+        parsed = urlsplit(raw)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+            return False
+        port = parsed.port or 443
+    except ValueError:
+        return False
+    hostname = parsed.hostname.rstrip(".").lower()
+    if hostname in {"localhost", "localhost.localdomain"} or hostname.endswith(
+        (".localhost", ".local", ".internal")
+    ):
+        return False
+    try:
+        literal = ipaddress.ip_address(hostname)
+    except ValueError:
+        try:
+            addresses = await asyncio.to_thread(socket.getaddrinfo, hostname, port)
+        except OSError:
+            return False
+        ips = {item[4][0] for item in addresses}
+        return bool(ips) and all(_public_ip(ipaddress.ip_address(ip)) for ip in ips)
+    return _public_ip(literal)
+
+
+def _public_ip(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return not (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_reserved
+        or address.is_unspecified
+    )
+
+
 async def _prepare_billing(
     request: Request,
     route: ModelRoute | Endpoint,
@@ -1399,7 +1792,11 @@ async def _metered_stream(
     pending = b""
     usage: dict[str, Any] | None = None
     try:
-        async for chunk in upstream.aiter_raw():
+        # Providers such as Venice may gzip SSE even when the downstream
+        # response should remain a normal event stream. Iterate decoded bytes;
+        # forwarding raw compressed chunks without Content-Encoding produces
+        # an unreadable stream and also prevents usage settlement.
+        async for chunk in upstream.aiter_bytes():
             pending += chunk
             lines = pending.split(b"\n")
             pending = lines.pop()
