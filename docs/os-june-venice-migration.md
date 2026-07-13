@@ -1,8 +1,8 @@
 # os-june Venice replacement assessment
 
-The OpenSoftware API implements the complete Venice upstream surface currently consumed by June
-API. It can be inserted between June API and Venice without changing June's client-facing routes.
-The compatibility surface is dormant by default and has not been enabled in os-june.
+The OpenSoftware API implements the complete Venice upstream surface consumed by June API. It sits
+between June API and private inference providers without changing June's client-facing routes. The
+compatibility surface is enabled in os-api production and June remains the billing owner.
 
 ## Compatible today
 
@@ -23,11 +23,14 @@ dedicated static os-api service key. Compatibility responses include `X-OS-Billi
 June continues to authorize and settle OS Accounts usage exactly once. Managed end-user os-api keys
 are rejected from these routes, preventing an accidental second billing path.
 
-## Deliberately not switched
+## Production posture
 
-- os-june configuration still points directly to Venice.
-- `VENICE_COMPAT_ENABLED` remains false in os-api production.
-- No production service key has been issued to June API for this path.
+- `VENICE_COMPAT_ENABLED=true` is declared in Terraform and in the digest-pinned deployment
+  workflow for the canary, primary, and secondary Cloud Run services.
+- June API authenticates with a dedicated static os-api service key; managed end-user os-api keys
+  remain rejected from compatibility routes to prevent double billing.
+- Canary validation preceded production promotion, including model catalog, chat, and real-audio
+  transcription checks through the June API boundary.
 - The ASR and augment implementations currently route to Venice behind os-api. Their stable public
   contracts are provider-independent, so another private provider can be added without another
   os-june migration.
@@ -35,17 +38,17 @@ are rejected from these routes, preventing an accidental second billing path.
   Venice ciphertext but cannot turn a plaintext June request into end-to-end encryption because
   the router would necessarily see the plaintext.
 
-## Safe migration sequence
+## Completed migration sequence
 
-1. Create a dedicated static service key scoped to the June API deployment.
-2. Enable `VENICE_COMPAT_ENABLED=true` on an os-api canary only.
-3. Run the June API provider contract suite against that canary base URL.
-4. Point a June API staging canary at `{os_api_origin}/v1`; keep June as billing owner.
-5. Compare catalog, ASR, chat, streaming usage, search, scrape, error, and latency telemetry.
-6. Set `OS_JUNE_AUTO_MODE_DEFAULT=true` only after the canary catalog exposes
-   `open-software/auto` and end-to-end agent tests pass.
-7. Roll back by restoring the Venice base URL and removing the default flag. No desktop release is
-   required.
+1. A dedicated static service key was scoped to the June API deployment.
+2. `VENICE_COMPAT_ENABLED=true` was enabled and validated on the os-api canary first.
+3. The June API provider contract suite ran against the canary base URL.
+4. June API staging was pointed at `{os_api_origin}/v1` with June retained as billing owner.
+5. Catalog, ASR, chat, streaming usage, search, scrape, error, and latency behavior was validated.
+6. Auto routing was enabled only after the canary catalog exposed `open-software/auto` and
+   end-to-end agent tests passed.
+7. Production was promoted after a real-audio June API transcription passed in staging. Rollback
+   remains restoring the Venice base URL; no desktop release is required.
 
 ## Runtime controls
 

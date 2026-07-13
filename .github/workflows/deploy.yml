@@ -103,7 +103,7 @@ jobs:
               --region "${REGION}" \
               --image "${{ steps.image.outputs.reference }}" \
               --revision-suffix "${suffix}" \
-              --update-env-vars "MODEL_CONFIG_PATH=/app/config/models.yaml" \
+              --update-env-vars "MODEL_CONFIG_PATH=/app/config/models.yaml,VENICE_COMPAT_ENABLED=true" \
               --quiet 2>&1); then
               printf '%s\n' "${output}"
               break
@@ -161,6 +161,23 @@ jobs:
             "${CANARY_URL}/v1/models" \
             | jq -e '.object == "list" and any(.data[]; .id == "openai/gpt-oss-20b")' >/dev/null
 
+          # The June desktop depends on this Venice-compatible route. A
+          # deliberately incomplete multipart body must reach route validation
+          # (400), never disappear behind the compatibility gate (404).
+          if ! audio_status="$(curl --silent --show-error --max-time 30 \
+            --output /dev/null --write-out '%{http_code}' \
+            -H "X-Serverless-Authorization: Bearer ${CANARY_ID_TOKEN}" \
+            -H "Authorization: Bearer ${smoke_key}" \
+            -F 'model=nvidia/parakeet-tdt-0.6b-v3' \
+            "${CANARY_URL}/v1/audio/transcriptions")"; then
+            echo "::error::Could not reach the Venice-compatible transcription route (HTTP ${audio_status:-000})"
+            exit 1
+          fi
+          if [[ "${audio_status}" != "400" ]]; then
+            echo "::error::Venice-compatible transcription route returned ${audio_status}, expected 400"
+            exit 1
+          fi
+
           headers_file="$(mktemp)"
           body_file="$(mktemp)"
           trap 'rm -f "${headers_file}" "${body_file}"' EXIT
@@ -214,7 +231,7 @@ jobs:
             --image "${{ steps.image.outputs.reference }}" \
             --revision-suffix "${suffix}" \
             --no-traffic \
-            --update-env-vars "MODEL_CONFIG_PATH=/app/config/models.yaml" \
+            --update-env-vars "MODEL_CONFIG_PATH=/app/config/models.yaml,VENICE_COMPAT_ENABLED=true" \
             --quiet
           echo "revision=${revision}" >> "${GITHUB_OUTPUT}"
 
@@ -231,7 +248,7 @@ jobs:
             --image "${{ steps.image.outputs.reference }}" \
             --revision-suffix "${suffix}" \
             --no-traffic \
-            --update-env-vars "MODEL_CONFIG_PATH=/app/config/models.yaml" \
+            --update-env-vars "MODEL_CONFIG_PATH=/app/config/models.yaml,VENICE_COMPAT_ENABLED=true" \
             --quiet
           echo "revision=${revision}" >> "${GITHUB_OUTPUT}"
 
