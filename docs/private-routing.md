@@ -146,8 +146,13 @@ with `400`; reverify this contract before changing augmentation providers.
 
 ## Catalog operations
 
-The catalog in `config/models.yaml` is fail-fast validated at application startup. Before every
-release, `scripts/validate_provider_catalog.py` queries the providers' public model catalogs and
+The hand-curated Auto catalog in `config/models.yaml` is combined with the generated
+`config/provider-models.yaml` snapshot: every Venice text model plus every Phala TEE model. Native
+provider IDs are retained so existing Venice selections remain compatible. Only models with an
+explicit, reviewed `quality_score` participate in Auto; expanding the selectable catalog cannot
+silently change Auto behavior. Regenerate the snapshot with `scripts/sync_provider_catalog.py`.
+The combined catalog is fail-fast validated at application startup. Before every release,
+`scripts/validate_provider_catalog.py` queries the providers' public model catalogs and
 fails if a model disappears, a TEE/E2EE capability is removed, or configured pass-through pricing
 differs from the live price.
 

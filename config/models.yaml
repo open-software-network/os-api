@@ -5,12 +5,17 @@ providers:
     api_key_env: PHALA_API_KEY
     adapter: phala
     regions: [global]
+
   venice:
     name: Venice E2EE
     base_url: https://api.venice.ai/api
     api_key_env: VENICE_API_KEY
     adapter: venice
     regions: [global]
+
+# Generated from the providers' public catalogs. Curated routes below remain
+# the only models eligible for Auto.
+catalog_includes: [provider-models.yaml]
 
 models:
   openai/gpt-oss-20b:

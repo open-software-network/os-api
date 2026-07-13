@@ -417,6 +417,27 @@ def test_legacy_june_model_aliases_are_resolved(
     assert response.json()["model"] == canonical_id
 
 
+def test_native_catalog_model_takes_precedence_over_legacy_alias(
+    routed_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sovereign_gateway import app as app_module
+
+    monkeypatch.setitem(
+        routed_client.app.state.config.models,
+        "zai-org-glm-5-2",
+        routed_client.app.state.config.models["openai/gpt-oss-20b"],
+    )
+    monkeypatch.setitem(app_module.MODEL_ALIASES, "zai-org-glm-5-2", "backup/private-model")
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={"model": "zai-org-glm-5-2", "messages": [{"role": "user", "content": "hello"}]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["model"] == "openai/gpt-oss-20b"
+
+
 def test_e2ee_endpoint_requires_client_encryption_headers() -> None:
     config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
     health = EndpointHealth()
