@@ -59,7 +59,7 @@ def select_auto_models(
     raw = payload.get("auto", {}) or {}
     if not isinstance(raw, dict):
         raise RoutingError("invalid_auto_policy", "auto must be an object")
-    value = raw.get("cost_quality", payload.get("cost_quality", 0.5))
+    value = raw.get("cost_quality", payload.get("cost_quality", 1.0))
     try:
         quality_weight = float(value)
     except (TypeError, ValueError) as exc:

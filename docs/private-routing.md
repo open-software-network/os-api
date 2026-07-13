@@ -54,7 +54,8 @@ Use the synthetic model ID `open-software/auto` (or `auto`) and set `auto.cost_q
 (lowest estimated request cost) to `1` (highest configured quality). The router first removes models
 that cannot satisfy the request's privacy, provider, price, capability, or context requirements. It
 then ranks the remaining models using the request's estimated input/output token mix. Automatic
-routing never weakens an explicit requirement.
+routing never weakens an explicit requirement. When `cost_quality` is omitted, the router defaults
+to `1` so quality is preferred unless the caller explicitly chooses a lower-cost policy.
 
 ```json
 {

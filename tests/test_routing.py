@@ -207,6 +207,19 @@ def test_auto_quality_slider_selects_highest_quality_model(routed_client: TestCl
     assert response.headers["x-os-auto-selected-model"] == "openai/gpt-oss-20b"
 
 
+def test_auto_defaults_to_highest_quality_model(routed_client: TestClient) -> None:
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "open-software/auto",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["x-os-auto-selected-model"] == "openai/gpt-oss-20b"
+
+
 def test_auto_filters_models_that_lack_required_tools(routed_client: TestClient) -> None:
     response = routed_client.post(
         "/v1/chat/completions",
