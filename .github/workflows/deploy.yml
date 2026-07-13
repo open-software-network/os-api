@@ -156,13 +156,29 @@ jobs:
             -H "Content-Type: application/json" \
             -H "X-Confidential-Compute: required" \
             -X POST "${CANARY_URL}/v1/chat/completions" \
-            --data '{"model":"openai/gpt-oss-20b","messages":[{"role":"user","content":"Reply with exactly: private-ready"}],"max_tokens":16,"privacy":{"minimum":"tee","require_zero_retention":true,"require_response_proof":true}}'
-          jq -e '.choices[0].message.content | type == "string"' "${body_file}" >/dev/null
-          grep -Eiq '^x-os-provider: phala\r?$' "${headers_file}"
-          grep -Eiq '^x-os-privacy-level: tee\r?$' "${headers_file}"
-          grep -Eiq '^x-os-attestation-status: present\r?$' "${headers_file}"
+            --data '{"model":"openai/gpt-oss-20b","messages":[{"role":"user","content":"Reply with exactly: private-ready"}],"max_tokens":128,"privacy":{"minimum":"tee","require_zero_retention":true,"require_response_proof":true}}'
+          if ! jq -e '.choices[0].message.content | type == "string" and length > 0' "${body_file}" >/dev/null; then
+            echo "::error::Canary completion did not contain non-empty text"
+            jq -c '{object, choices: [.choices[]? | {finish_reason, message: {role: .message.role, content_type: (.message.content | type), content_length: ((.message.content // "") | length)}}]}' "${body_file}"
+            exit 1
+          fi
+          if ! grep -Eiq '^x-os-provider: phala\r?$' "${headers_file}"; then
+            echo "::error::Canary completion was not routed through Phala"
+            exit 1
+          fi
+          if ! grep -Eiq '^x-os-privacy-level: tee\r?$' "${headers_file}"; then
+            echo "::error::Canary completion did not report TEE privacy"
+            exit 1
+          fi
+          if ! grep -Eiq '^x-os-attestation-status: present\r?$' "${headers_file}"; then
+            echo "::error::Canary completion did not report present attestation evidence"
+            exit 1
+          fi
           generation_id="$(awk 'BEGIN{IGNORECASE=1} /^x-os-generation-id:/ {gsub("\r", "", $2); print $2}' "${headers_file}")"
-          test -n "${generation_id}"
+          if [[ -z "${generation_id}" ]]; then
+            echo "::error::Canary completion did not return a generation ID"
+            exit 1
+          fi
           curl --fail --silent --show-error --max-time 30 \
             -H "X-Serverless-Authorization: Bearer ${CANARY_ID_TOKEN}" \
             -H "Authorization: Bearer ${smoke_key}" \
