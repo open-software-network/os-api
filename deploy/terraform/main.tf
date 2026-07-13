@@ -234,6 +234,11 @@ resource "google_cloud_run_v2_service" "public_api" {
       }
 
       env {
+        name  = "VENICE_COMPAT_ENABLED"
+        value = "true"
+      }
+
+      env {
         name  = "REDIS_CA_CERT_PATH"
         value = "/etc/redis/ca.pem"
       }
