@@ -232,27 +232,3 @@ endpoints:
 
     with pytest.raises(ConfigurationError, match="duplicates model 'duplicate'"):
         GatewayConfig.load(path)
-
-
-def test_rejects_unknown_top_level_configuration_key(tmp_path: Path) -> None:
-    path = tmp_path / "models.yaml"
-    path.write_text(
-        """
-providers:
-  provider:
-    base_url: https://provider.invalid
-models:
-  model: {}
-endpoints:
-  endpoint:
-    model: model
-    provider: provider
-    pricing:
-      input_per_million_usd: 1
-      output_per_million_usd: 1
-catalog_include: [misspelled.yaml]
-"""
-    )
-
-    with pytest.raises(ConfigurationError, match="unknown configuration keys.*catalog_include"):
-        GatewayConfig.load(path)

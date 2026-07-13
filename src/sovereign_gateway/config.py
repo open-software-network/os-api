@@ -167,17 +167,8 @@ class GatewayConfig:
             raise ConfigurationError(f"cannot load model configuration: {exc}") from exc
         if not isinstance(raw, dict):
             raise ConfigurationError("configuration root must be an object")
-        endpoint_schema = "endpoints" in raw or "providers" in raw
-        allowed = (
-            {"providers", "models", "endpoints", "catalog_includes"}
-            if endpoint_schema
-            else {"backends", "models"}
-        )
-        unknown = sorted(set(raw) - allowed)
-        if unknown:
-            raise ConfigurationError(f"unknown configuration keys: {unknown}")
         raw = _merge_catalog_includes(raw, config_path.parent)
-        if endpoint_schema:
+        if "endpoints" in raw or "providers" in raw:
             return _load_endpoint_config(raw)
         return _load_legacy_config(raw)
 

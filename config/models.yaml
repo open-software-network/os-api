@@ -5,6 +5,7 @@ providers:
     api_key_env: PHALA_API_KEY
     adapter: phala
     regions: [global]
+
   venice:
     name: Venice E2EE
     base_url: https://api.venice.ai/api

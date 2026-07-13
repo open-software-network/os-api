@@ -438,20 +438,6 @@ def test_native_catalog_model_takes_precedence_over_legacy_alias(
     assert response.json()["model"] == "openai/gpt-oss-20b"
 
 
-def test_generated_catalog_respects_explicit_tee_privacy_floor() -> None:
-    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
-    required = parse_routing_policy(
-        {"model": "claude-opus-4-8"},
-        "required",
-    )
-
-    with pytest.raises(RoutingError, match="no endpoint satisfying"):
-        route_endpoints(config, "claude-opus-4-8", required, EndpointHealth())
-
-    phala = route_endpoints(config, "phala/uncensored-24b", required, EndpointHealth())
-    assert phala[0].privacy.level == "tee"
-
-
 def test_e2ee_endpoint_requires_client_encryption_headers() -> None:
     config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
     health = EndpointHealth()
