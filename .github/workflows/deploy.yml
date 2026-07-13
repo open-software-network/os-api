@@ -91,14 +91,30 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          suffix="gh-${GITHUB_RUN_ID}"
-          gcloud run deploy "${CANARY_SERVICE}" \
-            --project "${PROJECT_ID}" \
-            --region "${REGION}" \
-            --image "${{ steps.image.outputs.reference }}" \
-            --revision-suffix "${suffix}" \
-            --update-env-vars "MODEL_CONFIG_PATH=/app/config/models.yaml" \
-            --quiet
+          # Binary Authorization occurrences are eventually consistent. Cloud
+          # Run can resolve the signed index to its signed platform manifest a
+          # few seconds before that occurrence is visible to policy evaluation.
+          # Retry only that transient denial; all other deploy failures remain
+          # immediate and fail closed.
+          for attempt in {1..6}; do
+            suffix="gh-${GITHUB_RUN_ID}-${attempt}"
+            if output=$(gcloud run deploy "${CANARY_SERVICE}" \
+              --project "${PROJECT_ID}" \
+              --region "${REGION}" \
+              --image "${{ steps.image.outputs.reference }}" \
+              --revision-suffix "${suffix}" \
+              --update-env-vars "MODEL_CONFIG_PATH=/app/config/models.yaml" \
+              --quiet 2>&1); then
+              printf '%s\n' "${output}"
+              break
+            fi
+            if [[ "${output}" != *"not authorized by policy"* || "${attempt}" == "6" ]]; then
+              printf '%s\n' "${output}" >&2
+              exit 1
+            fi
+            echo "Binary Authorization signature is not visible yet; retrying canary deploy (${attempt}/6)."
+            sleep 10
+          done
           canary_url="$(gcloud run services describe "${CANARY_SERVICE}" \
             --project "${PROJECT_ID}" \
             --region "${REGION}" \
