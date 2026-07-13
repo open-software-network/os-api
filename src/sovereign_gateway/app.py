@@ -141,7 +141,6 @@ def _auto_catalog_model(config: GatewayConfig, created: int) -> dict[str, Any]:
                         (
                             endpoint.input_price_microusd_per_million
                             for endpoint in config.endpoints.values()
-                            if config.models[endpoint.model_id].quality_score is not None
                         ),
                         default=0,
                     )
@@ -152,7 +151,6 @@ def _auto_catalog_model(config: GatewayConfig, created: int) -> dict[str, Any]:
                         (
                             endpoint.output_price_microusd_per_million
                             for endpoint in config.endpoints.values()
-                            if config.models[endpoint.model_id].quality_score is not None
                         ),
                         default=0,
                     )
@@ -483,9 +481,9 @@ def create_app() -> FastAPI:
                         "context_length": model.max_context_length,
                         "quality_score": model.quality_score,
                         "model_spec": {
-                            "name": model.name or model.id.rsplit("/", 1)[-1],
-                            "description": model.description,
-                            "privacy": model.provider_privacy or "private",
+                            "name": model.id.rsplit("/", 1)[-1],
+                            "description": None,
+                            "privacy": "private",
                             "pricing": {
                                 "input": {
                                     "usd": model.input_price_microusd_per_million / 1_000_000
@@ -503,7 +501,7 @@ def create_app() -> FastAPI:
                                     )
                                 )
                             ),
-                            "traits": list(model.traits),
+                            "traits": [],
                             "offline": False,
                         },
                         "pricing": {
@@ -840,12 +838,7 @@ def create_app() -> FastAPI:
             requested_models = list(dict.fromkeys(requested_models_raw))
             if parsed.model not in requested_models:
                 requested_models.insert(0, parsed.model)
-        # Provider-native IDs take precedence once they are present in the
-        # broad catalog. Aliases remain a compatibility path for retired IDs.
-        requested_models = [
-            model_id if model_id in config.models else MODEL_ALIASES.get(model_id, model_id)
-            for model_id in requested_models
-        ]
+        requested_models = [MODEL_ALIASES.get(model_id, model_id) for model_id in requested_models]
         requested_models = list(dict.fromkeys(requested_models))
         auto_requested = parsed.model in AUTO_MODEL_IDS
         unknown_models = [

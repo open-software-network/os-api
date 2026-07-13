@@ -106,10 +106,6 @@ class ModelRoute:
     output_modalities: tuple[str, ...] = ("text",)
     created: int | None = None
     quality_score: float | None = None
-    name: str | None = None
-    description: str | None = None
-    traits: tuple[str, ...] = ()
-    provider_privacy: str | None = None
 
     # Compatibility fields used by the existing web UI and tests. Pricing is
     # populated with the cheapest enabled endpoint for the model.
@@ -167,7 +163,6 @@ class GatewayConfig:
             raise ConfigurationError(f"cannot load model configuration: {exc}") from exc
         if not isinstance(raw, dict):
             raise ConfigurationError("configuration root must be an object")
-        raw = _merge_catalog_includes(raw, config_path.parent)
         if "endpoints" in raw or "providers" in raw:
             return _load_endpoint_config(raw)
         return _load_legacy_config(raw)
@@ -304,12 +299,6 @@ def _load_endpoint_config(raw: dict[str, Any]) -> GatewayConfig:
             ),
             created=item.get("created"),
             quality_score=_optional_score(item.get("quality_score"), model_id),
-            name=str(item["name"]) if item.get("name") is not None else None,
-            description=(str(item["description"]) if item.get("description") is not None else None),
-            traits=_string_tuple(item.get("traits", []), f"model {model_id} traits"),
-            provider_privacy=(
-                str(item["provider_privacy"]) if item.get("provider_privacy") is not None else None
-            ),
             input_price_microusd_per_million=min(
                 endpoint.input_price_microusd_per_million for endpoint in prices
             ),
@@ -319,41 +308,6 @@ def _load_endpoint_config(raw: dict[str, Any]) -> GatewayConfig:
             upstream_model=model_id,
         )
     return GatewayConfig(providers, endpoints, models, dict(endpoints))
-
-
-def _merge_catalog_includes(raw: dict[str, Any], base_dir: Path) -> dict[str, Any]:
-    """Merge deterministic generated model/endpoint snapshots into the hand-curated catalog."""
-    includes = raw.get("catalog_includes", [])
-    if not isinstance(includes, list) or any(not isinstance(item, str) for item in includes):
-        raise ConfigurationError("catalog_includes must be a list of paths")
-    if not includes:
-        return raw
-    merged = dict(raw)
-    merged_models = dict(_require_mapping(raw, "models"))
-    merged_endpoints = dict(_require_mapping(raw, "endpoints"))
-    for relative in includes:
-        include_path = (base_dir / relative).resolve()
-        try:
-            included = yaml.safe_load(include_path.read_text()) or {}
-        except (OSError, yaml.YAMLError) as exc:
-            raise ConfigurationError(f"cannot load catalog include {relative!r}: {exc}") from exc
-        if not isinstance(included, dict):
-            raise ConfigurationError(f"catalog include {relative!r} must be an object")
-        for model_id, item in _require_mapping(included, "models").items():
-            if model_id in merged_models:
-                raise ConfigurationError(
-                    f"catalog include {relative!r} duplicates model {model_id!r}"
-                )
-            merged_models[model_id] = item
-        for endpoint_id, item in _require_mapping(included, "endpoints").items():
-            if endpoint_id in merged_endpoints:
-                raise ConfigurationError(
-                    f"catalog include {relative!r} duplicates endpoint {endpoint_id!r}"
-                )
-            merged_endpoints[endpoint_id] = item
-    merged["models"] = merged_models
-    merged["endpoints"] = merged_endpoints
-    return merged
 
 
 def _load_legacy_config(raw: dict[str, Any]) -> GatewayConfig:
