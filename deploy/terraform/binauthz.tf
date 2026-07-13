@@ -129,6 +129,16 @@ resource "google_container_analysis_note_iam_member" "deployer_attaches" {
   member = "serviceAccount:${google_service_account.github_deployer[0].email}"
 }
 
+# Attestations are stored as Container Analysis occurrences in the project.
+# Note attachment permission above does not grant occurrence creation.
+resource "google_project_iam_member" "deployer_writes_attestation_occurrences" {
+  count = var.enable_binary_authorization && var.enable_github_deployments ? 1 : 0
+
+  project = var.project_id
+  role    = "roles/containeranalysis.occurrences.editor"
+  member  = "serviceAccount:${google_service_account.github_deployer[0].email}"
+}
+
 resource "google_binary_authorization_attestor_iam_member" "deployer_views" {
   count = var.enable_binary_authorization && var.enable_github_deployments ? 1 : 0
 
