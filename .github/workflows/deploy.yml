@@ -162,15 +162,15 @@ jobs:
             jq -c '{object, choices: [.choices[]? | {finish_reason, message: {role: .message.role, content_type: (.message.content | type), content_length: ((.message.content // "") | length)}}]}' "${body_file}"
             exit 1
           fi
-          if ! grep -Eiq '^x-os-provider: phala\r?$' "${headers_file}"; then
+          if ! grep -Eiq '^x-os-provider:[[:space:]]*phala[[:space:]]*$' "${headers_file}"; then
             echo "::error::Canary completion was not routed through Phala"
             exit 1
           fi
-          if ! grep -Eiq '^x-os-privacy-level: tee\r?$' "${headers_file}"; then
+          if ! grep -Eiq '^x-os-privacy-level:[[:space:]]*tee[[:space:]]*$' "${headers_file}"; then
             echo "::error::Canary completion did not report TEE privacy"
             exit 1
           fi
-          if ! grep -Eiq '^x-os-attestation-status: present\r?$' "${headers_file}"; then
+          if ! grep -Eiq '^x-os-attestation-status:[[:space:]]*present[[:space:]]*$' "${headers_file}"; then
             echo "::error::Canary completion did not report present attestation evidence"
             exit 1
           fi
