@@ -71,8 +71,9 @@ export MODEL_CONFIG_PATH=config/models.yaml
 uv run uvicorn sovereign_gateway.app:app --port 8080 --no-access-log
 ```
 
-The default catalog expects `PHALA_API_KEY` and `VENICE_API_KEY`. Production readiness fails closed
-when an enabled provider credential is absent. The legacy self-hosted profile is still available on
+The default catalog expects `PHALA_API_KEY` and `VENICE_API_KEY`. It combines the reviewed Auto
+routes with the providers' live `/v1/models` catalogs, cached for five minutes by default.
+Production readiness fails closed when an enabled provider credential is absent. The legacy self-hosted profile is still available on
 a Linux NVIDIA host with `docker compose --profile gpu up --build`. On a laptop, run the test suite,
 which uses in-process OpenAI-compatible mocks:
 

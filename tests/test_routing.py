@@ -100,11 +100,48 @@ def routed_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[T
     monkeypatch.setenv("PHALA_API_KEY", "phala-secret")
     monkeypatch.setenv("VENICE_API_KEY", "venice-secret")
     monkeypatch.setenv("VENICE_COMPAT_ENABLED", "true")
+    monkeypatch.setenv("LIVE_PROVIDER_CATALOG_ENABLED", "false")
     monkeypatch.delenv("REDIS_URL", raising=False)
     calls: list[str] = []
 
     def upstream(request: httpx.Request) -> httpx.Response:
         calls.append(str(request.url))
+        if request.method == "GET" and request.url.path.endswith("/v1/models"):
+            if request.url.host == "venice.test":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            {
+                                "id": "zai-org-glm-5-2",
+                                "type": "text",
+                                "model_spec": {
+                                    "name": "GLM 5.2",
+                                    "privacy": "private",
+                                    "pricing": {
+                                        "input": {"usd": 1.4},
+                                        "output": {"usd": 4.4},
+                                    },
+                                    "availableContextTokens": 100000,
+                                    "capabilities": {},
+                                },
+                            }
+                        ]
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "phala/live-only",
+                            "name": "Phala Live Only",
+                            "is_tee": True,
+                            "pricing": {"prompt": "0.0000001", "completion": "0.0000002"},
+                        }
+                    ]
+                },
+            )
         if request.url.path.endswith("/audio/transcriptions"):
             assert request.headers["authorization"] == "Bearer venice-secret"
             assert b'name="model"' in request.content
@@ -415,6 +452,27 @@ def test_legacy_june_model_aliases_are_resolved(
 
     assert response.status_code == 200
     assert response.json()["model"] == canonical_id
+
+
+def test_unknown_saved_model_refreshes_live_catalog_before_aliasing(
+    routed_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("LIVE_PROVIDER_CATALOG_ENABLED", "true")
+    routed_client.app.state.provider_catalog.http = routed_client.app.state.http
+    routed_client.app.state.provider_catalog._last_attempt = 0
+    routed_client.app.state.provider_catalog._expires_at = 0
+
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "zai-org-glm-5-2",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["model"] == "zai-org-glm-5-2"
+    assert any(url.endswith("/v1/models") for url in routed_client.app.state.test_calls)
 
 
 def test_e2ee_endpoint_requires_client_encryption_headers() -> None:
