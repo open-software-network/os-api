@@ -146,10 +146,13 @@ with `400`; reverify this contract before changing augmentation providers.
 
 ## Catalog operations
 
-The catalog in `config/models.yaml` is fail-fast validated at application startup. Before every
-release, `scripts/validate_provider_catalog.py` queries the providers' public model catalogs and
-fails if a model disappears, a TEE/E2EE capability is removed, or configured pass-through pricing
-differs from the live price.
+`config/models.yaml` contains only the reviewed models eligible for Auto. At runtime the gateway
+fetches Venice's and Phala's OpenAI-compatible `/v1/models` endpoints, adds every Venice text model
+and every Phala TEE model under its provider-native ID, and refreshes that union every five minutes.
+An explicit unknown ID triggers a rate-limited refresh before returning `model_not_found`, so newly
+added and previously saved Venice IDs do not require an os-api release. A failed refresh keeps the
+last successful in-memory catalog; pricing must be present and positive before a live model becomes
+routable. `scripts/validate_provider_catalog.py` still gates the curated Auto routes before release.
 
 Provider secrets are read only from environment variables backed by Secret Manager in production.
 If an enabled provider declares `api_key_env` and the key is absent, `/readyz` returns 503.

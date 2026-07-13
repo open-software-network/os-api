@@ -106,6 +106,10 @@ class ModelRoute:
     output_modalities: tuple[str, ...] = ("text",)
     created: int | None = None
     quality_score: float | None = None
+    name: str | None = None
+    description: str | None = None
+    traits: tuple[str, ...] = ()
+    provider_privacy: str | None = None
 
     # Compatibility fields used by the existing web UI and tests. Pricing is
     # populated with the cheapest enabled endpoint for the model.

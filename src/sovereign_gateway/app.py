@@ -32,6 +32,7 @@ from starlette.formparsers import MultiPartParser
 from . import __version__
 from .accounts import AccountsClient, WalletGrant
 from .auth import ApiKeyStore, Principal
+from .catalog import CatalogRefreshError, ProviderCatalog
 from .config import Endpoint, GatewayConfig, ModelRoute
 from .errors import openai_error
 from .managed_keys import (
@@ -141,6 +142,7 @@ def _auto_catalog_model(config: GatewayConfig, created: int) -> dict[str, Any]:
                         (
                             endpoint.input_price_microusd_per_million
                             for endpoint in config.endpoints.values()
+                            if config.models[endpoint.model_id].quality_score is not None
                         ),
                         default=0,
                     )
@@ -151,6 +153,7 @@ def _auto_catalog_model(config: GatewayConfig, created: int) -> dict[str, Any]:
                         (
                             endpoint.output_price_microusd_per_million
                             for endpoint in config.endpoints.values()
+                            if config.models[endpoint.model_id].quality_score is not None
                         ),
                         default=0,
                     )
@@ -260,6 +263,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         timeout=httpx.Timeout(connect=10, read=600, write=30, pool=10),
         limits=httpx.Limits(max_connections=500, max_keepalive_connections=100),
     )
+    app.state.provider_catalog = ProviderCatalog(
+        config,
+        app.state.http,
+        ttl_seconds=int(os.getenv("PROVIDER_CATALOG_TTL_SECONDS", "300")),
+    )
+    if os.getenv("LIVE_PROVIDER_CATALOG_ENABLED", "true").lower() in {"1", "true", "yes"}:
+        try:
+            await app.state.provider_catalog.refresh(force=True)
+        except CatalogRefreshError as exc:
+            logger.warning(
+                json.dumps(
+                    {
+                        "severity": "WARNING",
+                        "event": "provider_catalog_refresh_failed",
+                        "error": str(exc),
+                    },
+                    separators=(",", ":"),
+                )
+            )
     app.state.accounts = AccountsClient(app.state.http)
     app.state.endpoint_health = EndpointHealth(
         failure_threshold=int(os.getenv("ENDPOINT_FAILURE_THRESHOLD", "3")),
@@ -412,6 +434,20 @@ def create_app() -> FastAPI:
         if auth_error:
             return auth_error
         config: GatewayConfig = request.app.state.config
+        if os.getenv("LIVE_PROVIDER_CATALOG_ENABLED", "true").lower() in {"1", "true", "yes"}:
+            try:
+                await request.app.state.provider_catalog.refresh()
+            except CatalogRefreshError as exc:
+                logger.warning(
+                    json.dumps(
+                        {
+                            "severity": "WARNING",
+                            "event": "provider_catalog_refresh_failed",
+                            "error": str(exc),
+                        },
+                        separators=(",", ":"),
+                    )
+                )
         created = int(time.time())
         requested_type = request.query_params.get("type")
         if requested_type == "asr":
@@ -481,9 +517,9 @@ def create_app() -> FastAPI:
                         "context_length": model.max_context_length,
                         "quality_score": model.quality_score,
                         "model_spec": {
-                            "name": model.id.rsplit("/", 1)[-1],
-                            "description": None,
-                            "privacy": "private",
+                            "name": model.name or model.id.rsplit("/", 1)[-1],
+                            "description": model.description,
+                            "privacy": model.provider_privacy or "private",
                             "pricing": {
                                 "input": {
                                     "usd": model.input_price_microusd_per_million / 1_000_000
@@ -501,7 +537,7 @@ def create_app() -> FastAPI:
                                     )
                                 )
                             ),
-                            "traits": [],
+                            "traits": list(model.traits),
                             "offline": False,
                         },
                         "pricing": {
@@ -838,7 +874,31 @@ def create_app() -> FastAPI:
             requested_models = list(dict.fromkeys(requested_models_raw))
             if parsed.model not in requested_models:
                 requested_models.insert(0, parsed.model)
-        requested_models = [MODEL_ALIASES.get(model_id, model_id) for model_id in requested_models]
+        if os.getenv("LIVE_PROVIDER_CATALOG_ENABLED", "true").lower() in {
+            "1",
+            "true",
+            "yes",
+        } and any(
+            model_id not in config.models and model_id not in AUTO_MODEL_IDS
+            for model_id in requested_models
+        ):
+            try:
+                await request.app.state.provider_catalog.refresh(force=True)
+            except CatalogRefreshError as exc:
+                logger.warning(
+                    json.dumps(
+                        {
+                            "severity": "WARNING",
+                            "event": "provider_catalog_refresh_failed",
+                            "error": str(exc),
+                        },
+                        separators=(",", ":"),
+                    )
+                )
+        requested_models = [
+            model_id if model_id in config.models else MODEL_ALIASES.get(model_id, model_id)
+            for model_id in requested_models
+        ]
         requested_models = list(dict.fromkeys(requested_models))
         auto_requested = parsed.model in AUTO_MODEL_IDS
         unknown_models = [
