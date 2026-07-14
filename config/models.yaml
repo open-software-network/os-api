@@ -131,7 +131,7 @@ endpoints:
     model: openai/gpt-oss-120b
     provider: venice
     upstream_model: openai-gpt-oss-120b
-    priority: 100
+    priority: 5
     capabilities: [tools, tool_choice, reasoning]
     privacy:
       level: no-retention
@@ -178,7 +178,7 @@ endpoints:
     model: google/gemma-3-27b-it
     provider: venice
     upstream_model: google-gemma-3-27b-it
-    priority: 100
+    priority: 5
     capabilities: [tools, tool_choice, structured_outputs]
     privacy:
       level: no-retention
@@ -289,7 +289,7 @@ endpoints:
     model: z-ai/glm-5.2
     provider: venice
     upstream_model: zai-org-glm-5-2
-    priority: 100
+    priority: 5
     capabilities: [tools, tool_choice, structured_outputs, reasoning]
     privacy:
       level: no-retention
@@ -338,7 +338,7 @@ endpoints:
     model: qwen/qwen3.6-27b
     provider: venice
     upstream_model: qwen3-6-27b
-    priority: 100
+    priority: 5
     capabilities: [tools, tool_choice, structured_outputs, reasoning]
     privacy:
       level: no-retention
@@ -370,7 +370,7 @@ endpoints:
     model: moonshotai/kimi-k2.6
     provider: venice
     upstream_model: kimi-k2-6
-    priority: 100
+    priority: 5
     capabilities: [vision, tools, tool_choice, structured_outputs, reasoning]
     privacy:
       level: no-retention
