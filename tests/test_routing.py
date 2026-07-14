@@ -24,6 +24,7 @@ from sovereign_gateway.app import (
     _estimate_reservation_cost,
     _metered_stream,
     _settle_billing,
+    _stream_video_response,
     _validate_client_encryption_key,
     create_app,
 )
@@ -37,6 +38,17 @@ from sovereign_gateway.routing import (
     route_endpoints,
     select_auto_models,
 )
+
+
+class DelayedAsyncByteStream(httpx.AsyncByteStream):
+    def __init__(self, content: bytes, delay: float) -> None:
+        self.content = content
+        self.delay = delay
+
+    async def __aiter__(self):
+        await asyncio.sleep(self.delay)
+        yield self.content
+
 
 API_KEY = "sk-routing-test"
 
@@ -185,9 +197,7 @@ def routed_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[T
         if "/image/" in request.url.path:
             assert request.headers["authorization"] == "Bearer venice-secret"
             payload = json.loads(request.content)
-            expected_read_timeout = (
-                0.001 if payload["prompt"] == "force total timeout" else 360.0
-            )
+            expected_read_timeout = 0.001 if payload["prompt"] == "force total timeout" else 360.0
             assert request.extensions["timeout"] == {
                 "connect": 10,
                 "read": expected_read_timeout,
@@ -206,6 +216,70 @@ def routed_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[T
                 return httpx.Response(503, text="unavailable")
             assert payload["prompt"] == "a red bicycle"
             return httpx.Response(200, json={"images": ["aW1hZ2U="]})
+        if "/video/" in request.url.path:
+            assert request.headers["authorization"] == "Bearer venice-secret"
+            payload = json.loads(request.content)
+            expected_read_timeout = 0.03 if payload.get("queue_id") == "slow-json" else 360.0
+            assert request.extensions["timeout"] == {
+                "connect": 10,
+                "read": expected_read_timeout,
+                "write": 30,
+                "pool": 10,
+            }
+            if request.url.path.endswith("/quote"):
+                if payload["model"] == "oversized-json":
+                    return httpx.Response(
+                        200,
+                        content=b"{}",
+                        headers={"content-type": "application/json", "content-length": "101"},
+                    )
+                return httpx.Response(200, json={"quote": 0.42})
+            if request.url.path.endswith("/queue"):
+                assert payload["model"] in {
+                    "wan-2.2-a14b-text-to-video",
+                    "wan-2.6-image-to-video",
+                }
+                return httpx.Response(
+                    200,
+                    json={"queue_id": "video-job-1", "download_url": None},
+                )
+            queue_id = payload["queue_id"]
+            if queue_id == "processing":
+                return httpx.Response(
+                    200,
+                    json={
+                        "status": "PROCESSING",
+                        "average_execution_time": 120000,
+                        "execution_duration": 30000,
+                    },
+                )
+            if queue_id == "slow-json":
+                await asyncio.sleep(0.02)
+                return httpx.Response(
+                    200,
+                    stream=DelayedAsyncByteStream(b'{"status":"PROCESSING"}', 0.02),
+                    headers={"content-type": "application/json"},
+                )
+            if queue_id == "expired":
+                return httpx.Response(404, text="expired")
+            if queue_id == "oversized":
+                return httpx.Response(
+                    200,
+                    content=b"video",
+                    headers={"content-type": "video/mp4", "content-length": "101"},
+                )
+            if queue_id == "invalid-content-type":
+                return httpx.Response(
+                    200,
+                    content=b"<script>bad()</script>",
+                    headers={"content-type": "text/html"},
+                )
+            assert queue_id == "completed"
+            return httpx.Response(
+                200,
+                content=b"video-bytes",
+                headers={"content-type": "video/mp4"},
+            )
         payload = json.loads(request.content)
         payloads.append(payload)
         if payload.get("metadata", {}).get("force_primary_400") and payload["model"] != (
@@ -1749,6 +1823,216 @@ def test_image_generation_rejects_plaintext_provider_failure(
     assert response.json()["error"]["message"] == "Image provider returned invalid JSON"
     assert response.headers["x-os-billing-owner"] == "caller"
     assert response.headers["x-os-provider"] == "venice"
+
+
+def test_video_quote_matches_venice_upstream_contract(routed_client: TestClient) -> None:
+    assert routed_client.app.state.video_queue_semaphore._value == 4
+    response = routed_client.post(
+        "/v1/video/quote",
+        json={
+            "model": "wan-2.2-a14b-text-to-video",
+            "duration": "5s",
+            "resolution": "720p",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"quote": 0.42}
+    assert response.headers["x-os-billing-owner"] == "caller"
+    assert response.headers["x-os-provider"] == "venice"
+
+
+def test_video_queue_forwards_text_and_animation_requests(routed_client: TestClient) -> None:
+    text = routed_client.post(
+        "/v1/video/queue",
+        json={
+            "model": "wan-2.2-a14b-text-to-video",
+            "prompt": "waves on a moonlit shore",
+            "duration": "5s",
+        },
+    )
+    animation = routed_client.post(
+        "/v1/video/queue",
+        json={
+            "model": "wan-2.6-image-to-video",
+            "prompt": "the scene comes alive",
+            "duration": "5s",
+            "image_url": "data:image/png;base64,aW1hZ2U=",
+        },
+    )
+
+    assert text.status_code == 200
+    assert text.json()["queue_id"] == "video-job-1"
+    assert animation.status_code == 200
+    assert animation.json()["queue_id"] == "video-job-1"
+
+
+def test_video_retrieve_relays_json_progress(routed_client: TestClient) -> None:
+    response = routed_client.post(
+        "/v1/video/retrieve",
+        json={"model": "wan-2.2-a14b-text-to-video", "queue_id": "processing"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "PROCESSING"
+    assert response.headers["x-os-billing-owner"] == "caller"
+
+
+def test_video_retrieve_streams_completed_mp4(routed_client: TestClient) -> None:
+    response = routed_client.post(
+        "/v1/video/retrieve",
+        json={"model": "wan-2.2-a14b-text-to-video", "queue_id": "completed"},
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"video-bytes"
+    assert response.headers["content-type"].startswith("video/mp4")
+    assert response.headers["x-os-provider"] == "venice"
+
+
+def test_video_retrieve_preserves_plaintext_not_found(routed_client: TestClient) -> None:
+    response = routed_client.post(
+        "/v1/video/retrieve",
+        json={"model": "wan-2.2-a14b-text-to-video", "queue_id": "expired"},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "video_provider_error"
+
+
+def test_video_rejects_oversized_request_before_parsing(
+    routed_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MAX_VIDEO_QUEUE_REQUEST_BYTES", "32")
+
+    response = routed_client.post(
+        "/v1/video/queue",
+        json={"prompt": "x" * 100},
+    )
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "request_too_large"
+
+
+def test_video_queue_allows_animation_payload_above_small_json_cap(
+    routed_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MAX_VIDEO_REQUEST_BYTES", "1048576")
+    encoded_image = "a" * 1_100_000
+
+    queue = routed_client.post(
+        "/v1/video/queue",
+        json={
+            "model": "wan-2.6-image-to-video",
+            "prompt": "animate",
+            "duration": "5s",
+            "image_url": f"data:image/png;base64,{encoded_image}",
+        },
+    )
+    quote = routed_client.post(
+        "/v1/video/quote",
+        json={
+            "model": "wan-2.2-a14b-text-to-video",
+            "duration": "5s",
+            "padding": encoded_image,
+        },
+    )
+
+    assert queue.status_code == 200
+    assert quote.status_code == 413
+
+
+def test_video_queue_saturation_times_out_before_reading_or_forwarding(
+    routed_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VIDEO_REQUEST_TIMEOUT_SECONDS", "0.01")
+    routed_client.app.state.video_queue_semaphore = asyncio.Semaphore(0)
+    calls_before = list(routed_client.app.state.test_calls)
+
+    response = routed_client.post(
+        "/v1/video/queue",
+        json={
+            "model": "wan-2.2-a14b-text-to-video",
+            "prompt": "never forwarded",
+            "duration": "5s",
+        },
+    )
+
+    assert response.status_code == 502
+    assert response.headers["x-os-billing-owner"] == "caller"
+    assert routed_client.app.state.test_calls == calls_before
+
+
+def test_video_rejects_oversized_response_before_streaming(
+    routed_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MAX_VIDEO_RESPONSE_BYTES", "100")
+
+    response = routed_client.post(
+        "/v1/video/retrieve",
+        json={"model": "wan-2.2-a14b-text-to-video", "queue_id": "oversized"},
+    )
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "video_too_large"
+
+
+def test_video_rejects_unexpected_success_content_type(routed_client: TestClient) -> None:
+    response = routed_client.post(
+        "/v1/video/retrieve",
+        json={
+            "model": "wan-2.2-a14b-text-to-video",
+            "queue_id": "invalid-content-type",
+        },
+    )
+
+    assert response.status_code == 502
+    assert response.headers["content-type"].startswith("application/json")
+    assert "script" not in response.text
+
+
+def test_video_caps_json_provider_responses(
+    routed_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MAX_VIDEO_JSON_RESPONSE_BYTES", "100")
+
+    response = routed_client.post(
+        "/v1/video/quote",
+        json={"model": "oversized-json", "duration": "5s"},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["message"] == "Video provider response is too large"
+
+
+def test_video_retrieve_uses_one_deadline_for_headers_and_json_body(
+    routed_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VIDEO_REQUEST_TIMEOUT_SECONDS", "0.03")
+
+    response = routed_client.post(
+        "/v1/video/retrieve",
+        json={"model": "wan-2.2-a14b-text-to-video", "queue_id": "slow-json"},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["message"] == "Video provider failed"
+
+
+async def test_video_stream_caps_chunked_body_and_closes_upstream() -> None:
+    upstream = httpx.Response(200, content=b"oversized-video")
+    deadline = asyncio.get_running_loop().time() + 1
+
+    with pytest.raises(ValueError, match="Video response is too large"):
+        _ = [chunk async for chunk in _stream_video_response(upstream, 4, deadline)]
+
+    assert upstream.is_closed
 
 
 def test_endpoint_cost_accounts_for_cache_prices(tmp_path: Path) -> None:

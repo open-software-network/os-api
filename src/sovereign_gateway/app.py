@@ -306,6 +306,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         RedisConcurrencyLimiter(redis) if redis else LocalConcurrencyLimiter()
     )
     app.state.concurrency = concurrency
+    app.state.video_queue_semaphore = asyncio.Semaphore(
+        int(os.getenv("VIDEO_QUEUE_MAX_CONCURRENCY", "4"))
+    )
     app.state.http = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=10, read=600, write=30, pool=10),
         limits=httpx.Limits(max_connections=500, max_keepalive_connections=100),
@@ -920,6 +923,38 @@ def create_app() -> FastAPI:
             return openai_error(502, "Image provider failed")
         response_headers = {"x-os-provider": "venice", "x-os-billing-owner": "caller"}
         return _compat_image_generation_response(upstream, headers=response_headers)
+
+    @app.post("/v1/video/{operation}")
+    async def video(operation: str, request: Request) -> Response:
+        if operation not in {"quote", "queue", "retrieve"}:
+            return openai_error(404, "Unknown API endpoint", code="not_found")
+        compat_error = await _authorize_compat(request)
+        if compat_error:
+            return compat_error
+        maximum = int(
+            os.getenv(
+                "MAX_VIDEO_QUEUE_REQUEST_BYTES"
+                if operation == "queue"
+                else "MAX_VIDEO_REQUEST_BYTES",
+                "32505856" if operation == "queue" else "1048576",
+            )
+        )
+        timeout_seconds = float(os.getenv("VIDEO_REQUEST_TIMEOUT_SECONDS", "360"))
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        try:
+            async with asyncio.timeout_at(deadline):
+                if operation == "queue":
+                    async with request.app.state.video_queue_semaphore:
+                        return await _proxy_video_compat(
+                            request, operation, maximum, timeout_seconds, deadline
+                        )
+                return await _proxy_video_compat(
+                    request, operation, maximum, timeout_seconds, deadline
+                )
+        except TimeoutError:
+            response = openai_error(502, "Video provider failed")
+            response.headers.update({"x-os-provider": "venice", "x-os-billing-owner": "caller"})
+            return response
 
     @app.post("/v1/{proxy_path:path}")
     async def routed_inference(proxy_path: str, request: Request) -> Response:
@@ -1815,6 +1850,169 @@ def _compat_image_generation_response(
         response.headers.update(headers)
         return response
     return JSONResponse(content=content, status_code=upstream.status_code, headers=headers)
+
+
+async def _proxy_video_compat(
+    request: Request,
+    operation: str,
+    maximum_request: int,
+    timeout_seconds: float,
+    deadline: float,
+) -> Response:
+    body_error = _content_length_error(request, maximum_request)
+    if body_error:
+        return body_error
+    try:
+        raw = await _read_request_body_limited(request, maximum_request)
+    except RequestBodyTooLarge:
+        return openai_error(413, "Request body is too large", code="request_too_large")
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return openai_error(400, "Request body must be JSON", code="invalid_request")
+    if not isinstance(payload, dict):
+        return openai_error(400, "Request body must be an object", code="invalid_request")
+    # Large animation queues contain a base64 image. Do not retain the decoded
+    # Python string/object graph while the identical raw JSON is in flight.
+    del payload
+    provider = request.app.state.config.providers.get("venice")
+    if not provider or not provider.enabled or not provider.api_key:
+        return openai_error(503, "Video provider is unavailable")
+    timeout = httpx.Timeout(connect=10, read=timeout_seconds, write=30, pool=10)
+    headers = {
+        "authorization": f"Bearer {provider.api_key}",
+        "content-type": "application/json",
+    }
+    response_headers = {"x-os-provider": "venice", "x-os-billing-owner": "caller"}
+    upstream_request = request.app.state.http.build_request(
+        "POST",
+        f"{provider.base_url}/v1/video/{operation}",
+        content=raw,
+        headers=headers,
+        timeout=timeout,
+    )
+    try:
+        async with asyncio.timeout_at(deadline):
+            upstream = await request.app.state.http.send(upstream_request, stream=True)
+    except (TimeoutError, httpx.HTTPError):
+        response = openai_error(502, "Video provider failed")
+        response.headers.update(response_headers)
+        return response
+    content_type = upstream.headers.get("content-type", "")
+    if operation != "retrieve" or "json" in content_type.lower() or not upstream.is_success:
+        maximum_json = int(os.getenv("MAX_VIDEO_JSON_RESPONSE_BYTES", "1048576"))
+        try:
+            body = await _read_upstream_response_limited(upstream, maximum_json, deadline)
+        except RequestBodyTooLarge:
+            response = openai_error(502, "Video provider response is too large")
+            response.headers.update(response_headers)
+            return response
+        except (TimeoutError, httpx.HTTPError):
+            response = openai_error(502, "Video provider failed")
+            response.headers.update(response_headers)
+            return response
+        return _compat_video_json_response(
+            upstream.status_code,
+            body,
+            headers=response_headers,
+        )
+    if content_type and not content_type.lower().startswith(("video/", "application/octet-stream")):
+        await upstream.aclose()
+        response = openai_error(502, "Video provider returned an invalid content type")
+        response.headers.update(response_headers)
+        return response
+    # June rejects at 100 MiB. Keep the proxy one MiB higher and emit fixed
+    # 64 KiB chunks so June always observes its own terminal size error before
+    # a chunked upstream can cross this defense-in-depth ceiling.
+    maximum_response = int(os.getenv("MAX_VIDEO_RESPONSE_BYTES", "105906176"))
+    content_length = upstream.headers.get("content-length")
+    if content_length:
+        try:
+            declared_length = int(content_length)
+            if declared_length < 0:
+                raise ValueError
+            if declared_length > maximum_response:
+                await upstream.aclose()
+                response = openai_error(
+                    413,
+                    "Video response is too large",
+                    code="video_too_large",
+                )
+                response.headers.update(response_headers)
+                return response
+        except ValueError:
+            await upstream.aclose()
+            response = openai_error(502, "Video provider returned an invalid response")
+            response.headers.update(response_headers)
+            return response
+    return StreamingResponse(
+        _stream_video_response(upstream, maximum_response, deadline),
+        status_code=upstream.status_code,
+        media_type=content_type or "video/mp4",
+        headers=response_headers,
+    )
+
+
+def _compat_video_json_response(status_code: int, body: bytes, headers: dict[str, str]) -> Response:
+    try:
+        content = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        status = status_code
+        if status < 400 or (status >= 500 and status != 503):
+            status = 502
+        response = openai_error(
+            status,
+            "Video provider rejected the request" if status < 500 else "Video provider failed",
+            code="video_provider_error",
+        )
+        response.headers.update(headers)
+        return response
+    return JSONResponse(content=content, status_code=status_code, headers=headers)
+
+
+async def _read_upstream_response_limited(
+    upstream: httpx.Response, maximum: int, deadline: float
+) -> bytes:
+    content_length = upstream.headers.get("content-length")
+    if content_length:
+        try:
+            declared_length = int(content_length)
+        except ValueError as error:
+            await upstream.aclose()
+            raise httpx.ProtocolError("Invalid Content-Length") from error
+        if declared_length < 0:
+            await upstream.aclose()
+            raise httpx.ProtocolError("Invalid Content-Length")
+        if declared_length > maximum:
+            await upstream.aclose()
+            raise RequestBodyTooLarge("Upstream response is too large")
+    chunks: list[bytes] = []
+    received = 0
+    try:
+        async with asyncio.timeout_at(deadline):
+            async for chunk in upstream.aiter_bytes(chunk_size=65_536):
+                received += len(chunk)
+                if received > maximum:
+                    raise RequestBodyTooLarge("Upstream response is too large")
+                chunks.append(chunk)
+    finally:
+        await upstream.aclose()
+    return b"".join(chunks)
+
+
+async def _stream_video_response(
+    upstream: httpx.Response, maximum: int, deadline: float
+) -> AsyncIterator[bytes]:
+    received = 0
+    try:
+        async with asyncio.timeout_at(deadline):
+            async for chunk in upstream.aiter_bytes(chunk_size=65_536):
+                received += len(chunk)
+                if received > maximum:
+                    raise RequestBodyTooLarge("Video response is too large")
+                yield chunk
+    finally:
+        await upstream.aclose()
 
 
 async def _public_https_url(raw: str) -> bool:

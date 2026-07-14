@@ -205,6 +205,11 @@ def test_venice_compatibility_surface_is_dormant_by_default(client: TestClient) 
     assert image.status_code == 404
     assert image.json()["error"]["code"] == "not_found"
 
+    for operation in ("quote", "queue", "retrieve"):
+        video = client.post(f"/v1/video/{operation}", json={})
+        assert video.status_code == 404
+        assert video.json()["error"]["code"] == "not_found"
+
 
 def test_request_id_is_preserved(client: TestClient) -> None:
     response = client.get("/healthz", headers={"X-Request-ID": "request-from-client"})
