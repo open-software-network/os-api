@@ -93,8 +93,13 @@ against the larger of the full raw request byte size and the selected model's en
 capacity whenever non-text input is present. This covers both large inline data URLs and short
 remote URLs whose visual token usage is not knowable before inference. Fallback candidates are
 compared using this bound. Metered non-text requests fail closed if an eligible model has no
-configured context capacity. Settlement uses the upstream provider's reported usage, and the
-original request body is forwarded unchanged to the selected endpoint.
+configured context capacity. The reservation also includes the model's configured maximum output
+when the caller omits an output limit; explicit limits are capped at the configured maximum.
+Settlement uses the upstream provider's reported usage. If buffered or streaming usage is missing,
+the charge falls back to the bounded structural estimate plus 4,096 units per non-text input and
+the existing 2,048-token default output estimate. That fallback never exceeds or automatically
+charges the full-context reservation. The original request body is forwarded unchanged to the
+selected endpoint.
 
 The initial score snapshot and its limitations are recorded in
 [`auto-quality-policy.md`](auto-quality-policy.md). The slider is an ordinal product policy, not a

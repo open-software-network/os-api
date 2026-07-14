@@ -5,6 +5,7 @@ import hashlib
 import json
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import anyio
 import httpx
@@ -12,18 +13,22 @@ import pytest
 from fastapi.testclient import TestClient
 
 from sovereign_gateway.app import (
+    BillingContext,
     _actual_cost,
     _auto_catalog_model,
-    _estimate_cost,
+    _estimate_fallback_charge,
+    _estimate_reservation_cost,
+    _metered_stream,
+    _settle_billing,
     _validate_client_encryption_key,
     create_app,
 )
 from sovereign_gateway.config import GatewayConfig
 from sovereign_gateway.routing import (
-    NON_TEXT_INPUT_ROUTING_ALLOWANCE,
+    NON_TEXT_INPUT_HEURISTIC_ALLOWANCE,
     EndpointHealth,
     RoutingError,
-    estimate_auto_context_units,
+    estimate_bounded_prompt_units,
     parse_routing_policy,
     route_endpoints,
     select_auto_models,
@@ -378,26 +383,26 @@ def test_non_text_estimate_is_size_independent_and_multiplies_per_input() -> Non
 
     small_url = "data:image/png;base64,eA=="
     large_url = "data:image/png;base64," + base64.b64encode(b"x" * 1_000_000).decode()
-    small = estimate_auto_context_units(payload([small_url]))
-    large = estimate_auto_context_units(payload([large_url]))
-    two_inputs = estimate_auto_context_units(payload([small_url, large_url]))
+    small = estimate_bounded_prompt_units(payload([small_url]))
+    large = estimate_bounded_prompt_units(payload([large_url]))
+    two_inputs = estimate_bounded_prompt_units(payload([small_url, large_url]))
 
     assert large == small
-    assert two_inputs >= small + NON_TEXT_INPUT_ROUTING_ALLOWANCE
+    assert two_inputs >= small + NON_TEXT_INPUT_HEURISTIC_ALLOWANCE
 
 
 def test_attachment_estimate_multiplies_per_attachment() -> None:
-    one = estimate_auto_context_units(
+    one = estimate_bounded_prompt_units(
         {"model": "open-software/auto", "attachments": [{"file_id": "file-1"}]}
     )
-    two = estimate_auto_context_units(
+    two = estimate_bounded_prompt_units(
         {
             "model": "open-software/auto",
             "attachments": [{"file_id": "file-1"}, {"file_id": "file-2"}],
         }
     )
 
-    assert two >= one + NON_TEXT_INPUT_ROUTING_ALLOWANCE
+    assert two >= one + NON_TEXT_INPUT_HEURISTIC_ALLOWANCE
 
 
 def _image_payload(url: str, model: str) -> dict[str, object]:
@@ -417,35 +422,57 @@ def test_remote_image_billing_hold_covers_full_model_context(model: str) -> None
     config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
     route = config.endpoints["venice-kimi-k2.6-private"]
     context_limit = config.models[route.model_id].max_context_length
+    max_output_length = config.models[route.model_id].max_output_length
     assert context_limit is not None
+    assert max_output_length is not None
     payload = _image_payload("https://example.com/image.png", model)
     request_bytes = len(json.dumps(payload).encode())
 
-    estimate = _estimate_cost(route, payload, request_bytes, context_limit)
+    reservation = _estimate_reservation_cost(
+        route,
+        payload,
+        request_bytes,
+        context_limit,
+        max_output_length,
+    )
     maximum_prompt_cost = _actual_cost(
         route,
-        {"prompt_tokens": context_limit, "completion_tokens": 2_048},
+        {"prompt_tokens": context_limit, "completion_tokens": 0},
+    )
+    maximum_output_cost = _actual_cost(
+        route,
+        {"prompt_tokens": 0, "completion_tokens": max_output_length},
     )
 
     assert request_bytes < context_limit
-    assert estimate >= maximum_prompt_cost
+    assert "max_tokens" not in payload
+    assert reservation >= maximum_prompt_cost
+    assert reservation >= maximum_output_cost
 
 
 def test_inline_image_billing_hold_keeps_larger_raw_request_bound() -> None:
     config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
     route = config.endpoints["venice-kimi-k2.6-private"]
     context_limit = config.models[route.model_id].max_context_length
+    max_output_length = config.models[route.model_id].max_output_length
     assert context_limit is not None
+    assert max_output_length is not None
     large_url = "data:image/png;base64," + base64.b64encode(b"x" * 1_000_000).decode()
     payload = _image_payload(large_url, "open-software/auto")
     request_bytes = len(json.dumps(payload).encode())
 
-    estimate = _estimate_cost(route, payload, request_bytes, context_limit)
+    estimate = _estimate_reservation_cost(
+        route,
+        payload,
+        request_bytes,
+        context_limit,
+        max_output_length,
+    )
     expected = max(
         1,
         (
             request_bytes * route.input_price_microusd_per_million
-            + 2_048 * route.output_price_microusd_per_million
+            + max_output_length * route.output_price_microusd_per_million
             + 999_999
         )
         // 1_000_000,
@@ -453,6 +480,176 @@ def test_inline_image_billing_hold_keeps_larger_raw_request_bound() -> None:
 
     assert request_bytes > context_limit
     assert estimate == expected
+
+
+def test_non_text_billing_hold_clamps_explicit_output_limit() -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    route = config.endpoints["venice-kimi-k2.6-private"]
+    model = config.models[route.model_id]
+    assert model.max_context_length is not None
+    assert model.max_output_length is not None
+    payload = {
+        **_image_payload("https://example.com/image.png", route.model_id),
+        "max_tokens": model.max_output_length * 2,
+    }
+    request_bytes = len(json.dumps(payload).encode())
+
+    reservation = _estimate_reservation_cost(
+        route,
+        payload,
+        request_bytes,
+        model.max_context_length,
+        model.max_output_length,
+    )
+    configured_maximum_cost = _actual_cost(
+        route,
+        {
+            "prompt_tokens": model.max_context_length,
+            "completion_tokens": model.max_output_length,
+        },
+    )
+
+    assert reservation == configured_maximum_cost
+
+
+class _CapturingSettlementRepository:
+    def __init__(self) -> None:
+        self.actual_microusd: int | None = None
+
+    async def settle(
+        self,
+        key_id: str,
+        billing_id: str,
+        actual_microusd: int,
+        event: dict[str, object],
+    ) -> None:
+        self.actual_microusd = actual_microusd
+
+
+class _AcceptingSettlementAccounts:
+    def __init__(self) -> None:
+        self.charged_microusd: int | None = None
+
+    async def charge_wallet(
+        self,
+        grant: object,
+        actual_microusd: int,
+        billing_id: str,
+        request_id: str,
+    ) -> bool:
+        self.charged_microusd = actual_microusd
+        return True
+
+
+def _settlement_request(
+    repository: _CapturingSettlementRepository,
+    accounts: _AcceptingSettlementAccounts,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(managed_keys=repository, accounts=accounts),
+        ),
+        state=SimpleNamespace(request_id="req-no-usage"),
+    )
+
+
+@pytest.mark.anyio
+async def test_remote_image_missing_usage_charges_fallback_not_reservation() -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    route = config.endpoints["venice-kimi-k2.6-private"]
+    model = config.models[route.model_id]
+    payload = _image_payload("https://example.com/image.png", "open-software/auto")
+    request_bytes = len(json.dumps(payload).encode())
+    reservation = _estimate_reservation_cost(
+        route,
+        payload,
+        request_bytes,
+        model.max_context_length,
+        model.max_output_length,
+    )
+    fallback_charge = _estimate_fallback_charge(
+        route,
+        payload,
+        request_bytes,
+        model.max_context_length,
+        model.max_output_length,
+    )
+    repository = _CapturingSettlementRepository()
+    accounts = _AcceptingSettlementAccounts()
+    request = _settlement_request(repository, accounts)
+    billing = BillingContext("key-1", "bill-1", reservation, fallback_charge, None)
+
+    await _settle_billing(
+        request,
+        billing,
+        route,
+        route.model_id,
+        "no-retention",
+        route.id,
+        usage=None,
+    )
+
+    assert fallback_charge < reservation
+    assert repository.actual_microusd == fallback_charge
+    assert accounts.charged_microusd == fallback_charge
+
+
+@pytest.mark.anyio
+async def test_stream_without_usage_charges_fallback_not_reservation() -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    route = config.endpoints["venice-kimi-k2.6-private"]
+    repository = _CapturingSettlementRepository()
+    accounts = _AcceptingSettlementAccounts()
+    request = _settlement_request(repository, accounts)
+    billing = BillingContext("key-1", "bill-1", 100_000, 5_000, None)
+    upstream = httpx.Response(
+        200,
+        content=b'data: {"choices":[]}\n\ndata: [DONE]\n\n',
+    )
+
+    chunks = [
+        chunk
+        async for chunk in _metered_stream(
+            request,
+            upstream,
+            billing,
+            route,
+            route.model_id,
+            "no-retention",
+            route.id,
+        )
+    ]
+
+    assert chunks
+    assert repository.actual_microusd == billing.fallback_charge_microusd
+    assert accounts.charged_microusd == billing.fallback_charge_microusd
+
+
+def test_text_missing_usage_fallback_preserves_reservation_estimate() -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    route = config.endpoints["venice-kimi-k2.6-private"]
+    model = config.models[route.model_id]
+    payload = {
+        "model": route.model_id,
+        "messages": [{"role": "user", "content": "Summarize this meeting."}],
+    }
+    request_bytes = len(json.dumps(payload).encode())
+
+    reservation = _estimate_reservation_cost(
+        route,
+        payload,
+        request_bytes,
+        model.max_context_length,
+        model.max_output_length,
+    )
+    fallback_charge = _estimate_fallback_charge(
+        route,
+        payload,
+        request_bytes,
+        model.max_context_length,
+    )
+
+    assert fallback_charge == reservation
 
 
 @pytest.mark.parametrize(

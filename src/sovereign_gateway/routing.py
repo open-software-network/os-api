@@ -61,9 +61,10 @@ MANDATORY_INPUT_CAPABILITIES = frozenset(
 )
 NON_TEXT_INPUT_PLACEHOLDER = "<non-text input omitted>"
 # Auto uses UTF-8 bytes as a conservative tokenizer-independent bound for
-# text. Non-text inputs add a fixed 4K routing allowance instead of treating
-# raw base64 bytes as text tokens. This is not a billing authorization bound.
-NON_TEXT_INPUT_ROUTING_ALLOWANCE = 4_096
+# text. Non-text inputs add a fixed 4K heuristic allowance for routing and
+# missing-usage fallback charges instead of treating raw base64 bytes as text
+# tokens. This is not a billing authorization bound.
+NON_TEXT_INPUT_HEURISTIC_ALLOWANCE = 4_096
 
 
 def select_auto_models(
@@ -86,7 +87,7 @@ def select_auto_models(
 
     # UTF-8 bytes are a conservative tokenizer-independent upper bound for
     # byte-fallback model tokenizers, including CJK and large tool schemas.
-    prompt_tokens = estimate_auto_context_units(payload)
+    prompt_tokens = estimate_bounded_prompt_units(payload)
     requested_output = payload.get("max_completion_tokens", payload.get("max_tokens", 2048))
     try:
         output_tokens = max(1, int(requested_output))
@@ -466,11 +467,11 @@ def _message_input_capabilities(messages: Any) -> set[str]:
     return capabilities
 
 
-def estimate_auto_context_units(payload: dict[str, Any]) -> int:
-    """Estimate Auto routing context without counting encoded media as text."""
+def estimate_bounded_prompt_units(payload: dict[str, Any]) -> int:
+    """Estimate routing or fallback usage without counting encoded media as text."""
     estimation_payload = _payload_for_token_estimation(payload)
     text_upper_bound = len(json.dumps(estimation_payload, separators=(",", ":")).encode("utf-8"))
-    non_text_allowance = _count_non_text_inputs(payload) * NON_TEXT_INPUT_ROUTING_ALLOWANCE
+    non_text_allowance = _count_non_text_inputs(payload) * NON_TEXT_INPUT_HEURISTIC_ALLOWANCE
     return max(1, text_upper_bound + non_text_allowance)
 
 
