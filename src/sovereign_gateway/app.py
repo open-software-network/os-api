@@ -101,6 +101,9 @@ MODEL_ALIASES = {
 def _enforce_non_text_output_cap(payload: dict[str, Any]) -> None:
     if not has_non_text_input(payload):
         return
+    for name in ("max_completion_tokens", "max_tokens"):
+        if name in payload and payload[name] is None:
+            payload.pop(name)
     max_completion_tokens = payload.get("max_completion_tokens")
     max_tokens = payload.get("max_tokens")
     for name, limit in (

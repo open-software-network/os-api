@@ -535,6 +535,51 @@ def test_non_text_invalid_single_output_limit_fails_without_forwarding(
     assert len(routed_client.app.state.test_payloads) == forwarded_before
 
 
+@pytest.mark.parametrize(
+    ("limits", "expected"),
+    [
+        ({"max_tokens": None}, {"max_completion_tokens": 2_048}),
+        (
+            {"max_completion_tokens": None, "max_tokens": 100},
+            {"max_tokens": 100},
+        ),
+        (
+            {"max_completion_tokens": 100, "max_tokens": None},
+            {"max_completion_tokens": 100},
+        ),
+    ],
+)
+def test_non_text_null_output_limits_are_removed_before_forwarding(
+    routed_client: TestClient,
+    limits: dict[str, object],
+    expected: dict[str, int],
+) -> None:
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "openai/gpt-oss-20b",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": {
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.com/image.png"},
+                    },
+                }
+            ],
+            **limits,
+        },
+    )
+
+    assert response.status_code == 200
+    forwarded = routed_client.app.state.test_payloads[-1]
+    assert {
+        name: forwarded[name]
+        for name in ("max_completion_tokens", "max_tokens")
+        if name in forwarded
+    } == expected
+
+
 def test_auto_image_input_returns_actionable_error_without_vision_route(
     routed_client: TestClient,
 ) -> None:

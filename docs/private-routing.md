@@ -100,9 +100,10 @@ enforced cap. A valid explicit limit is forwarded unchanged and the reservation 
 model's configured maximum. If both `max_completion_tokens` and `max_tokens` are set, the gateway
 uses the larger positive integer as the canonical `max_completion_tokens` value and removes
 `max_tokens` before routing, billing, and forwarding. Every supplied non-text output limit must be a
-positive, non-boolean integer; invalid single or dual values fail with a 400 response before any
-upstream call. This prevents an upstream provider from honoring a value that the gateway's billing
-estimate parsed or clamped differently. Nested media content is never rewritten. Settlement uses
+positive, non-boolean integer; explicit `null` values are removed and treated as omitted. Invalid
+single or dual values fail with a 400 response before any upstream call. This prevents an upstream
+provider from honoring a value that the gateway's billing estimate parsed or clamped differently.
+Nested media content is never rewritten. Settlement uses
 billable prompt/completion usage reported by the upstream provider. Missing usage, `total_tokens`
 alone, or zero-only token fields emit a warning and fall back to the bounded structural estimate
 plus 4,096 units per non-text input and the 2,048-token default output estimate. That fallback never
