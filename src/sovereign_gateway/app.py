@@ -99,12 +99,23 @@ MODEL_ALIASES = {
 
 
 def _enforce_non_text_output_cap(payload: dict[str, Any]) -> None:
-    if (
-        has_non_text_input(payload)
-        and payload.get("max_completion_tokens") is None
-        and payload.get("max_tokens") is None
-    ):
+    if not has_non_text_input(payload):
+        return
+    max_completion_tokens = payload.get("max_completion_tokens")
+    max_tokens = payload.get("max_tokens")
+    if max_completion_tokens is None and max_tokens is None:
         payload["max_completion_tokens"] = DEFAULT_NON_TEXT_MAX_COMPLETION_TOKENS
+        return
+    if max_completion_tokens is None or max_tokens is None:
+        return
+    limits = (max_completion_tokens, max_tokens)
+    if any(not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0 for limit in limits):
+        raise RoutingError(
+            "invalid_output_limit",
+            "max_completion_tokens and max_tokens must be positive integers when both are set",
+        )
+    payload["max_completion_tokens"] = max(limits)
+    payload.pop("max_tokens")
 
 
 def _site_auth_protects_path(path: str) -> bool:
@@ -884,6 +895,8 @@ def create_app() -> FastAPI:
             if isinstance(payload, dict):
                 _enforce_non_text_output_cap(payload)
             parsed = InferenceRequest.model_validate(payload)
+        except RoutingError as exc:
+            return openai_error(400, str(exc), code=exc.code)
         except (json.JSONDecodeError, ValidationError):
             return openai_error(400, "Request body must include a valid model")
 

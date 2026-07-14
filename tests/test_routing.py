@@ -405,6 +405,102 @@ def test_non_text_output_cap_is_forwarded_without_rewriting_media(
     assert forwarded["messages"] == messages
 
 
+def test_non_text_dual_output_limits_use_larger_bound_everywhere(
+    routed_client: TestClient,
+) -> None:
+    config = routed_client.app.state.config
+    model_id = "openai/gpt-oss-20b"
+    model = config.models[model_id]
+    config.models[model_id] = replace(
+        model,
+        capabilities=model.capabilities.union({"vision"}),
+        input_modalities=("text", "image"),
+    )
+    endpoint_id = "venice-gpt-oss-20b"
+    endpoint = config.endpoints[endpoint_id]
+    config.endpoints[endpoint_id] = replace(
+        endpoint,
+        capabilities=endpoint.capabilities.union({"vision"}),
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": {
+                "type": "image_url",
+                "image_url": {"url": "https://example.com/image.png"},
+            },
+        }
+    ]
+
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "open-software/auto",
+            "auto": {"cost_quality": 0},
+            "messages": messages,
+            "max_completion_tokens": 1,
+            "max_tokens": 40_000,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["x-os-auto-selected-model"] == model_id
+    forwarded = routed_client.app.state.test_payloads[-1]
+    assert forwarded["model"] == endpoint.upstream_model
+    assert forwarded["max_completion_tokens"] == 40_000
+    assert "max_tokens" not in forwarded
+    assert forwarded["messages"] == messages
+    reservation = _estimate_reservation_cost(
+        config.endpoints[endpoint_id],
+        forwarded,
+        len(json.dumps(forwarded).encode()),
+        config.models[model_id].max_context_length,
+        config.models[model_id].max_output_length,
+    )
+    assert reservation == _actual_cost(
+        config.endpoints[endpoint_id],
+        {"prompt_tokens": 131_072, "completion_tokens": 40_000},
+    )
+
+
+@pytest.mark.parametrize(
+    ("max_completion_tokens", "max_tokens"),
+    [
+        ("1", 2),
+        (1, False),
+        (0, 1),
+        (1, -1),
+        (1, 1.5),
+    ],
+)
+def test_non_text_invalid_dual_output_limits_fail_closed(
+    routed_client: TestClient,
+    max_completion_tokens: object,
+    max_tokens: object,
+) -> None:
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "open-software/auto",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": {
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.com/image.png"},
+                    },
+                }
+            ],
+            "max_completion_tokens": max_completion_tokens,
+            "max_tokens": max_tokens,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_output_limit"
+    assert "must be positive integers" in response.json()["error"]["message"]
+
+
 def test_auto_image_input_returns_actionable_error_without_vision_route(
     routed_client: TestClient,
 ) -> None:
