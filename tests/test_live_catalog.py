@@ -46,7 +46,7 @@ def _venice_model(model_id: str, *, priced: bool = True) -> dict[str, object]:
             "pricing": pricing,
             "availableContextTokens": 100000,
             "maxCompletionTokens": 32000,
-            "capabilities": {"supportsFunctionCalling": True},
+            "capabilities": {"supportsFunctionCalling": True, "supportsVision": True},
             "traits": [],
         },
     }
@@ -100,6 +100,8 @@ async def test_live_provider_catalog_adds_native_models_and_exact_prices(
     assert venice.upstream_model == "venice-native-id"
     assert venice.input_price_microusd_per_million == 1_400_000
     assert venice.privacy.retention == "zero"
+    assert "vision" in venice.capabilities
+    assert config.models["venice-native-id"].input_modalities == ("text", "image")
     assert phala.input_price_microusd_per_million == 200_000
     assert phala.privacy.level == "tee"
     assert config.models["venice-native-id"].quality_score is None

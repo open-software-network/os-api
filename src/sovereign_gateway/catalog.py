@@ -267,6 +267,8 @@ def _venice_capabilities(raw: Any) -> frozenset[str]:
     if not isinstance(raw, dict):
         return frozenset()
     result = set()
+    if raw.get("supportsVision"):
+        result.add("vision")
     if raw.get("supportsFunctionCalling"):
         result.update({"tools", "tool_choice"})
     if raw.get("supportsResponseSchema"):

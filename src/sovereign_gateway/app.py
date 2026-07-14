@@ -55,6 +55,8 @@ from .routing import (
     AUTO_MODEL_IDS,
     EndpointHealth,
     RoutingError,
+    estimate_bounded_prompt_units,
+    has_non_text_input,
     parse_routing_policy,
     route_endpoints,
     select_auto_models,
@@ -75,7 +77,8 @@ class InferenceRequest(BaseModel):
 class BillingContext:
     key_id: str
     billing_id: str
-    estimate_microusd: int
+    reservation_microusd: int
+    fallback_charge_microusd: int
     wallet_grant: WalletGrant | None
 
 
@@ -85,6 +88,7 @@ PACKAGE_DIR = Path(__file__).resolve().parent
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 SITE_AUTH_EXEMPT_PATHS = frozenset({"/healthz", "/readyz", "/v1"})
 DEFAULT_ASR_MODELS = ("nvidia/parakeet-tdt-0.6b-v3",)
+DEFAULT_NON_TEXT_MAX_COMPLETION_TOKENS = 2_048
 MODEL_ALIASES = {
     "zai-org-glm-5-2": "z-ai/glm-5.2",
     "kimi-k2-6": "moonshotai/kimi-k2.6",
@@ -92,6 +96,35 @@ MODEL_ALIASES = {
     "zai-org-glm-5": "z-ai/glm-5.2",
     "nvidia-nemotron-3-nano-30b-a3b": "qwen/qwen-2.5-7b-instruct",
 }
+
+
+def _enforce_non_text_output_cap(payload: dict[str, Any]) -> None:
+    if not has_non_text_input(payload):
+        return
+    for name in ("max_completion_tokens", "max_tokens"):
+        if name in payload and payload[name] is None:
+            payload.pop(name)
+    max_completion_tokens = payload.get("max_completion_tokens")
+    max_tokens = payload.get("max_tokens")
+    for name, limit in (
+        ("max_completion_tokens", max_completion_tokens),
+        ("max_tokens", max_tokens),
+    ):
+        if limit is not None and (
+            not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0
+        ):
+            raise RoutingError(
+                "invalid_output_limit",
+                f"{name} must be a positive integer for non-text input",
+            )
+    if max_completion_tokens is None and max_tokens is None:
+        payload["max_completion_tokens"] = DEFAULT_NON_TEXT_MAX_COMPLETION_TOKENS
+        return
+    if max_completion_tokens is None or max_tokens is None:
+        return
+    limits = (max_completion_tokens, max_tokens)
+    payload["max_completion_tokens"] = max(limits)
+    payload.pop("max_tokens")
 
 
 def _site_auth_protects_path(path: str) -> bool:
@@ -110,6 +143,8 @@ def _asr_models() -> tuple[str, ...]:
 
 def _venice_capabilities(capabilities: frozenset[str]) -> dict[str, bool]:
     names: dict[str, bool] = {}
+    if "vision" in capabilities:
+        names["supportsVision"] = True
     if "tools" in capabilities:
         names["supportsFunctionCalling"] = True
     if "reasoning" in capabilities:
@@ -123,6 +158,20 @@ def _venice_capabilities(capabilities: frozenset[str]) -> dict[str, bool]:
 def _auto_catalog_model(config: GatewayConfig, created: int) -> dict[str, Any]:
     # June owns billing on the compatibility path, so advertise conservative
     # maximum rates. Actual provider cost can only be lower than its hold.
+    supports_vision = any(
+        "vision" in endpoint.capabilities
+        for model in config.models.values()
+        if model.quality_score is not None
+        for endpoint in config.endpoints_for(model.id)
+    )
+    capabilities = {
+        "supportsFunctionCalling": True,
+        "supportsReasoning": True,
+        "supportsReasoningEffort": True,
+        "supportsResponseSchema": True,
+    }
+    if supports_vision:
+        capabilities["supportsVision"] = True
     return {
         "id": "open-software/auto",
         "object": "model",
@@ -131,7 +180,10 @@ def _auto_catalog_model(config: GatewayConfig, created: int) -> dict[str, Any]:
         "owned_by": "open-software",
         "description": "Privacy-safe automatic cost and quality routing",
         "supported_parameters": ["auto.cost_quality", "privacy", "provider"],
-        "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
+        "architecture": {
+            "input_modalities": ["text", "image"] if supports_vision else ["text"],
+            "output_modalities": ["text"],
+        },
         "model_spec": {
             "name": "Automatic private model",
             "description": "Automatically selects an eligible private model",
@@ -168,12 +220,7 @@ def _auto_catalog_model(config: GatewayConfig, created: int) -> dict[str, Any]:
                 ),
                 default=32_768,
             ),
-            "capabilities": {
-                "supportsFunctionCalling": True,
-                "supportsReasoning": True,
-                "supportsReasoningEffort": True,
-                "supportsResponseSchema": True,
-            },
+            "capabilities": capabilities,
             "traits": ["automatic"],
             "offline": False,
         },
@@ -854,7 +901,11 @@ def create_app() -> FastAPI:
                     and isinstance(fallback_models[0], str)
                 ):
                     payload["model"] = fallback_models[0]
+            if isinstance(payload, dict):
+                _enforce_non_text_output_cap(payload)
             parsed = InferenceRequest.model_validate(payload)
+        except RoutingError as exc:
+            return openai_error(400, str(exc), code=exc.code)
         except (json.JSONDecodeError, ValidationError):
             return openai_error(400, "Request body must include a valid model")
 
@@ -953,13 +1004,29 @@ def create_app() -> FastAPI:
             )
             return openai_error(status, str(exc), code=code)
 
-        # Reserve against the most expensive eligible endpoint so fallback can
-        # never bypass a key or wallet spend limit.
+        # Reserve against the highest estimated eligible endpoint so fallback
+        # cannot bypass a key or wallet spend limit. For non-text input, model
+        # context capacity is part of the estimate and can outweigh unit price.
+        non_text_input = has_non_text_input(payload)
+
+        def billing_estimate(endpoint: Endpoint) -> float:
+            context_limit = config.models[endpoint.model_id].max_context_length
+            if non_text_input and context_limit is None:
+                # Force the unknown-bound endpoint into _prepare_billing,
+                # which fails closed for metered requests.
+                return float("inf")
+            model = config.models[endpoint.model_id]
+            return _estimate_reservation_cost(
+                endpoint,
+                payload,
+                len(raw),
+                context_limit,
+                model.max_output_length,
+            )
+
         estimate_endpoint = max(
             candidates,
-            key=lambda item: (
-                item.input_price_microusd_per_million + item.output_price_microusd_per_million
-            ),
+            key=billing_estimate,
         )
         billing = await _prepare_billing(request, estimate_endpoint, payload, len(raw))
         if isinstance(billing, Response):
@@ -1216,7 +1283,11 @@ def create_app() -> FastAPI:
             return openai_error(413, "Request body is too large", code="request_too_large")
         try:
             payload = json.loads(raw)
+            if isinstance(payload, dict):
+                _enforce_non_text_output_cap(payload)
             parsed = InferenceRequest.model_validate(payload)
+        except RoutingError as exc:
+            return openai_error(400, str(exc), code=exc.code)
         except (json.JSONDecodeError, ValidationError):
             return openai_error(400, "Request body must include a valid model")
 
@@ -1727,9 +1798,39 @@ async def _prepare_billing(
     if not principal.key_id or not principal.user_id or not repository:
         return None
     billing_id = str(uuid.uuid4())
-    estimate = _estimate_cost(route, payload, request_bytes)
+    if isinstance(route, ModelRoute):
+        context_limit = route.max_context_length
+        max_output_length = route.max_output_length
+    else:
+        model = request.app.state.config.models.get(route.model_id)
+        context_limit = model.max_context_length if model else None
+        max_output_length = model.max_output_length if model else None
+    if has_non_text_input(payload) and context_limit is None:
+        return openai_error(
+            409,
+            "The selected model has no configured non-text billing bound",
+            error_type="billing_error",
+            code="billing_bound_unavailable",
+        )
+    reservation = _estimate_reservation_cost(
+        route,
+        payload,
+        request_bytes,
+        context_limit,
+        max_output_length,
+    )
+    fallback_charge = min(
+        reservation,
+        _estimate_fallback_charge(
+            route,
+            payload,
+            request_bytes,
+            context_limit,
+            max_output_length if has_non_text_input(payload) else None,
+        ),
+    )
     try:
-        await repository.reserve(principal.key_id, billing_id, estimate)
+        await repository.reserve(principal.key_id, billing_id, reservation)
     except SpendLimitExceeded:
         return openai_error(
             402,
@@ -1748,7 +1849,7 @@ async def _prepare_billing(
     accounts: AccountsClient = request.app.state.accounts
     decision = await accounts.authorize_wallet(
         principal.user_id,
-        estimate,
+        reservation,
         request.state.request_id,
     )
     if decision.reason:
@@ -1771,7 +1872,13 @@ async def _prepare_billing(
             error_type="billing_error",
             code="insufficient_credits",
         )
-    return BillingContext(principal.key_id, billing_id, estimate, decision.grant)
+    return BillingContext(
+        principal.key_id,
+        billing_id,
+        reservation,
+        fallback_charge,
+        decision.grant,
+    )
 
 
 async def _release_billing(
@@ -1807,7 +1914,24 @@ async def _settle_billing(
     if not billing or not request.app.state.managed_keys:
         return
     clean_usage = _clean_usage(usage)
-    actual = _actual_cost(route, clean_usage) if clean_usage else billing.estimate_microusd
+    billable_usage = _has_billable_usage(clean_usage)
+    if not billable_usage:
+        logger.warning(
+            json.dumps(
+                {
+                    "severity": "WARNING",
+                    "event": "billing_usage_fallback",
+                    "request_id": request.state.request_id,
+                    "billing_id": billing.billing_id,
+                    "reason": "missing" if usage is None else "unbillable",
+                    "usage_fields": sorted(usage) if usage else [],
+                },
+                separators=(",", ":"),
+            )
+        )
+    actual = (
+        _actual_cost(route, clean_usage) if billable_usage else billing.fallback_charge_microusd
+    )
     event = {
         "request_id": request.state.request_id,
         "model": model,
@@ -1891,22 +2015,85 @@ async def _metered_stream(
         await _settle_billing(request, billing, route, model, privacy, backend, usage)
 
 
-def _estimate_cost(
-    route: ModelRoute | Endpoint, payload: dict[str, Any], request_bytes: int
+def _estimate_reservation_cost(
+    route: ModelRoute | Endpoint,
+    payload: dict[str, Any],
+    request_bytes: int,
+    context_limit: int | None = None,
+    max_output_length: int | None = None,
 ) -> int:
     prompt_upper_bound = max(1, request_bytes)
-    requested_output = payload.get("max_completion_tokens", payload.get("max_tokens"))
+    non_text_input = has_non_text_input(payload)
+    if context_limit is None and isinstance(route, ModelRoute):
+        context_limit = route.max_context_length
+    if non_text_input and context_limit:
+        # Remote media can tokenize far beyond its short URL. The model's full
+        # context capacity is the only configured pre-inference prompt bound.
+        prompt_upper_bound = max(prompt_upper_bound, context_limit)
+    output_tokens = _estimate_output_tokens(
+        payload,
+        context_limit,
+        max_output_length,
+        conservative_non_text=non_text_input,
+    )
+    return _cost_from_bounds(route, prompt_upper_bound, output_tokens)
+
+
+def _estimate_fallback_charge(
+    route: ModelRoute | Endpoint,
+    payload: dict[str, Any],
+    request_bytes: int,
+    context_limit: int | None = None,
+    max_output_length: int | None = None,
+) -> int:
+    prompt_units = (
+        estimate_bounded_prompt_units(payload)
+        if has_non_text_input(payload)
+        else max(1, request_bytes)
+    )
+    output_tokens = _estimate_output_tokens(
+        payload,
+        context_limit,
+        max_output_length,
+        conservative_non_text=False,
+    )
+    return _cost_from_bounds(route, prompt_units, output_tokens)
+
+
+def _estimate_output_tokens(
+    payload: dict[str, Any],
+    context_limit: int | None,
+    max_output_length: int | None,
+    *,
+    conservative_non_text: bool,
+) -> int:
+    requested_output = payload.get("max_completion_tokens")
+    if requested_output is None:
+        requested_output = payload.get("max_tokens")
+    configured_limits = [limit for limit in (context_limit, max_output_length) if limit]
+    configured_maximum = min(configured_limits) if configured_limits else None
     try:
-        output_tokens = int(requested_output) if requested_output is not None else 2_048
+        if requested_output is None and conservative_non_text:
+            output_tokens = configured_maximum or 2_048
+        else:
+            output_tokens = int(requested_output) if requested_output is not None else 2_048
     except (TypeError, ValueError):
-        output_tokens = 2_048
-    context_limit = route.max_context_length if isinstance(route, ModelRoute) else None
-    if context_limit:
-        output_tokens = min(max(1, output_tokens), context_limit)
+        output_tokens = (configured_maximum or 2_048) if conservative_non_text else 2_048
+    cap = configured_maximum if conservative_non_text or max_output_length else context_limit
+    if cap:
+        output_tokens = min(max(1, output_tokens), cap)
+    return max(1, output_tokens)
+
+
+def _cost_from_bounds(
+    route: ModelRoute | Endpoint,
+    prompt_tokens: int,
+    output_tokens: int,
+) -> int:
     return max(
         1,
         (
-            prompt_upper_bound * route.input_price_microusd_per_million
+            prompt_tokens * route.input_price_microusd_per_million
             + output_tokens * route.output_price_microusd_per_million
             + 999_999
         )
@@ -1936,6 +2123,20 @@ def _actual_cost(route: ModelRoute | Endpoint, usage: dict[str, Any]) -> int:
             + 999_999
         )
         // 1_000_000,
+    )
+
+
+def _has_billable_usage(usage: dict[str, int]) -> bool:
+    return any(
+        usage.get(key, 0) > 0
+        for key in (
+            "prompt_tokens",
+            "completion_tokens",
+            "input_tokens",
+            "output_tokens",
+            "cached_tokens",
+            "cache_write_tokens",
+        )
     )
 
 

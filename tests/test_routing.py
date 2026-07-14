@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import anyio
 import httpx
@@ -11,14 +14,24 @@ import pytest
 from fastapi.testclient import TestClient
 
 from sovereign_gateway.app import (
+    DEFAULT_NON_TEXT_MAX_COMPLETION_TOKENS,
+    BillingContext,
     _actual_cost,
+    _auto_catalog_model,
+    _enforce_non_text_output_cap,
+    _estimate_fallback_charge,
+    _estimate_reservation_cost,
+    _metered_stream,
+    _settle_billing,
     _validate_client_encryption_key,
     create_app,
 )
 from sovereign_gateway.config import GatewayConfig
 from sovereign_gateway.routing import (
+    NON_TEXT_INPUT_HEURISTIC_ALLOWANCE,
     EndpointHealth,
     RoutingError,
+    estimate_bounded_prompt_units,
     parse_routing_policy,
     route_endpoints,
     select_auto_models,
@@ -103,6 +116,7 @@ def routed_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[T
     monkeypatch.setenv("LIVE_PROVIDER_CATALOG_ENABLED", "false")
     monkeypatch.delenv("REDIS_URL", raising=False)
     calls: list[str] = []
+    payloads: list[dict[str, object]] = []
 
     def upstream(request: httpx.Request) -> httpx.Response:
         calls.append(str(request.url))
@@ -168,6 +182,7 @@ def routed_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[T
                 json={"url": "https://example.com", "content": "page", "format": "markdown"},
             )
         payload = json.loads(request.content)
+        payloads.append(payload)
         if payload.get("metadata", {}).get("force_primary_400") and payload["model"] != (
             "backup/private-model"
         ):
@@ -196,6 +211,7 @@ def routed_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[T
         app.state.http = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
         client.headers["Authorization"] = f"Bearer {API_KEY}"
         client.app.state.test_calls = calls
+        client.app.state.test_payloads = payloads
         yield client
         anyio.run(old_client.aclose)
 
@@ -274,6 +290,865 @@ def test_auto_filters_models_that_lack_required_tools(routed_client: TestClient)
 
     assert response.status_code == 200
     assert response.headers["x-os-auto-selected-model"] == "openai/gpt-oss-20b"
+
+
+@pytest.mark.parametrize(
+    "image_part",
+    [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,aW1hZ2U="}},
+        {"type": "input_image", "image_url": "data:image/png;base64,aW1hZ2U="},
+    ],
+)
+def test_auto_image_input_selects_only_verified_vision_route(image_part: dict[str, object]) -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    payload = {
+        "model": "open-software/auto",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image."},
+                    image_part,
+                ],
+            }
+        ],
+        # Image compatibility remains mandatory because it is an input
+        # modality, even when optional parameter filtering is disabled.
+        "provider": {"require_parameters": False},
+    }
+    policy = parse_routing_policy(payload, None)
+
+    models = select_auto_models(config, policy, EndpointHealth(), payload)
+    endpoints = route_endpoints(config, models[0], policy, EndpointHealth())
+
+    assert policy.required_capabilities == frozenset({"vision"})
+    assert models == ["moonshotai/kimi-k2.6"]
+    assert [endpoint.id for endpoint in endpoints] == ["venice-kimi-k2.6-private"]
+
+
+def test_explicit_vision_model_selects_only_vision_endpoint() -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    payload = {
+        "model": "moonshotai/kimi-k2.6",
+        "messages": [
+            {
+                "role": "user",
+                "content": {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.com/image.png"},
+                },
+            }
+        ],
+    }
+    policy = parse_routing_policy(payload, None)
+
+    endpoints = route_endpoints(config, payload["model"], policy, EndpointHealth())
+
+    assert policy.required_capabilities == frozenset({"vision"})
+    assert [endpoint.id for endpoint in endpoints] == ["venice-kimi-k2.6-private"]
+
+
+def test_auto_bare_image_content_uses_same_routing_and_billing_detection() -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    content = {
+        "type": "image_url",
+        "image_url": {"url": "https://example.com/image.png"},
+    }
+    messages = [{"role": "user", "content": content}]
+    payload = {"model": "open-software/auto", "messages": messages}
+
+    _enforce_non_text_output_cap(payload)
+    policy = parse_routing_policy(payload, None)
+    models = select_auto_models(config, policy, EndpointHealth(), payload)
+    endpoints = route_endpoints(config, models[0], policy, EndpointHealth())
+
+    assert payload["messages"] is messages
+    assert payload["messages"][0]["content"] is content
+    assert payload["max_completion_tokens"] == DEFAULT_NON_TEXT_MAX_COMPLETION_TOKENS
+    assert policy.required_capabilities == frozenset({"vision"})
+    assert models == ["moonshotai/kimi-k2.6"]
+    assert [endpoint.id for endpoint in endpoints] == ["venice-kimi-k2.6-private"]
+
+
+def test_auto_responses_input_image_uses_vision_routing_and_billing_detection() -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    payload = {
+        "model": "open-software/auto",
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Describe this image."},
+                    {
+                        "type": "input_image",
+                        "image_url": "https://example.com/image.png",
+                    },
+                ],
+            }
+        ],
+    }
+
+    _enforce_non_text_output_cap(payload)
+    policy = parse_routing_policy(payload, None)
+    models = select_auto_models(config, policy, EndpointHealth(), payload)
+    endpoints = route_endpoints(config, models[0], policy, EndpointHealth())
+
+    assert payload["max_completion_tokens"] == DEFAULT_NON_TEXT_MAX_COMPLETION_TOKENS
+    assert policy.required_capabilities == frozenset({"vision"})
+    assert models == ["moonshotai/kimi-k2.6"]
+    assert [endpoint.id for endpoint in endpoints] == ["venice-kimi-k2.6-private"]
+
+
+def test_auto_responses_input_file_fails_closed(routed_client: TestClient) -> None:
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "open-software/auto",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_file", "file_id": "file-1"},
+                    ],
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "auto_route_unavailable"
+    assert "required capabilities (file_input)" in response.json()["error"]["message"]
+
+
+def test_non_text_output_cap_is_forwarded_without_rewriting_media(
+    routed_client: TestClient,
+) -> None:
+    config = routed_client.app.state.config
+    model_id = "openai/gpt-oss-20b"
+    model = config.models[model_id]
+    config.models[model_id] = replace(
+        model,
+        capabilities=model.capabilities.union({"vision"}),
+        input_modalities=("text", "image"),
+    )
+    endpoint_id = "venice-gpt-oss-20b"
+    endpoint = config.endpoints[endpoint_id]
+    config.endpoints[endpoint_id] = replace(
+        endpoint,
+        capabilities=endpoint.capabilities.union({"vision"}),
+    )
+    content = {
+        "type": "image_url",
+        "image_url": {"url": "https://example.com/image.png", "detail": "high"},
+    }
+    messages = [{"role": "user", "content": content}]
+
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={"model": "open-software/auto", "messages": messages},
+    )
+
+    assert response.status_code == 200
+    forwarded = routed_client.app.state.test_payloads[-1]
+    assert forwarded["model"] == endpoint.upstream_model
+    assert forwarded["max_completion_tokens"] == DEFAULT_NON_TEXT_MAX_COMPLETION_TOKENS
+    assert forwarded["messages"] == messages
+
+
+def test_non_text_dual_output_limits_use_larger_bound_everywhere(
+    routed_client: TestClient,
+) -> None:
+    config = routed_client.app.state.config
+    model_id = "openai/gpt-oss-20b"
+    model = config.models[model_id]
+    config.models[model_id] = replace(
+        model,
+        capabilities=model.capabilities.union({"vision"}),
+        input_modalities=("text", "image"),
+    )
+    endpoint_id = "venice-gpt-oss-20b"
+    endpoint = config.endpoints[endpoint_id]
+    config.endpoints[endpoint_id] = replace(
+        endpoint,
+        capabilities=endpoint.capabilities.union({"vision"}),
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": {
+                "type": "image_url",
+                "image_url": {"url": "https://example.com/image.png"},
+            },
+        }
+    ]
+
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "open-software/auto",
+            "auto": {"cost_quality": 0},
+            "messages": messages,
+            "max_completion_tokens": 1,
+            "max_tokens": 40_000,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["x-os-auto-selected-model"] == model_id
+    forwarded = routed_client.app.state.test_payloads[-1]
+    assert forwarded["model"] == endpoint.upstream_model
+    assert forwarded["max_completion_tokens"] == 40_000
+    assert "max_tokens" not in forwarded
+    assert forwarded["messages"] == messages
+    reservation = _estimate_reservation_cost(
+        config.endpoints[endpoint_id],
+        forwarded,
+        len(json.dumps(forwarded).encode()),
+        config.models[model_id].max_context_length,
+        config.models[model_id].max_output_length,
+    )
+    assert reservation == _actual_cost(
+        config.endpoints[endpoint_id],
+        {"prompt_tokens": 131_072, "completion_tokens": 40_000},
+    )
+
+
+@pytest.mark.parametrize(
+    ("max_completion_tokens", "max_tokens"),
+    [
+        ("1", 2),
+        (1, False),
+        (0, 1),
+        (1, -1),
+        (1, 1.5),
+    ],
+)
+def test_non_text_invalid_dual_output_limits_fail_closed(
+    routed_client: TestClient,
+    max_completion_tokens: object,
+    max_tokens: object,
+) -> None:
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "open-software/auto",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": {
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.com/image.png"},
+                    },
+                }
+            ],
+            "max_completion_tokens": max_completion_tokens,
+            "max_tokens": max_tokens,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_output_limit"
+    assert "must be a positive integer" in response.json()["error"]["message"]
+
+
+@pytest.mark.parametrize("name", ["max_completion_tokens", "max_tokens"])
+@pytest.mark.parametrize("value", [-1, 0, False, 1.5, "1"])
+def test_non_text_invalid_single_output_limit_fails_without_forwarding(
+    routed_client: TestClient,
+    name: str,
+    value: object,
+) -> None:
+    forwarded_before = len(routed_client.app.state.test_payloads)
+
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "open-software/auto",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": {
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.com/image.png"},
+                    },
+                }
+            ],
+            name: value,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_output_limit"
+    assert response.json()["error"]["message"] == (
+        f"{name} must be a positive integer for non-text input"
+    )
+    assert len(routed_client.app.state.test_payloads) == forwarded_before
+
+
+@pytest.mark.parametrize(
+    ("limits", "expected"),
+    [
+        ({"max_tokens": None}, {"max_completion_tokens": 2_048}),
+        (
+            {"max_completion_tokens": None, "max_tokens": 100},
+            {"max_tokens": 100},
+        ),
+        (
+            {"max_completion_tokens": 100, "max_tokens": None},
+            {"max_completion_tokens": 100},
+        ),
+    ],
+)
+def test_non_text_null_output_limits_are_removed_before_forwarding(
+    routed_client: TestClient,
+    limits: dict[str, object],
+    expected: dict[str, int],
+) -> None:
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "openai/gpt-oss-20b",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": {
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.com/image.png"},
+                    },
+                }
+            ],
+            **limits,
+        },
+    )
+
+    assert response.status_code == 200
+    forwarded = routed_client.app.state.test_payloads[-1]
+    assert {
+        name: forwarded[name]
+        for name in ("max_completion_tokens", "max_tokens")
+        if name in forwarded
+    } == expected
+
+
+def test_auto_image_input_returns_actionable_error_without_vision_route(
+    routed_client: TestClient,
+) -> None:
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "open-software/auto",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+                    ],
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "auto_route_unavailable"
+    assert "required capabilities (vision)" in response.json()["error"]["message"]
+
+
+def test_auto_large_image_data_url_does_not_consume_text_context() -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    data_url = (
+        "data:image/png;base64,"
+        + base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"x" * 1_000_000).decode()
+    )
+    payload = {
+        "model": "open-software/auto",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image."},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }
+        ],
+    }
+    policy = parse_routing_policy(payload, None)
+
+    models = select_auto_models(config, policy, EndpointHealth(), payload)
+
+    assert models == ["moonshotai/kimi-k2.6"]
+    assert payload["messages"][0]["content"][1]["image_url"]["url"] == data_url
+
+
+def test_non_text_estimate_is_size_independent_and_multiplies_per_input() -> None:
+    def payload(urls: list[str]) -> dict[str, object]:
+        return {
+            "model": "open-software/auto",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "image_url", "image_url": {"url": url}} for url in urls],
+                }
+            ],
+        }
+
+    small_url = "data:image/png;base64,eA=="
+    large_url = "data:image/png;base64," + base64.b64encode(b"x" * 1_000_000).decode()
+    small = estimate_bounded_prompt_units(payload([small_url]))
+    large = estimate_bounded_prompt_units(payload([large_url]))
+    two_inputs = estimate_bounded_prompt_units(payload([small_url, large_url]))
+
+    assert large == small
+    assert two_inputs >= small + NON_TEXT_INPUT_HEURISTIC_ALLOWANCE
+
+
+def test_attachment_estimate_multiplies_per_attachment() -> None:
+    one = estimate_bounded_prompt_units(
+        {"model": "open-software/auto", "attachments": [{"file_id": "file-1"}]}
+    )
+    two = estimate_bounded_prompt_units(
+        {
+            "model": "open-software/auto",
+            "attachments": [{"file_id": "file-1"}, {"file_id": "file-2"}],
+        }
+    )
+
+    assert two >= one + NON_TEXT_INPUT_HEURISTIC_ALLOWANCE
+
+
+def _image_payload(url: str, model: str) -> dict[str, object]:
+    return {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "image_url", "image_url": {"url": url}}],
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize("model", ["open-software/auto", "moonshotai/kimi-k2.6"])
+def test_remote_image_billing_hold_covers_full_model_context(model: str) -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    route = config.endpoints["venice-kimi-k2.6-private"]
+    context_limit = config.models[route.model_id].max_context_length
+    max_output_length = config.models[route.model_id].max_output_length
+    assert context_limit is not None
+    assert max_output_length is not None
+    payload = _image_payload("https://example.com/image.png", model)
+    _enforce_non_text_output_cap(payload)
+    request_bytes = len(json.dumps(payload).encode())
+
+    reservation = _estimate_reservation_cost(
+        route,
+        payload,
+        request_bytes,
+        context_limit,
+        max_output_length,
+    )
+    maximum_prompt_cost = _actual_cost(
+        route,
+        {
+            "prompt_tokens": context_limit,
+            "completion_tokens": DEFAULT_NON_TEXT_MAX_COMPLETION_TOKENS,
+        },
+    )
+
+    assert request_bytes < context_limit
+    assert payload["max_completion_tokens"] == DEFAULT_NON_TEXT_MAX_COMPLETION_TOKENS
+    assert reservation >= maximum_prompt_cost
+
+
+def test_inline_image_billing_hold_keeps_larger_raw_request_bound() -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    route = config.endpoints["venice-kimi-k2.6-private"]
+    context_limit = config.models[route.model_id].max_context_length
+    max_output_length = config.models[route.model_id].max_output_length
+    assert context_limit is not None
+    assert max_output_length is not None
+    large_url = "data:image/png;base64," + base64.b64encode(b"x" * 1_000_000).decode()
+    payload = _image_payload(large_url, "open-software/auto")
+    _enforce_non_text_output_cap(payload)
+    request_bytes = len(json.dumps(payload).encode())
+
+    estimate = _estimate_reservation_cost(
+        route,
+        payload,
+        request_bytes,
+        context_limit,
+        max_output_length,
+    )
+    expected = max(
+        1,
+        (
+            request_bytes * route.input_price_microusd_per_million
+            + DEFAULT_NON_TEXT_MAX_COMPLETION_TOKENS * route.output_price_microusd_per_million
+            + 999_999
+        )
+        // 1_000_000,
+    )
+
+    assert request_bytes > context_limit
+    assert estimate == expected
+
+
+def test_non_text_billing_hold_clamps_explicit_output_limit() -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    route = config.endpoints["venice-kimi-k2.6-private"]
+    model = config.models[route.model_id]
+    assert model.max_context_length is not None
+    assert model.max_output_length is not None
+    payload = {
+        **_image_payload("https://example.com/image.png", route.model_id),
+        "max_tokens": model.max_output_length * 2,
+    }
+    _enforce_non_text_output_cap(payload)
+    request_bytes = len(json.dumps(payload).encode())
+
+    reservation = _estimate_reservation_cost(
+        route,
+        payload,
+        request_bytes,
+        model.max_context_length,
+        model.max_output_length,
+    )
+    configured_maximum_cost = _actual_cost(
+        route,
+        {
+            "prompt_tokens": model.max_context_length,
+            "completion_tokens": model.max_output_length,
+        },
+    )
+
+    assert reservation == configured_maximum_cost
+    assert payload["max_tokens"] == model.max_output_length * 2
+    assert "max_completion_tokens" not in payload
+
+
+class _CapturingSettlementRepository:
+    def __init__(self) -> None:
+        self.actual_microusd: int | None = None
+
+    async def settle(
+        self,
+        key_id: str,
+        billing_id: str,
+        actual_microusd: int,
+        event: dict[str, object],
+    ) -> None:
+        self.actual_microusd = actual_microusd
+
+
+class _AcceptingSettlementAccounts:
+    def __init__(self) -> None:
+        self.charged_microusd: int | None = None
+
+    async def charge_wallet(
+        self,
+        grant: object,
+        actual_microusd: int,
+        billing_id: str,
+        request_id: str,
+    ) -> bool:
+        self.charged_microusd = actual_microusd
+        return True
+
+
+def _settlement_request(
+    repository: _CapturingSettlementRepository,
+    accounts: _AcceptingSettlementAccounts,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(managed_keys=repository, accounts=accounts),
+        ),
+        state=SimpleNamespace(request_id="req-no-usage"),
+    )
+
+
+@pytest.mark.anyio
+async def test_remote_image_missing_usage_charges_fallback_not_reservation() -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    route = config.endpoints["venice-kimi-k2.6-private"]
+    model = config.models[route.model_id]
+    payload = _image_payload("https://example.com/image.png", "open-software/auto")
+    _enforce_non_text_output_cap(payload)
+    request_bytes = len(json.dumps(payload).encode())
+    reservation = _estimate_reservation_cost(
+        route,
+        payload,
+        request_bytes,
+        model.max_context_length,
+        model.max_output_length,
+    )
+    fallback_charge = _estimate_fallback_charge(
+        route,
+        payload,
+        request_bytes,
+        model.max_context_length,
+        model.max_output_length,
+    )
+    repository = _CapturingSettlementRepository()
+    accounts = _AcceptingSettlementAccounts()
+    request = _settlement_request(repository, accounts)
+    billing = BillingContext("key-1", "bill-1", reservation, fallback_charge, None)
+
+    await _settle_billing(
+        request,
+        billing,
+        route,
+        route.model_id,
+        "no-retention",
+        route.id,
+        usage=None,
+    )
+
+    assert fallback_charge < reservation
+    assert repository.actual_microusd == fallback_charge
+    assert accounts.charged_microusd == fallback_charge
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {"total_tokens": 123},
+        {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    ],
+)
+async def test_unbillable_usage_warns_and_charges_fallback(
+    usage: dict[str, int], caplog: pytest.LogCaptureFixture
+) -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    route = config.endpoints["venice-kimi-k2.6-private"]
+    repository = _CapturingSettlementRepository()
+    accounts = _AcceptingSettlementAccounts()
+    request = _settlement_request(repository, accounts)
+    billing = BillingContext("key-1", "bill-1", 100_000, 5_000, None)
+
+    await _settle_billing(
+        request,
+        billing,
+        route,
+        route.model_id,
+        "no-retention",
+        route.id,
+        usage=usage,
+    )
+
+    assert repository.actual_microusd == billing.fallback_charge_microusd
+    assert accounts.charged_microusd == billing.fallback_charge_microusd
+    assert "billing_usage_fallback" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_stream_without_usage_charges_fallback_not_reservation() -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    route = config.endpoints["venice-kimi-k2.6-private"]
+    repository = _CapturingSettlementRepository()
+    accounts = _AcceptingSettlementAccounts()
+    request = _settlement_request(repository, accounts)
+    billing = BillingContext("key-1", "bill-1", 100_000, 5_000, None)
+    upstream = httpx.Response(
+        200,
+        content=b'data: {"choices":[]}\n\ndata: [DONE]\n\n',
+    )
+
+    chunks = [
+        chunk
+        async for chunk in _metered_stream(
+            request,
+            upstream,
+            billing,
+            route,
+            route.model_id,
+            "no-retention",
+            route.id,
+        )
+    ]
+
+    assert chunks
+    assert repository.actual_microusd == billing.fallback_charge_microusd
+    assert accounts.charged_microusd == billing.fallback_charge_microusd
+
+
+def test_text_missing_usage_fallback_preserves_reservation_estimate() -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    route = config.endpoints["venice-kimi-k2.6-private"]
+    model = config.models[route.model_id]
+    payload = {
+        "model": route.model_id,
+        "messages": [{"role": "user", "content": "Summarize this meeting."}],
+    }
+    request_bytes = len(json.dumps(payload).encode())
+
+    reservation = _estimate_reservation_cost(
+        route,
+        payload,
+        request_bytes,
+        model.max_context_length,
+        model.max_output_length,
+    )
+    fallback_charge = _estimate_fallback_charge(
+        route,
+        payload,
+        request_bytes,
+        model.max_context_length,
+    )
+
+    assert fallback_charge == reservation
+
+
+@pytest.mark.parametrize(
+    ("request_input", "required_capability"),
+    [
+        ({"attachments": [{"file_id": "file-1"}]}, "attachments"),
+        (
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_file", "file_data": "data:text/plain;base64,eA=="}
+                        ],
+                    }
+                ]
+            },
+            "file_input",
+        ),
+        (
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "file", "file": {"file_id": "file-1"}}],
+                    }
+                ]
+            },
+            "file_input",
+        ),
+        (
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_audio",
+                                "input_audio": {"data": "YXVkaW8=", "format": "wav"},
+                            }
+                        ],
+                    }
+                ]
+            },
+            "audio_input",
+        ),
+        (
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "audio_url", "audio_url": {"url": "https://example.com/a"}}
+                        ],
+                    }
+                ]
+            },
+            "audio_input",
+        ),
+    ],
+)
+def test_auto_unsupported_input_modalities_fail_closed(
+    request_input: dict[str, object], required_capability: str
+) -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    payload = {
+        "model": "open-software/auto",
+        "provider": {"require_parameters": False},
+        **request_input,
+    }
+    policy = parse_routing_policy(payload, None)
+
+    with pytest.raises(RoutingError) as raised:
+        select_auto_models(config, policy, EndpointHealth(), payload)
+
+    assert required_capability in policy.required_capabilities
+    assert raised.value.code == "auto_route_unavailable"
+    assert required_capability in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "request_input",
+    [
+        {"attachments": [{"file_id": "file-1"}]},
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+                    ],
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_file", "file_id": "file-1"}],
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_audio",
+                            "input_audio": {"data": "YXVkaW8=", "format": "wav"},
+                        }
+                    ],
+                }
+            ]
+        },
+    ],
+)
+def test_explicit_model_non_text_input_preserves_passthrough(
+    routed_client: TestClient, request_input: dict[str, object]
+) -> None:
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={"model": "openai/gpt-oss-20b", **request_input},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["model"] == "openai/gpt-oss-20b"
+
+
+def test_auto_image_and_tools_require_both_capabilities() -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    payload = {
+        "model": "open-software/auto",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Read the image and save a note."},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+                ],
+            }
+        ],
+        "tools": [{"type": "function", "function": {"name": "save_note"}}],
+    }
+    policy = parse_routing_policy(payload, None)
+
+    models = select_auto_models(config, policy, EndpointHealth(), payload)
+    endpoints = route_endpoints(config, models[0], policy, EndpointHealth())
+
+    assert policy.required_capabilities == frozenset({"tools", "vision"})
+    assert models == ["moonshotai/kimi-k2.6"]
+    assert [endpoint.id for endpoint in endpoints] == ["venice-kimi-k2.6-private"]
 
 
 def test_auto_forwards_hermes_shape_with_selected_model(routed_client: TestClient) -> None:
@@ -606,6 +1481,20 @@ def test_venice_catalog_shape_supports_june_bootstrap(routed_client: TestClient)
     assert asr_models.status_code == 200
     assert asr_models.json()["data"][0]["type"] == "asr"
     assert asr_models.json()["data"][0]["model_spec"]["pricing"]["per_audio_second"]
+
+
+def test_production_auto_catalog_advertises_guaranteed_image_input() -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+
+    auto = _auto_catalog_model(config, created=0)
+    kimi = config.models["moonshotai/kimi-k2.6"]
+
+    assert auto["architecture"]["input_modalities"] == ["text", "image"]
+    assert auto["model_spec"]["capabilities"]["supportsVision"] is True
+    assert kimi.input_modalities == ("text", "image")
+    assert "vision" in kimi.capabilities
+    assert "vision" not in config.endpoints["phala-kimi-k2.6"].capabilities
+    assert "vision" in config.endpoints["venice-kimi-k2.6-private"].capabilities
 
 
 def test_audio_transcription_matches_venice_upstream_contract(routed_client: TestClient) -> None:

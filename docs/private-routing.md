@@ -46,7 +46,13 @@ The structured policy provides finer control:
 Supported provider controls are `order`, `only`, `ignore`, `allow_fallbacks`,
 `require_parameters`, `sort` (`priority`, `price`, `latency`, or `throughput`), `max_price`, and
 `regions`. Tool, structured-output, and reasoning parameters automatically become required endpoint
-capabilities.
+capabilities. During Auto selection, non-text input modalities are mandatory even when
+`provider.require_parameters` is false. Image-bearing chat content (`image_url` or `input_image`, as
+a message content part or under top-level Responses `input`) requires an endpoint explicitly marked for vision. File parts
+(`input_file` or `file`), audio parts (`input_audio` or `audio_url`), and non-empty attachments fail
+closed until an endpoint is explicitly reviewed for the corresponding capability. Explicit models
+that declare a modality also require endpoint-level support; models without that declaration retain
+passthrough behavior for backward compatibility.
 
 ## Automatic model selection
 
@@ -73,6 +79,35 @@ not provider marketing labels. Models without a score are excluded from automati
 catalog release must update scores only from a documented evaluation snapshot and rerun the router
 regression suite. Explicit model IDs remain available when reproducibility matters more than
 automatic optimization.
+
+For image input, Auto removes text-only models and endpoints before cost/quality ranking. The
+initial reviewed vision route is Venice's private Kimi K2.6 endpoint. The Phala Kimi K2.6 endpoint
+remains text-only in this catalog until its image-input support is independently confirmed. If
+provider or privacy controls exclude every reviewed vision endpoint, the request fails with
+`auto_route_unavailable` instead of sending the image to a text-only route.
+
+Auto's routing-context heuristic substitutes bounded placeholders for non-text input payloads and
+attachments. Large base64 data URLs therefore do not consume the text-token estimate, while each
+non-text content part and each attachment adds a fixed 4,096-unit routing allowance. Multiple inputs
+multiply that allowance. This heuristic is not used as a billing bound: authorization reserves
+against the larger of the full raw request byte size and the selected model's entire context-token
+capacity whenever non-text input is present. This covers both large inline data URLs and short
+remote URLs whose visual token usage is not knowable before inference. Fallback candidates are
+compared using this bound. Metered non-text requests fail closed if an eligible model has no
+configured context capacity. When a non-text request omits both output-limit fields, the gateway
+adds `max_completion_tokens: 2048` to the effective upstream request and reserves against that
+enforced cap. A valid explicit limit is forwarded unchanged and the reservation is capped at the
+model's configured maximum. If both `max_completion_tokens` and `max_tokens` are set, the gateway
+uses the larger positive integer as the canonical `max_completion_tokens` value and removes
+`max_tokens` before routing, billing, and forwarding. Every supplied non-text output limit must be a
+positive, non-boolean integer; explicit `null` values are removed and treated as omitted. Invalid
+single or dual values fail with a 400 response before any upstream call. This prevents an upstream
+provider from honoring a value that the gateway's billing estimate parsed or clamped differently.
+Nested media content is never rewritten. Settlement uses
+billable prompt/completion usage reported by the upstream provider. Missing usage, `total_tokens`
+alone, or zero-only token fields emit a warning and fall back to the bounded structural estimate
+plus 4,096 units per non-text input and the 2,048-token default output estimate. That fallback never
+exceeds or automatically charges the full-context reservation.
 
 The initial score snapshot and its limitations are recorded in
 [`auto-quality-policy.md`](auto-quality-policy.md). The slider is an ordinal product policy, not a
