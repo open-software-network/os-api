@@ -17,6 +17,7 @@ compatibility surface is enabled in os-api production and June remains the billi
 - `POST /v1/audio/transcriptions` with multipart audio and the Parakeet ASR model
 - `POST /v1/augment/search` and `/v1/augment/scrape`
 - `POST /v1/image/generate`
+- `POST /v1/video/quote`, `/v1/video/queue`, and `/v1/video/retrieve`
 - Conservative auto-model pricing for June's preauthorization hold
 - Backward-compatible resolution of June's stored GLM, Kimi, and Nemotron model IDs
 
@@ -63,7 +64,19 @@ are rejected from these routes, preventing an accidental second billing path.
 | `MAX_AUDIO_BYTES` | Hard multipart audio cap; defaults to 25 MiB. |
 | `MAX_IMAGE_GENERATE_REQUEST_BYTES` | Hard image-generation JSON cap; defaults to 1 MiB. |
 | `IMAGE_GENERATE_TIMEOUT_SECONDS` | Venice image-generation timeout; defaults to 360 seconds so June can cancel before its provider-leg budget expires. |
+| `MAX_VIDEO_REQUEST_BYTES` | Hard quote and retrieve JSON cap; defaults to 1 MiB. |
+| `MAX_VIDEO_QUEUE_REQUEST_BYTES` | Hard queue JSON cap; defaults to 31 MiB, below Cloud Run's HTTP/1 ingress ceiling. |
+| `VIDEO_QUEUE_MAX_CONCURRENCY` | Per-instance queue-body concurrency cap; defaults to 4 to bound base64 memory residency. |
+| `MAX_VIDEO_JSON_RESPONSE_BYTES` | Hard provider JSON/error response cap; defaults to 1 MiB. |
+| `MAX_VIDEO_RESPONSE_BYTES` | Defense-in-depth streamed video cap; defaults to 101 MiB so June's 100 MiB terminal limit fires first. |
+| `VIDEO_REQUEST_TIMEOUT_SECONDS` | Per-call Venice video timeout; defaults to 360 seconds. |
 
 The proxy strips the user's audio filename, never logs request or response bodies, validates ASR
 models against an allowlist, clamps web result counts, and permits scrape targets only when HTTPS
 DNS resolution contains exclusively public addresses.
+
+Video quote and queue responses remain JSON. Retrieve responses preserve JSON progress and error
+statuses, while completed video bytes are streamed through os-api without buffering the MP4 in
+gateway memory. Both the declared content length and the streamed byte count are bounded.
+Because Cloud Run HTTP/1 ingress cannot carry June's maximum 50 MiB source image after base64
+expansion, animation queue payloads above 31 MiB require a future upload-by-reference transport.

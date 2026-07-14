@@ -179,6 +179,17 @@ is required because a preflight alone is not connection-bound and cannot prevent
 July 12, 2026 canary explicitly verified Venice rejects loopback and link-local metadata targets
 with `400`; reverify this contract before changing augmentation providers.
 
+June's video compatibility path forwards Venice quote and queue JSON and preserves retrieve's
+polymorphic response: JSON while a job is processing, or a streamed video body when complete.
+Quote/retrieve requests are bounded at 1 MiB, queue requests at 31 MiB, and provider JSON at 1 MiB.
+Only four queue request bodies are admitted concurrently per instance, and decoded validation
+objects are released before forwarding to keep large base64 animation frames memory-bounded.
+The 101 MiB streaming ceiling sits above June's terminal 100 MiB limit so June classifies an
+oversized chunked result before the proxy's defense-in-depth cap. Animation source payloads above
+31 MiB require an upload-by-reference design because base64 expansion can exceed Cloud Run's
+HTTP/1 ingress ceiling. Compatibility
+service keys keep `X-OS-Billing-Owner: caller`, so June remains the sole billing owner.
+
 ## Catalog operations
 
 `config/models.yaml` contains only the reviewed models eligible for Auto. At runtime the gateway
