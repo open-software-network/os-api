@@ -6,8 +6,10 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from sovereign_gateway import app as app_module
 from sovereign_gateway.gateway_attestation import (
     DEFAULT_AUDIENCE,
+    GatewayAttestation,
     GatewayAttestationUnavailable,
     request_gateway_attestation,
 )
@@ -63,6 +65,32 @@ def test_gateway_attestation_rejects_weak_nonce(client: TestClient) -> None:
 
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_nonce"
+
+
+@pytest.mark.parametrize("length", [9, 89])
+def test_gateway_attestation_rejects_nonce_outside_launcher_bounds(
+    client: TestClient, length: int
+) -> None:
+    response = client.post("/v1/gateway/attestation", json={"nonce": "a" * length})
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_nonce"
+
+
+@pytest.mark.parametrize("length", [10, 88])
+def test_gateway_attestation_accepts_nonce_at_launcher_bounds(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, length: int
+) -> None:
+    async def attest(nonce: str) -> GatewayAttestation:
+        return GatewayAttestation("signed-token", DEFAULT_AUDIENCE, nonce)
+
+    monkeypatch.setattr(app_module, "request_gateway_attestation", attest)
+    response = client.post("/v1/gateway/attestation", json={"nonce": "a" * length})
+
+    assert response.status_code == 200
+    assert response.json()["nonce"] == "a" * length
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["access-control-allow-origin"] == "*"
 
 
 def test_gateway_attestation_fails_closed_outside_confidential_space(client: TestClient) -> None:

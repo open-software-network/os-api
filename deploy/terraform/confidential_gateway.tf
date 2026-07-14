@@ -206,11 +206,12 @@ resource "google_compute_health_check" "confidential_gateway" {
 }
 
 resource "google_compute_region_instance_group_manager" "confidential_gateway_primary" {
-  count              = var.enable_confidential_gateway ? 1 : 0
-  name               = "os-api-confidential-primary"
-  region             = var.region
-  base_instance_name = "os-api-confidential-primary"
-  target_size        = 1
+  count                     = var.enable_confidential_gateway ? 1 : 0
+  name                      = "os-api-confidential-primary"
+  region                    = var.region
+  base_instance_name        = "os-api-confidential-primary"
+  target_size               = 1
+  distribution_policy_zones = [var.confidential_gateway_primary_zone]
   version { instance_template = google_compute_instance_template.confidential_gateway_primary[0].id }
   named_port {
     name = "http"
@@ -223,11 +224,12 @@ resource "google_compute_region_instance_group_manager" "confidential_gateway_pr
 }
 
 resource "google_compute_region_instance_group_manager" "confidential_gateway_secondary" {
-  count              = var.enable_confidential_gateway && var.enable_multi_region_control_plane ? 1 : 0
-  name               = "os-api-confidential-secondary"
-  region             = var.secondary_region
-  base_instance_name = "os-api-confidential-secondary"
-  target_size        = 1
+  count                     = var.enable_confidential_gateway && var.enable_multi_region_control_plane ? 1 : 0
+  name                      = "os-api-confidential-secondary"
+  region                    = var.secondary_region
+  base_instance_name        = "os-api-confidential-secondary"
+  target_size               = 1
+  distribution_policy_zones = [var.confidential_gateway_secondary_zone]
   version { instance_template = google_compute_instance_template.confidential_gateway_secondary[0].id }
   named_port {
     name = "http"

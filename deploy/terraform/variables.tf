@@ -84,13 +84,15 @@ variable "confidential_gateway_machine_type" {
 }
 
 variable "confidential_gateway_primary_zone" {
-  type    = string
-  default = "us-central1-a"
+  description = "Primary-region zone where the Confidential Space MIG may place its pinned TDX replica."
+  type        = string
+  default     = "us-central1-a"
 }
 
 variable "confidential_gateway_secondary_zone" {
-  type    = string
-  default = "us-east4-a"
+  description = "Secondary-region zone where the Confidential Space MIG may place its pinned TDX replica."
+  type        = string
+  default     = "us-east4-a"
 }
 
 variable "public_api_domain" {

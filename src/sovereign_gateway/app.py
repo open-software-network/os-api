@@ -298,7 +298,7 @@ def _settings() -> tuple[
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    configure_confidential_runtime()
+    _initialize_confidential_runtime()
     config, keys, managed_keys, limiter, redis = _settings()
     app.state.config = config
     app.state.keys = keys
@@ -345,6 +345,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await app.state.http.aclose()
     if redis:
         await redis.aclose()
+
+
+def _initialize_confidential_runtime() -> None:
+    try:
+        configure_confidential_runtime()
+    except Exception:
+        logger.exception(
+            json.dumps(
+                {
+                    "severity": "CRITICAL",
+                    "event": "confidential_runtime_init_failed",
+                },
+                separators=(",", ":"),
+            )
+        )
+        raise
 
 
 def create_app() -> FastAPI:

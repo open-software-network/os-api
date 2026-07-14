@@ -33,6 +33,22 @@ def test_required_runtime_fails_without_launcher_token(
         configure_confidential_runtime()
 
 
+def test_required_runtime_rejects_invalid_secret_mapping(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    token = tmp_path / "attestation-token"
+    token.write_text("signed-token")
+    monkeypatch.setenv("REQUIRE_CONFIDENTIAL_SPACE", "true")
+    monkeypatch.setenv("CONFIDENTIAL_SPACE_WIP_PROVIDER", "provider")
+    monkeypatch.setenv("CONFIDENTIAL_SPACE_IMPERSONATE_SERVICE_ACCOUNT", "runtime@example.com")
+    monkeypatch.setenv("CONFIDENTIAL_SPACE_TOKEN_FILE", str(token))
+    monkeypatch.setenv("CONFIDENTIAL_SPACE_CREDENTIAL_FILE", str(tmp_path / "credentials.json"))
+    monkeypatch.setenv("CONFIDENTIAL_SPACE_SECRET_ENV", "[]")
+
+    with pytest.raises(ConfidentialRuntimeError, match="map strings to strings"):
+        configure_confidential_runtime()
+
+
 def test_attested_identity_releases_secrets(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
