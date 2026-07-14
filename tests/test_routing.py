@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 from collections.abc import Iterator
@@ -13,13 +14,16 @@ from fastapi.testclient import TestClient
 from sovereign_gateway.app import (
     _actual_cost,
     _auto_catalog_model,
+    _estimate_cost,
     _validate_client_encryption_key,
     create_app,
 )
 from sovereign_gateway.config import GatewayConfig
 from sovereign_gateway.routing import (
+    NON_TEXT_INPUT_ESTIMATE_TOKENS,
     EndpointHealth,
     RoutingError,
+    estimate_prompt_tokens,
     parse_routing_policy,
     route_endpoints,
     select_auto_models,
@@ -332,6 +336,254 @@ def test_auto_image_input_returns_actionable_error_without_vision_route(
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "auto_route_unavailable"
     assert "required capabilities (vision)" in response.json()["error"]["message"]
+
+
+def test_auto_large_image_data_url_does_not_consume_text_context() -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    data_url = (
+        "data:image/png;base64,"
+        + base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"x" * 1_000_000).decode()
+    )
+    payload = {
+        "model": "open-software/auto",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image."},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }
+        ],
+    }
+    policy = parse_routing_policy(payload, None)
+
+    models = select_auto_models(config, policy, EndpointHealth(), payload)
+
+    assert models == ["moonshotai/kimi-k2.6"]
+    assert payload["messages"][0]["content"][1]["image_url"]["url"] == data_url
+
+
+def test_non_text_estimate_is_size_independent_and_multiplies_per_input() -> None:
+    def payload(urls: list[str]) -> dict[str, object]:
+        return {
+            "model": "open-software/auto",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "image_url", "image_url": {"url": url}} for url in urls],
+                }
+            ],
+        }
+
+    small_url = "data:image/png;base64,eA=="
+    large_url = "data:image/png;base64," + base64.b64encode(b"x" * 1_000_000).decode()
+    small = estimate_prompt_tokens(payload([small_url]))
+    large = estimate_prompt_tokens(payload([large_url]))
+    two_inputs = estimate_prompt_tokens(payload([small_url, large_url]))
+
+    assert large == small
+    assert two_inputs >= small + NON_TEXT_INPUT_ESTIMATE_TOKENS
+
+
+def test_attachment_estimate_multiplies_per_attachment() -> None:
+    one = estimate_prompt_tokens(
+        {"model": "open-software/auto", "attachments": [{"file_id": "file-1"}]}
+    )
+    two = estimate_prompt_tokens(
+        {
+            "model": "open-software/auto",
+            "attachments": [{"file_id": "file-1"}, {"file_id": "file-2"}],
+        }
+    )
+
+    assert two >= one + NON_TEXT_INPUT_ESTIMATE_TOKENS
+
+
+def test_auto_large_image_data_url_does_not_inflate_billing_reservation() -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    route = config.endpoints["venice-kimi-k2.6-private"]
+    large_url = "data:image/png;base64," + base64.b64encode(b"x" * 1_000_000).decode()
+
+    def payload(url: str, model: str = "open-software/auto") -> dict[str, object]:
+        return {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "image_url", "image_url": {"url": url}}],
+                }
+            ],
+        }
+
+    small = payload("data:image/png;base64,eA==")
+    large = payload(large_url)
+    explicit = payload(large_url, "moonshotai/kimi-k2.6")
+
+    small_estimate = _estimate_cost(route, small, len(json.dumps(small).encode()))
+    large_estimate = _estimate_cost(route, large, len(json.dumps(large).encode()))
+    explicit_estimate = _estimate_cost(route, explicit, len(json.dumps(explicit).encode()))
+    text_only_estimate = _estimate_cost(
+        route,
+        {"model": "open-software/auto", "messages": [{"role": "user", "content": "x"}]},
+        1,
+    )
+
+    assert large_estimate == small_estimate
+    assert large_estimate > text_only_estimate
+    assert explicit_estimate > large_estimate
+
+
+@pytest.mark.parametrize(
+    ("request_input", "required_capability"),
+    [
+        ({"attachments": [{"file_id": "file-1"}]}, "attachments"),
+        (
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_file", "file_data": "data:text/plain;base64,eA=="}
+                        ],
+                    }
+                ]
+            },
+            "file_input",
+        ),
+        (
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "file", "file": {"file_id": "file-1"}}],
+                    }
+                ]
+            },
+            "file_input",
+        ),
+        (
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_audio",
+                                "input_audio": {"data": "YXVkaW8=", "format": "wav"},
+                            }
+                        ],
+                    }
+                ]
+            },
+            "audio_input",
+        ),
+        (
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "audio_url", "audio_url": {"url": "https://example.com/a"}}
+                        ],
+                    }
+                ]
+            },
+            "audio_input",
+        ),
+    ],
+)
+def test_auto_unsupported_input_modalities_fail_closed(
+    request_input: dict[str, object], required_capability: str
+) -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    payload = {
+        "model": "open-software/auto",
+        "provider": {"require_parameters": False},
+        **request_input,
+    }
+    policy = parse_routing_policy(payload, None)
+
+    with pytest.raises(RoutingError) as raised:
+        select_auto_models(config, policy, EndpointHealth(), payload)
+
+    assert required_capability in policy.required_capabilities
+    assert raised.value.code == "auto_route_unavailable"
+    assert required_capability in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "request_input",
+    [
+        {"attachments": [{"file_id": "file-1"}]},
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+                    ],
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_file", "file_id": "file-1"}],
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_audio",
+                            "input_audio": {"data": "YXVkaW8=", "format": "wav"},
+                        }
+                    ],
+                }
+            ]
+        },
+    ],
+)
+def test_explicit_model_non_text_input_preserves_passthrough(
+    routed_client: TestClient, request_input: dict[str, object]
+) -> None:
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={"model": "openai/gpt-oss-20b", **request_input},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["model"] == "openai/gpt-oss-20b"
+
+
+def test_auto_image_and_tools_require_both_capabilities() -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    payload = {
+        "model": "open-software/auto",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Read the image and save a note."},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+                ],
+            }
+        ],
+        "tools": [{"type": "function", "function": {"name": "save_note"}}],
+    }
+    policy = parse_routing_policy(payload, None)
+
+    models = select_auto_models(config, policy, EndpointHealth(), payload)
+    endpoints = route_endpoints(config, models[0], policy, EndpointHealth())
+
+    assert policy.required_capabilities == frozenset({"tools", "vision"})
+    assert models == ["moonshotai/kimi-k2.6"]
+    assert [endpoint.id for endpoint in endpoints] == ["venice-kimi-k2.6-private"]
 
 
 def test_auto_forwards_hermes_shape_with_selected_model(routed_client: TestClient) -> None:

@@ -46,8 +46,12 @@ The structured policy provides finer control:
 Supported provider controls are `order`, `only`, `ignore`, `allow_fallbacks`,
 `require_parameters`, `sort` (`priority`, `price`, `latency`, or `throughput`), `max_price`, and
 `regions`. Tool, structured-output, and reasoning parameters automatically become required endpoint
-capabilities. Image-bearing chat content (`image_url` or `input_image` parts) requires an endpoint
-explicitly marked for vision, even when `provider.require_parameters` is false.
+capabilities. During Auto selection, non-text input modalities are mandatory even when
+`provider.require_parameters` is false. Image-bearing chat content (`image_url` or `input_image`
+parts) requires an endpoint explicitly marked for vision. File parts (`input_file` or `file`), audio
+parts (`input_audio` or `audio_url`), and non-empty attachments fail closed until an endpoint is
+explicitly reviewed for the corresponding capability. Explicit model requests retain passthrough
+behavior for backward compatibility.
 
 ## Automatic model selection
 
@@ -80,6 +84,12 @@ initial reviewed vision route is Venice's private Kimi K2.6 endpoint. The Phala 
 remains text-only in this catalog until its image-input support is independently confirmed. If
 provider or privacy controls exclude every reviewed vision endpoint, the request fails with
 `auto_route_unavailable` instead of sending the image to a text-only route.
+
+Auto's context and billing-reservation estimates substitute bounded placeholders for non-text input
+payloads and attachments. Large base64 data URLs therefore do not consume the text-token estimate,
+while each non-text content part and each attachment adds a fixed 4,096-unit allowance. Multiple
+inputs multiply that allowance. The original request body is forwarded unchanged to the selected
+endpoint, and settlement still uses the upstream provider's reported usage.
 
 The initial score snapshot and its limitations are recorded in
 [`auto-quality-policy.md`](auto-quality-policy.md). The slider is an ordinal product policy, not a

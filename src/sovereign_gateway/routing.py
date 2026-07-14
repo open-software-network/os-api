@@ -44,9 +44,26 @@ class RoutingPolicy:
     provider: ProviderPolicy
     required_capabilities: frozenset[str] = frozenset()
     client_encrypted: bool = False
+    automatic: bool = False
 
 
 AUTO_MODEL_IDS = frozenset({"auto", "open-software/auto"})
+INPUT_CAPABILITIES_BY_CONTENT_TYPE = {
+    "image_url": "vision",
+    "input_image": "vision",
+    "input_file": "file_input",
+    "file": "file_input",
+    "input_audio": "audio_input",
+    "audio_url": "audio_input",
+}
+MANDATORY_INPUT_CAPABILITIES = frozenset(
+    {"attachments", *INPUT_CAPABILITIES_BY_CONTENT_TYPE.values()}
+)
+NON_TEXT_INPUT_PLACEHOLDER = "<non-text input omitted>"
+# Auto uses UTF-8 bytes as a conservative tokenizer-independent text-token
+# bound. Add the same fixed 4K estimate units for every non-text input so
+# authorization is meaningful without treating raw base64 bytes as tokens.
+NON_TEXT_INPUT_ESTIMATE_TOKENS = 4_096
 
 
 def select_auto_models(
@@ -69,7 +86,7 @@ def select_auto_models(
 
     # UTF-8 bytes are a conservative tokenizer-independent upper bound for
     # byte-fallback model tokenizers, including CJK and large tool schemas.
-    prompt_tokens = max(1, len(json.dumps(payload, separators=(",", ":")).encode("utf-8")))
+    prompt_tokens = estimate_prompt_tokens(payload)
     requested_output = payload.get("max_completion_tokens", payload.get("max_tokens", 2048))
     try:
         output_tokens = max(1, int(requested_output))
@@ -258,6 +275,7 @@ def parse_routing_policy(
         ),
         required_capabilities=required,
         client_encrypted=client_encrypted,
+        automatic=payload.get("model") in AUTO_MODEL_IDS,
     )
 
 
@@ -296,11 +314,19 @@ def route_endpoints(
             )
         ]
     candidates = [endpoint for endpoint in candidates if _privacy_matches(endpoint, policy)]
-    required_capabilities = policy.required_capabilities
+    input_capabilities = policy.required_capabilities.intersection(MANDATORY_INPUT_CAPABILITIES)
+    if policy.automatic:
+        required_capabilities = policy.required_capabilities
+    else:
+        # Explicit model requests retain their established passthrough
+        # behavior. Automatic routing alone makes modality compatibility a
+        # gateway-enforced contract.
+        required_capabilities = policy.required_capabilities - input_capabilities
     if not provider_policy.require_parameters:
-        # Vision is an input modality, not an optional request parameter. An
-        # image-bearing request must never be sent to a text-only endpoint.
-        required_capabilities = required_capabilities.intersection({"vision"})
+        # Input modalities are not optional request parameters. Non-text input
+        # must never be sent to an endpoint that has not explicitly declared
+        # support for that modality when the gateway chooses the model.
+        required_capabilities = input_capabilities if policy.automatic else frozenset()
     if required_capabilities:
         candidates = [
             endpoint
@@ -336,6 +362,7 @@ def route_endpoints(
             ),
             provider=policy.provider,
             required_capabilities=policy.required_capabilities,
+            automatic=policy.automatic,
         )
         try:
             downgrade = route_endpoints(config, model_id, downgrade_policy, health)
@@ -404,8 +431,9 @@ def _satisfies_minimum_privacy(endpoint: Endpoint, minimum: str) -> bool:
 
 def _infer_capabilities(payload: dict[str, Any]) -> frozenset[str]:
     capabilities: set[str] = set()
-    if _has_image_content(payload.get("messages")):
-        capabilities.add("vision")
+    if payload.get("attachments"):
+        capabilities.add("attachments")
+    capabilities.update(_message_input_capabilities(payload.get("messages")))
     if payload.get("tools"):
         capabilities.add("tools")
     if payload.get("tool_choice") is not None:
@@ -417,21 +445,79 @@ def _infer_capabilities(payload: dict[str, Any]) -> frozenset[str]:
     return frozenset(capabilities)
 
 
-def _has_image_content(messages: Any) -> bool:
+def _message_input_capabilities(messages: Any) -> set[str]:
+    capabilities: set[str] = set()
     if not isinstance(messages, list):
-        return False
+        return capabilities
     for message in messages:
         if not isinstance(message, dict):
             continue
+        if message.get("attachments"):
+            capabilities.add("attachments")
         content = message.get("content")
         if not isinstance(content, list):
             continue
-        if any(
-            isinstance(part, dict) and part.get("type") in {"image_url", "input_image"}
-            for part in content
-        ):
-            return True
-    return False
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            capability = INPUT_CAPABILITIES_BY_CONTENT_TYPE.get(part.get("type"))
+            if capability:
+                capabilities.add(capability)
+    return capabilities
+
+
+def estimate_prompt_tokens(payload: dict[str, Any]) -> int:
+    estimation_payload = _payload_for_token_estimation(payload)
+    text_upper_bound = len(json.dumps(estimation_payload, separators=(",", ":")).encode("utf-8"))
+    non_text_allowance = _count_non_text_inputs(payload) * NON_TEXT_INPUT_ESTIMATE_TOKENS
+    return max(1, text_upper_bound + non_text_allowance)
+
+
+def _payload_for_token_estimation(payload: dict[str, Any]) -> dict[str, Any]:
+    sanitized = _sanitize_estimation_value(payload)
+    return sanitized if isinstance(sanitized, dict) else {}
+
+
+def _sanitize_estimation_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        content_type = value.get("type")
+        if content_type in INPUT_CAPABILITIES_BY_CONTENT_TYPE:
+            return {"type": content_type, "input": NON_TEXT_INPUT_PLACEHOLDER}
+        return {
+            key: (
+                _attachment_placeholder(item)
+                if key == "attachments" and item
+                else _sanitize_estimation_value(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_sanitize_estimation_value(item) for item in value]
+    return value
+
+
+def _attachment_placeholder(value: Any) -> dict[str, Any]:
+    count = len(value) if isinstance(value, (list, tuple)) else 1
+    return {"count": count, "input": NON_TEXT_INPUT_PLACEHOLDER}
+
+
+def _count_non_text_inputs(value: Any) -> int:
+    if isinstance(value, dict):
+        if value.get("type") in INPUT_CAPABILITIES_BY_CONTENT_TYPE:
+            return 1
+        return sum(
+            _attachment_count(item)
+            if key == "attachments" and item
+            else _count_non_text_inputs(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return sum(_count_non_text_inputs(item) for item in value)
+    return 0
+
+
+def _attachment_count(value: Any) -> int:
+    return len(value) if isinstance(value, (list, tuple)) else 1
 
 
 def _supports_capabilities(
@@ -439,12 +525,13 @@ def _supports_capabilities(
     model_capabilities: frozenset[str],
     required_capabilities: frozenset[str],
 ) -> bool:
-    # Vision is endpoint-specific: a multimodal model may be exposed through
-    # another provider or deployment that accepts text only. Other capability
-    # declarations retain the legacy model-level fallback.
-    if "vision" in required_capabilities and "vision" not in endpoint.capabilities:
+    # Input modalities are endpoint-specific: a multimodal model may be
+    # exposed through another provider or deployment that accepts text only.
+    # Other capability declarations retain the legacy model-level fallback.
+    input_capabilities = required_capabilities.intersection(MANDATORY_INPUT_CAPABILITIES)
+    if not input_capabilities.issubset(endpoint.capabilities):
         return False
-    remaining = required_capabilities - {"vision"}
+    remaining = required_capabilities - MANDATORY_INPUT_CAPABILITIES
     return remaining.issubset(endpoint.capabilities or model_capabilities)
 
 
