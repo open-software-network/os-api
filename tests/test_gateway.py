@@ -197,6 +197,14 @@ def test_venice_compatibility_surface_is_dormant_by_default(client: TestClient) 
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "not_found"
 
+    image = client.post(
+        "/v1/image/generate",
+        json={"model": "chroma", "prompt": "a red bicycle"},
+    )
+
+    assert image.status_code == 404
+    assert image.json()["error"]["code"] == "not_found"
+
 
 def test_request_id_is_preserved(client: TestClient) -> None:
     response = client.get("/healthz", headers={"X-Request-ID": "request-from-client"})

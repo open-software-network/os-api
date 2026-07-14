@@ -1,6 +1,8 @@
 # os-june Venice replacement assessment
 
-The OpenSoftware API implements the complete Venice upstream surface consumed by June API. It sits
+The OpenSoftware API implements the Venice upstream surface consumed by June API, except image
+editing. Image-edit requests can exceed Cloud Run's ingress limit, so that endpoint needs a
+separate transport design before it can move behind this compatibility layer. The router sits
 between June API and private inference providers without changing June's client-facing routes. The
 compatibility surface is enabled in os-api production and June remains the billing owner.
 
@@ -14,6 +16,7 @@ compatibility surface is enabled in os-api production and June remains the billi
 - `GET /v1/models?type=text|asr` using Venice's catalog wire shape
 - `POST /v1/audio/transcriptions` with multipart audio and the Parakeet ASR model
 - `POST /v1/augment/search` and `/v1/augment/scrape`
+- `POST /v1/image/generate`
 - Conservative auto-model pricing for June's preauthorization hold
 - Backward-compatible resolution of June's stored GLM, Kimi, and Nemotron model IDs
 
@@ -58,6 +61,8 @@ are rejected from these routes, preventing an accidental second billing path.
 | `ASR_MODEL_ALLOWLIST` | Comma-separated ASR models; defaults to Parakeet. |
 | `ASR_PRICE_PER_SECOND_USD` | Venice-shaped catalog price used by June billing. |
 | `MAX_AUDIO_BYTES` | Hard multipart audio cap; defaults to 25 MiB. |
+| `MAX_IMAGE_GENERATE_REQUEST_BYTES` | Hard image-generation JSON cap; defaults to 1 MiB. |
+| `IMAGE_GENERATE_TIMEOUT_SECONDS` | Venice image-generation timeout; defaults to 360 seconds so June can cancel before its provider-leg budget expires. |
 
 The proxy strips the user's audio filename, never logs request or response bodies, validates ASR
 models against an allowlist, clamps web result counts, and permits scrape targets only when HTTPS

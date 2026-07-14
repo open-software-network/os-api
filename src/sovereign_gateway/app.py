@@ -871,6 +871,56 @@ def create_app() -> FastAPI:
             headers={"x-os-provider": "venice", "x-os-billing-owner": "caller"},
         )
 
+    @app.post("/v1/image/generate")
+    async def image_generate(request: Request) -> Response:
+        compat_error = await _authorize_compat(request)
+        if compat_error:
+            return compat_error
+        maximum = int(os.getenv("MAX_IMAGE_GENERATE_REQUEST_BYTES", "1048576"))
+        body_error = _content_length_error(request, maximum)
+        if body_error:
+            return body_error
+        try:
+            raw = await _read_request_body_limited(request, maximum)
+        except RequestBodyTooLarge:
+            return openai_error(413, "Request body is too large", code="request_too_large")
+        try:
+            payload = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return openai_error(400, "Request body must be JSON", code="invalid_request")
+        if not isinstance(payload, dict):
+            return openai_error(400, "Request body must be an object", code="invalid_request")
+        if payload.get("return_binary") is True:
+            return openai_error(
+                400,
+                "Binary image responses are not supported by this compatibility endpoint",
+                code="invalid_request",
+            )
+        provider = request.app.state.config.providers.get("venice")
+        if not provider or not provider.enabled or not provider.api_key:
+            return openai_error(503, "Image provider is unavailable")
+        timeout_seconds = float(os.getenv("IMAGE_GENERATE_TIMEOUT_SECONDS", "360"))
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                upstream = await request.app.state.http.post(
+                    f"{provider.base_url}/v1/image/generate",
+                    content=raw,
+                    headers={
+                        "authorization": f"Bearer {provider.api_key}",
+                        "content-type": "application/json",
+                    },
+                    timeout=httpx.Timeout(
+                        connect=10,
+                        read=timeout_seconds,
+                        write=30,
+                        pool=10,
+                    ),
+                )
+        except (TimeoutError, httpx.HTTPError):
+            return openai_error(502, "Image provider failed")
+        response_headers = {"x-os-provider": "venice", "x-os-billing-owner": "caller"}
+        return _compat_image_generation_response(upstream, headers=response_headers)
+
     @app.post("/v1/{proxy_path:path}")
     async def routed_inference(proxy_path: str, request: Request) -> Response:
         if proxy_path not in PROXY_PATHS:
@@ -1744,6 +1794,26 @@ def _compat_json_response(upstream: httpx.Response, headers: dict[str, str]) -> 
         content = upstream.json()
     except (json.JSONDecodeError, UnicodeDecodeError):
         return openai_error(502, "Compatibility provider returned invalid JSON")
+    return JSONResponse(content=content, status_code=upstream.status_code, headers=headers)
+
+
+def _compat_image_generation_response(
+    upstream: httpx.Response, headers: dict[str, str]
+) -> Response:
+    try:
+        content = upstream.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        if upstream.status_code == 400:
+            response = openai_error(
+                400,
+                "Image generation was rejected",
+                code="image_generation_rejected",
+            )
+            response.headers.update(headers)
+            return response
+        response = openai_error(502, "Image provider returned invalid JSON")
+        response.headers.update(headers)
+        return response
     return JSONResponse(content=content, status_code=upstream.status_code, headers=headers)
 
 

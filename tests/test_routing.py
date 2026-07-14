@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -118,7 +119,7 @@ def routed_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[T
     calls: list[str] = []
     payloads: list[dict[str, object]] = []
 
-    def upstream(request: httpx.Request) -> httpx.Response:
+    async def upstream(request: httpx.Request) -> httpx.Response:
         calls.append(str(request.url))
         if request.method == "GET" and request.url.path.endswith("/v1/models"):
             if request.url.host == "venice.test":
@@ -181,6 +182,30 @@ def routed_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[T
                 200,
                 json={"url": "https://example.com", "content": "page", "format": "markdown"},
             )
+        if "/image/" in request.url.path:
+            assert request.headers["authorization"] == "Bearer venice-secret"
+            payload = json.loads(request.content)
+            expected_read_timeout = (
+                0.001 if payload["prompt"] == "force total timeout" else 360.0
+            )
+            assert request.extensions["timeout"] == {
+                "connect": 10,
+                "read": expected_read_timeout,
+                "write": 30,
+                "pool": 10,
+            }
+            assert payload["model"] == "chroma"
+            if payload["prompt"] == "force total timeout":
+                await asyncio.sleep(0.01)
+                raise AssertionError("total timeout did not cancel the upstream request")
+            if payload["prompt"] == "force timeout":
+                raise httpx.ReadTimeout("image generation timed out", request=request)
+            if payload["prompt"] == "reject as text":
+                return httpx.Response(400, text="bad model")
+            if payload["prompt"] == "fail as text":
+                return httpx.Response(503, text="unavailable")
+            assert payload["prompt"] == "a red bicycle"
+            return httpx.Response(200, json={"images": ["aW1hZ2U="]})
         payload = json.loads(request.content)
         payloads.append(payload)
         if payload.get("metadata", {}).get("force_primary_400") and payload["model"] != (
@@ -1629,6 +1654,101 @@ def test_augment_scrape_blocks_ssrf_targets(routed_client: TestClient, target: s
     response = routed_client.post("/v1/augment/scrape", json={"url": target})
 
     assert response.status_code == 400
+
+
+def test_image_generation_matches_venice_upstream_contract(
+    routed_client: TestClient,
+) -> None:
+    response = routed_client.post(
+        "/v1/image/generate",
+        json={"model": "chroma", "prompt": "a red bicycle", "format": "png"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"images": ["aW1hZ2U="]}
+    assert response.headers["x-os-billing-owner"] == "caller"
+    assert response.headers["x-os-provider"] == "venice"
+
+
+def test_image_rejects_oversized_body_before_parsing(
+    routed_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MAX_IMAGE_GENERATE_REQUEST_BYTES", "32")
+
+    response = routed_client.post(
+        "/v1/image/generate",
+        json={"prompt": "x" * 100},
+    )
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "request_too_large"
+
+
+def test_image_generation_rejects_binary_response_mode(routed_client: TestClient) -> None:
+    response = routed_client.post(
+        "/v1/image/generate",
+        json={
+            "model": "chroma",
+            "prompt": "a red bicycle",
+            "return_binary": True,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
+
+
+def test_image_generation_bounds_upstream_timeout(routed_client: TestClient) -> None:
+    response = routed_client.post(
+        "/v1/image/generate",
+        json={"model": "chroma", "prompt": "force timeout"},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["message"] == "Image provider failed"
+
+
+def test_image_generation_bounds_total_elapsed_time(
+    routed_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("IMAGE_GENERATE_TIMEOUT_SECONDS", "0.001")
+
+    response = routed_client.post(
+        "/v1/image/generate",
+        json={"model": "chroma", "prompt": "force total timeout"},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["message"] == "Image provider failed"
+
+
+def test_image_generation_preserves_plaintext_rejection_status(
+    routed_client: TestClient,
+) -> None:
+    response = routed_client.post(
+        "/v1/image/generate",
+        json={"model": "chroma", "prompt": "reject as text"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "image_generation_rejected"
+    assert response.headers["x-os-billing-owner"] == "caller"
+
+
+def test_image_generation_rejects_plaintext_provider_failure(
+    routed_client: TestClient,
+) -> None:
+    response = routed_client.post(
+        "/v1/image/generate",
+        json={"model": "chroma", "prompt": "fail as text"},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["message"] == "Image provider returned invalid JSON"
+    assert response.headers["x-os-billing-owner"] == "caller"
+    assert response.headers["x-os-provider"] == "venice"
 
 
 def test_endpoint_cost_accounts_for_cache_prices(tmp_path: Path) -> None:
