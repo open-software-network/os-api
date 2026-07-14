@@ -19,6 +19,7 @@ from sovereign_gateway.app import (
     BillingContext,
     _actual_cost,
     _auto_catalog_model,
+    _endpoint_headers,
     _enforce_non_text_output_cap,
     _estimate_fallback_charge,
     _estimate_reservation_cost,
@@ -1476,22 +1477,49 @@ def test_e2ee_endpoint_requires_client_encryption_headers() -> None:
         route_endpoints(config, "openai/gpt-oss-20b", independently_verified, health)
 
 
-def test_preferred_privacy_appends_zero_retention_venice_fallback() -> None:
+@pytest.mark.parametrize(
+    ("model", "venice_private", "phala"),
+    [
+        ("openai/gpt-oss-120b", "venice-gpt-oss-120b-private", "phala-gpt-oss-120b"),
+        ("google/gemma-3-27b-it", "venice-gemma-3-27b-private", "phala-gemma-3-27b"),
+        ("z-ai/glm-5.2", "venice-glm-5.2-private", "phala-glm-5.2"),
+        ("qwen/qwen3.6-27b", "venice-qwen3.6-27b-private", "phala-qwen3.6-27b"),
+        ("moonshotai/kimi-k2.6", "venice-kimi-k2.6-private", "phala-kimi-k2.6"),
+    ],
+)
+def test_preferred_privacy_uses_venice_private_then_phala(
+    model: str, venice_private: str, phala: str
+) -> None:
     config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
-    payload = {"model": "openai/gpt-oss-120b", "privacy": {"require_zero_retention": True}}
+    payload = {"model": model}
     preferred = parse_routing_policy(payload, None)
     required = parse_routing_policy(payload, "required")
 
-    preferred_endpoints = route_endpoints(
-        config, "openai/gpt-oss-120b", preferred, EndpointHealth()
-    )
-    required_endpoints = route_endpoints(config, "openai/gpt-oss-120b", required, EndpointHealth())
+    preferred_endpoints = route_endpoints(config, model, preferred, EndpointHealth())
+    required_endpoints = route_endpoints(config, model, required, EndpointHealth())
 
-    assert [endpoint.id for endpoint in preferred_endpoints] == [
-        "phala-gpt-oss-120b",
-        "venice-gpt-oss-120b-private",
-    ]
-    assert [endpoint.id for endpoint in required_endpoints] == ["phala-gpt-oss-120b"]
+    assert [endpoint.id for endpoint in preferred_endpoints] == [venice_private, phala]
+    assert [endpoint.id for endpoint in required_endpoints] == [phala]
+
+
+def test_default_privacy_requires_zero_retention_but_not_tee() -> None:
+    preferred = parse_routing_policy({"model": "openai/gpt-oss-120b"}, None)
+    required = parse_routing_policy({"model": "openai/gpt-oss-120b"}, "required")
+
+    assert preferred.privacy.minimum == "no-retention"
+    assert preferred.privacy.allow_downgrade is False
+    assert required.privacy.minimum == "tee"
+    assert required.privacy.allow_downgrade is False
+
+
+def test_venice_private_response_headers_report_non_tee_privacy() -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    endpoint = config.endpoints["venice-glm-5.2-private"]
+
+    headers = _endpoint_headers(endpoint, None)
+
+    assert headers["x-compute-privacy"] == "standard"
+    assert headers["x-os-privacy-level"] == "no-retention"
 
 
 def test_production_auto_slider_is_monotonic_for_quality_and_primary_cost() -> None:

@@ -18,7 +18,7 @@ class RoutingError(ValueError):
 
 @dataclass(frozen=True)
 class PrivacyPolicy:
-    minimum: str = "tee"
+    minimum: str = "no-retention"
     require_zero_retention: bool = False
     require_response_proof: bool = False
     allow_downgrade: bool = False
@@ -234,12 +234,17 @@ def parse_routing_policy(
         )
     if header == "disabled":
         default_minimum = "standard"
-    else:
+    elif header == "required":
         default_minimum = "tee"
+    else:
+        default_minimum = "no-retention"
     minimum = str(privacy_raw.get("minimum", default_minimum))
     if minimum not in PRIVACY_LEVELS:
         raise RoutingError("invalid_privacy_policy", f"Unknown privacy level {minimum!r}")
-    allow_downgrade = bool(privacy_raw.get("allow_downgrade", header == "preferred"))
+    # A caller must explicitly authorize routing below its requested privacy
+    # floor. "preferred" selects the product default; it is not consent to
+    # abandon zero retention when those routes are unavailable.
+    allow_downgrade = bool(privacy_raw.get("allow_downgrade", False))
     # "required" is an unconditional fail-closed override.
     if header == "required":
         allow_downgrade = False

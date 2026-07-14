@@ -44,10 +44,10 @@ print(completion.choices[0].message.content)</code></pre>
     <p>Set <code>X-Confidential-Compute</code> on any inference request:</p>
     <table><thead><tr><th>Value</th><th>Behavior</th></tr></thead><tbody>
       <tr><td><code>required</code></td><td>Use a configured TEE backend or fail with 409. Never downgrade.</td></tr>
-      <tr><td><code>preferred</code></td><td>Use confidential compute when configured; otherwise return an explicit standard fallback. This is the default.</td></tr>
+      <tr><td><code>preferred</code></td><td>Require zero retention, prefer a configured Venice private endpoint, and fall back to a compatible Phala TEE endpoint. This is the default.</td></tr>
       <tr><td><code>disabled</code></td><td>Use the standard compute backend.</td></tr>
     </tbody></table>
-    <p>Responses report the selection in <code>X-Compute-Privacy</code> and <code>X-Model-Backend</code>.</p>
+    <p>This is a deliberate change from the earlier TEE-first default. Callers that require hardware-backed confidential compute must send <code>required</code>. Responses report the exact hosted-provider contract in <code>X-OS-Privacy-Level</code>; <code>X-Compute-Privacy</code> remains a coarser legacy compute-class field.</p>
 
     <h2 id="streaming">Streaming</h2>
     <p>Set <code>stream: true</code>. The endpoint returns OpenAI-style server-sent events and includes the terminal usage block for billing.</p>

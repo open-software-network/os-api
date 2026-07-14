@@ -117,6 +117,7 @@ def test_unlimited_backend_skips_admission_control(client: TestClient) -> None:
 
     response = client.post(
         "/v1/chat/completions",
+        headers={"X-Confidential-Compute": "disabled"},
         json={"model": "standard-only", "messages": []},
     )
 

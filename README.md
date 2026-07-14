@@ -43,10 +43,15 @@ Set one request header:
 | Header | Behavior |
 | --- | --- |
 | `X-Confidential-Compute: required` | Use only a configured TEE backend; return `409` instead of downgrading. |
-| `X-Confidential-Compute: preferred` | Use TEE when configured, otherwise explicitly return `standard-fallback`. This is the default. |
+| `X-Confidential-Compute: preferred` | Require zero retention, prefer the configured private endpoint, and fall back to a compatible TEE endpoint. This is the default. |
 | `X-Confidential-Compute: disabled` | Use the lower-cost standard GPU pool only. |
 
 Responses include `X-Compute-Privacy` and `X-Model-Backend`. A production edge proxy must preserve these headers.
+The default was deliberately changed from TEE-first to Venice-private-first on July 14, 2026. This
+is a breaking privacy-policy choice: callers that require a hardware execution guarantee must send
+`X-Confidential-Compute: required` rather than infer TEE use from an omitted header. For hosted
+providers, `X-OS-Privacy-Level` reports the precise level (`no-retention`, `tee`, or `e2ee-tee`),
+while the legacy `X-Compute-Privacy` header reports the coarser compute class.
 
 ```bash
 curl http://localhost:8080/v1/chat/completions \
