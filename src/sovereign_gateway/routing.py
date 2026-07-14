@@ -474,6 +474,10 @@ def estimate_auto_context_units(payload: dict[str, Any]) -> int:
     return max(1, text_upper_bound + non_text_allowance)
 
 
+def has_non_text_input(payload: dict[str, Any]) -> bool:
+    return _count_non_text_inputs(payload) > 0
+
+
 def _payload_for_token_estimation(payload: dict[str, Any]) -> dict[str, Any]:
     sanitized = _sanitize_estimation_value(payload)
     return sanitized if isinstance(sanitized, dict) else {}

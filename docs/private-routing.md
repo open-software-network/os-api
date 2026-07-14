@@ -89,8 +89,12 @@ Auto's routing-context heuristic substitutes bounded placeholders for non-text i
 attachments. Large base64 data URLs therefore do not consume the text-token estimate, while each
 non-text content part and each attachment adds a fixed 4,096-unit routing allowance. Multiple inputs
 multiply that allowance. This heuristic is not used as a billing bound: authorization reserves
-against the full raw request byte size, and settlement uses the upstream provider's reported usage.
-The original request body is forwarded unchanged to the selected endpoint.
+against the larger of the full raw request byte size and the selected model's entire context-token
+capacity whenever non-text input is present. This covers both large inline data URLs and short
+remote URLs whose visual token usage is not knowable before inference. Fallback candidates are
+compared using this bound. Metered non-text requests fail closed if an eligible model has no
+configured context capacity. Settlement uses the upstream provider's reported usage, and the
+original request body is forwarded unchanged to the selected endpoint.
 
 The initial score snapshot and its limitations are recorded in
 [`auto-quality-policy.md`](auto-quality-policy.md). The slider is an ordinal product policy, not a

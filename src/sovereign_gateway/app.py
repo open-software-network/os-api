@@ -55,6 +55,7 @@ from .routing import (
     AUTO_MODEL_IDS,
     EndpointHealth,
     RoutingError,
+    has_non_text_input,
     parse_routing_policy,
     route_endpoints,
     select_auto_models,
@@ -967,13 +968,27 @@ def create_app() -> FastAPI:
             )
             return openai_error(status, str(exc), code=code)
 
-        # Reserve against the most expensive eligible endpoint so fallback can
-        # never bypass a key or wallet spend limit.
+        # Reserve against the highest estimated eligible endpoint so fallback
+        # cannot bypass a key or wallet spend limit. For non-text input, model
+        # context capacity is part of the estimate and can outweigh unit price.
+        non_text_input = has_non_text_input(payload)
+
+        def billing_estimate(endpoint: Endpoint) -> float:
+            context_limit = config.models[endpoint.model_id].max_context_length
+            if non_text_input and context_limit is None:
+                # Force the unknown-bound endpoint into _prepare_billing,
+                # which fails closed for metered requests.
+                return float("inf")
+            return _estimate_cost(
+                endpoint,
+                payload,
+                len(raw),
+                context_limit,
+            )
+
         estimate_endpoint = max(
             candidates,
-            key=lambda item: (
-                item.input_price_microusd_per_million + item.output_price_microusd_per_million
-            ),
+            key=billing_estimate,
         )
         billing = await _prepare_billing(request, estimate_endpoint, payload, len(raw))
         if isinstance(billing, Response):
@@ -1741,7 +1756,19 @@ async def _prepare_billing(
     if not principal.key_id or not principal.user_id or not repository:
         return None
     billing_id = str(uuid.uuid4())
-    estimate = _estimate_cost(route, payload, request_bytes)
+    if isinstance(route, ModelRoute):
+        context_limit = route.max_context_length
+    else:
+        model = request.app.state.config.models.get(route.model_id)
+        context_limit = model.max_context_length if model else None
+    if has_non_text_input(payload) and context_limit is None:
+        return openai_error(
+            409,
+            "The selected model has no configured non-text billing bound",
+            error_type="billing_error",
+            code="billing_bound_unavailable",
+        )
+    estimate = _estimate_cost(route, payload, request_bytes, context_limit)
     try:
         await repository.reserve(principal.key_id, billing_id, estimate)
     except SpendLimitExceeded:
@@ -1906,15 +1933,23 @@ async def _metered_stream(
 
 
 def _estimate_cost(
-    route: ModelRoute | Endpoint, payload: dict[str, Any], request_bytes: int
+    route: ModelRoute | Endpoint,
+    payload: dict[str, Any],
+    request_bytes: int,
+    context_limit: int | None = None,
 ) -> int:
     prompt_upper_bound = max(1, request_bytes)
+    if context_limit is None and isinstance(route, ModelRoute):
+        context_limit = route.max_context_length
+    if has_non_text_input(payload) and context_limit:
+        # Remote media can tokenize far beyond its short URL. The model's full
+        # context capacity is the only configured pre-inference prompt bound.
+        prompt_upper_bound = max(prompt_upper_bound, context_limit)
     requested_output = payload.get("max_completion_tokens", payload.get("max_tokens"))
     try:
         output_tokens = int(requested_output) if requested_output is not None else 2_048
     except (TypeError, ValueError):
         output_tokens = 2_048
-    context_limit = route.max_context_length if isinstance(route, ModelRoute) else None
     if context_limit:
         output_tokens = min(max(1, output_tokens), context_limit)
     return max(

@@ -400,40 +400,59 @@ def test_attachment_estimate_multiplies_per_attachment() -> None:
     assert two >= one + NON_TEXT_INPUT_ROUTING_ALLOWANCE
 
 
-def test_auto_large_image_billing_reservation_uses_raw_request_bytes() -> None:
+def _image_payload(url: str, model: str) -> dict[str, object]:
+    return {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "image_url", "image_url": {"url": url}}],
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize("model", ["open-software/auto", "moonshotai/kimi-k2.6"])
+def test_remote_image_billing_hold_covers_full_model_context(model: str) -> None:
     config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
     route = config.endpoints["venice-kimi-k2.6-private"]
+    context_limit = config.models[route.model_id].max_context_length
+    assert context_limit is not None
+    payload = _image_payload("https://example.com/image.png", model)
+    request_bytes = len(json.dumps(payload).encode())
+
+    estimate = _estimate_cost(route, payload, request_bytes, context_limit)
+    maximum_prompt_cost = _actual_cost(
+        route,
+        {"prompt_tokens": context_limit, "completion_tokens": 2_048},
+    )
+
+    assert request_bytes < context_limit
+    assert estimate >= maximum_prompt_cost
+
+
+def test_inline_image_billing_hold_keeps_larger_raw_request_bound() -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    route = config.endpoints["venice-kimi-k2.6-private"]
+    context_limit = config.models[route.model_id].max_context_length
+    assert context_limit is not None
     large_url = "data:image/png;base64," + base64.b64encode(b"x" * 1_000_000).decode()
+    payload = _image_payload(large_url, "open-software/auto")
+    request_bytes = len(json.dumps(payload).encode())
 
-    def payload(url: str, model: str = "open-software/auto") -> dict[str, object]:
-        return {
-            "model": model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [{"type": "image_url", "image_url": {"url": url}}],
-                }
-            ],
-        }
-
-    small = payload("data:image/png;base64,eA==")
-    large = payload(large_url)
-    small_bytes = len(json.dumps(small).encode())
-    large_bytes = len(json.dumps(large).encode())
-    small_estimate = _estimate_cost(route, small, small_bytes)
-    large_estimate = _estimate_cost(route, large, large_bytes)
-    expected_large_estimate = max(
+    estimate = _estimate_cost(route, payload, request_bytes, context_limit)
+    expected = max(
         1,
         (
-            large_bytes * route.input_price_microusd_per_million
+            request_bytes * route.input_price_microusd_per_million
             + 2_048 * route.output_price_microusd_per_million
             + 999_999
         )
         // 1_000_000,
     )
 
-    assert large_estimate == expected_large_estimate
-    assert large_estimate > small_estimate
+    assert request_bytes > context_limit
+    assert estimate == expected
 
 
 @pytest.mark.parametrize(
