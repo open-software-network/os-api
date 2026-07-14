@@ -47,11 +47,12 @@ Supported provider controls are `order`, `only`, `ignore`, `allow_fallbacks`,
 `require_parameters`, `sort` (`priority`, `price`, `latency`, or `throughput`), `max_price`, and
 `regions`. Tool, structured-output, and reasoning parameters automatically become required endpoint
 capabilities. During Auto selection, non-text input modalities are mandatory even when
-`provider.require_parameters` is false. Image-bearing chat content (`image_url` or `input_image`
-parts) requires an endpoint explicitly marked for vision. File parts (`input_file` or `file`), audio
-parts (`input_audio` or `audio_url`), and non-empty attachments fail closed until an endpoint is
-explicitly reviewed for the corresponding capability. Explicit model requests retain passthrough
-behavior for backward compatibility.
+`provider.require_parameters` is false. Image-bearing chat content (`image_url` or `input_image`, as
+a content object or list part) requires an endpoint explicitly marked for vision. File parts
+(`input_file` or `file`), audio parts (`input_audio` or `audio_url`), and non-empty attachments fail
+closed until an endpoint is explicitly reviewed for the corresponding capability. Explicit models
+that declare a modality also require endpoint-level support; models without that declaration retain
+passthrough behavior for backward compatibility.
 
 ## Automatic model selection
 
@@ -93,13 +94,14 @@ against the larger of the full raw request byte size and the selected model's en
 capacity whenever non-text input is present. This covers both large inline data URLs and short
 remote URLs whose visual token usage is not knowable before inference. Fallback candidates are
 compared using this bound. Metered non-text requests fail closed if an eligible model has no
-configured context capacity. The reservation also includes the model's configured maximum output
-when the caller omits an output limit; explicit limits are capped at the configured maximum.
-Settlement uses the upstream provider's reported usage. If buffered or streaming usage is missing,
-the charge falls back to the bounded structural estimate plus 4,096 units per non-text input and
-the existing 2,048-token default output estimate. That fallback never exceeds or automatically
-charges the full-context reservation. The original request body is forwarded unchanged to the
-selected endpoint.
+configured context capacity. When a non-text request omits both output-limit fields, the gateway
+adds `max_completion_tokens: 2048` to the effective upstream request and reserves against that
+enforced cap. A valid explicit limit is forwarded unchanged and the reservation is capped at the
+model's configured maximum. Nested media content is never rewritten. Settlement uses billable
+prompt/completion usage reported by the upstream provider. Missing usage, `total_tokens` alone, or
+zero-only token fields emit a warning and fall back to the bounded structural estimate plus 4,096
+units per non-text input and the 2,048-token default output estimate. That fallback never exceeds or
+automatically charges the full-context reservation.
 
 The initial score snapshot and its limitations are recorded in
 [`auto-quality-policy.md`](auto-quality-policy.md). The slider is an ordinal product policy, not a

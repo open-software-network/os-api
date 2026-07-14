@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,9 +14,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from sovereign_gateway.app import (
+    DEFAULT_NON_TEXT_MAX_COMPLETION_TOKENS,
     BillingContext,
     _actual_cost,
     _auto_catalog_model,
+    _enforce_non_text_output_cap,
     _estimate_fallback_charge,
     _estimate_reservation_cost,
     _metered_stream,
@@ -113,6 +116,7 @@ def routed_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[T
     monkeypatch.setenv("LIVE_PROVIDER_CATALOG_ENABLED", "false")
     monkeypatch.delenv("REDIS_URL", raising=False)
     calls: list[str] = []
+    payloads: list[dict[str, object]] = []
 
     def upstream(request: httpx.Request) -> httpx.Response:
         calls.append(str(request.url))
@@ -178,6 +182,7 @@ def routed_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[T
                 json={"url": "https://example.com", "content": "page", "format": "markdown"},
             )
         payload = json.loads(request.content)
+        payloads.append(payload)
         if payload.get("metadata", {}).get("force_primary_400") and payload["model"] != (
             "backup/private-model"
         ):
@@ -206,6 +211,7 @@ def routed_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[T
         app.state.http = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
         client.headers["Authorization"] = f"Bearer {API_KEY}"
         client.app.state.test_calls = calls
+        client.app.state.test_payloads = payloads
         yield client
         anyio.run(old_client.aclose)
 
@@ -320,6 +326,85 @@ def test_auto_image_input_selects_only_verified_vision_route(image_part: dict[st
     assert [endpoint.id for endpoint in endpoints] == ["venice-kimi-k2.6-private"]
 
 
+def test_explicit_vision_model_selects_only_vision_endpoint() -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    payload = {
+        "model": "moonshotai/kimi-k2.6",
+        "messages": [
+            {
+                "role": "user",
+                "content": {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.com/image.png"},
+                },
+            }
+        ],
+    }
+    policy = parse_routing_policy(payload, None)
+
+    endpoints = route_endpoints(config, payload["model"], policy, EndpointHealth())
+
+    assert policy.required_capabilities == frozenset({"vision"})
+    assert [endpoint.id for endpoint in endpoints] == ["venice-kimi-k2.6-private"]
+
+
+def test_auto_bare_image_content_uses_same_routing_and_billing_detection() -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    content = {
+        "type": "image_url",
+        "image_url": {"url": "https://example.com/image.png"},
+    }
+    messages = [{"role": "user", "content": content}]
+    payload = {"model": "open-software/auto", "messages": messages}
+
+    _enforce_non_text_output_cap(payload)
+    policy = parse_routing_policy(payload, None)
+    models = select_auto_models(config, policy, EndpointHealth(), payload)
+    endpoints = route_endpoints(config, models[0], policy, EndpointHealth())
+
+    assert payload["messages"] is messages
+    assert payload["messages"][0]["content"] is content
+    assert payload["max_completion_tokens"] == DEFAULT_NON_TEXT_MAX_COMPLETION_TOKENS
+    assert policy.required_capabilities == frozenset({"vision"})
+    assert models == ["moonshotai/kimi-k2.6"]
+    assert [endpoint.id for endpoint in endpoints] == ["venice-kimi-k2.6-private"]
+
+
+def test_non_text_output_cap_is_forwarded_without_rewriting_media(
+    routed_client: TestClient,
+) -> None:
+    config = routed_client.app.state.config
+    model_id = "openai/gpt-oss-20b"
+    model = config.models[model_id]
+    config.models[model_id] = replace(
+        model,
+        capabilities=model.capabilities.union({"vision"}),
+        input_modalities=("text", "image"),
+    )
+    endpoint_id = "venice-gpt-oss-20b"
+    endpoint = config.endpoints[endpoint_id]
+    config.endpoints[endpoint_id] = replace(
+        endpoint,
+        capabilities=endpoint.capabilities.union({"vision"}),
+    )
+    content = {
+        "type": "image_url",
+        "image_url": {"url": "https://example.com/image.png", "detail": "high"},
+    }
+    messages = [{"role": "user", "content": content}]
+
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={"model": "open-software/auto", "messages": messages},
+    )
+
+    assert response.status_code == 200
+    forwarded = routed_client.app.state.test_payloads[-1]
+    assert forwarded["model"] == endpoint.upstream_model
+    assert forwarded["max_completion_tokens"] == DEFAULT_NON_TEXT_MAX_COMPLETION_TOKENS
+    assert forwarded["messages"] == messages
+
+
 def test_auto_image_input_returns_actionable_error_without_vision_route(
     routed_client: TestClient,
 ) -> None:
@@ -426,6 +511,7 @@ def test_remote_image_billing_hold_covers_full_model_context(model: str) -> None
     assert context_limit is not None
     assert max_output_length is not None
     payload = _image_payload("https://example.com/image.png", model)
+    _enforce_non_text_output_cap(payload)
     request_bytes = len(json.dumps(payload).encode())
 
     reservation = _estimate_reservation_cost(
@@ -437,17 +523,15 @@ def test_remote_image_billing_hold_covers_full_model_context(model: str) -> None
     )
     maximum_prompt_cost = _actual_cost(
         route,
-        {"prompt_tokens": context_limit, "completion_tokens": 0},
-    )
-    maximum_output_cost = _actual_cost(
-        route,
-        {"prompt_tokens": 0, "completion_tokens": max_output_length},
+        {
+            "prompt_tokens": context_limit,
+            "completion_tokens": DEFAULT_NON_TEXT_MAX_COMPLETION_TOKENS,
+        },
     )
 
     assert request_bytes < context_limit
-    assert "max_tokens" not in payload
+    assert payload["max_completion_tokens"] == DEFAULT_NON_TEXT_MAX_COMPLETION_TOKENS
     assert reservation >= maximum_prompt_cost
-    assert reservation >= maximum_output_cost
 
 
 def test_inline_image_billing_hold_keeps_larger_raw_request_bound() -> None:
@@ -459,6 +543,7 @@ def test_inline_image_billing_hold_keeps_larger_raw_request_bound() -> None:
     assert max_output_length is not None
     large_url = "data:image/png;base64," + base64.b64encode(b"x" * 1_000_000).decode()
     payload = _image_payload(large_url, "open-software/auto")
+    _enforce_non_text_output_cap(payload)
     request_bytes = len(json.dumps(payload).encode())
 
     estimate = _estimate_reservation_cost(
@@ -472,7 +557,7 @@ def test_inline_image_billing_hold_keeps_larger_raw_request_bound() -> None:
         1,
         (
             request_bytes * route.input_price_microusd_per_million
-            + max_output_length * route.output_price_microusd_per_million
+            + DEFAULT_NON_TEXT_MAX_COMPLETION_TOKENS * route.output_price_microusd_per_million
             + 999_999
         )
         // 1_000_000,
@@ -492,6 +577,7 @@ def test_non_text_billing_hold_clamps_explicit_output_limit() -> None:
         **_image_payload("https://example.com/image.png", route.model_id),
         "max_tokens": model.max_output_length * 2,
     }
+    _enforce_non_text_output_cap(payload)
     request_bytes = len(json.dumps(payload).encode())
 
     reservation = _estimate_reservation_cost(
@@ -510,6 +596,8 @@ def test_non_text_billing_hold_clamps_explicit_output_limit() -> None:
     )
 
     assert reservation == configured_maximum_cost
+    assert payload["max_tokens"] == model.max_output_length * 2
+    assert "max_completion_tokens" not in payload
 
 
 class _CapturingSettlementRepository:
@@ -559,6 +647,7 @@ async def test_remote_image_missing_usage_charges_fallback_not_reservation() -> 
     route = config.endpoints["venice-kimi-k2.6-private"]
     model = config.models[route.model_id]
     payload = _image_payload("https://example.com/image.png", "open-software/auto")
+    _enforce_non_text_output_cap(payload)
     request_bytes = len(json.dumps(payload).encode())
     reservation = _estimate_reservation_cost(
         route,
@@ -592,6 +681,39 @@ async def test_remote_image_missing_usage_charges_fallback_not_reservation() -> 
     assert fallback_charge < reservation
     assert repository.actual_microusd == fallback_charge
     assert accounts.charged_microusd == fallback_charge
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {"total_tokens": 123},
+        {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    ],
+)
+async def test_unbillable_usage_warns_and_charges_fallback(
+    usage: dict[str, int], caplog: pytest.LogCaptureFixture
+) -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    route = config.endpoints["venice-kimi-k2.6-private"]
+    repository = _CapturingSettlementRepository()
+    accounts = _AcceptingSettlementAccounts()
+    request = _settlement_request(repository, accounts)
+    billing = BillingContext("key-1", "bill-1", 100_000, 5_000, None)
+
+    await _settle_billing(
+        request,
+        billing,
+        route,
+        route.model_id,
+        "no-retention",
+        route.id,
+        usage=usage,
+    )
+
+    assert repository.actual_microusd == billing.fallback_charge_microusd
+    assert accounts.charged_microusd == billing.fallback_charge_microusd
+    assert "billing_usage_fallback" in caplog.text
 
 
 @pytest.mark.anyio

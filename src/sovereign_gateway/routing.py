@@ -7,7 +7,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from .config import PRIVACY_LEVELS, Endpoint, GatewayConfig
+from .config import PRIVACY_LEVELS, Endpoint, GatewayConfig, ModelRoute
 
 
 class RoutingError(ValueError):
@@ -56,6 +56,11 @@ INPUT_CAPABILITIES_BY_CONTENT_TYPE = {
     "input_audio": "audio_input",
     "audio_url": "audio_input",
 }
+INPUT_CAPABILITIES_BY_MODALITY = {
+    "image": "vision",
+    "audio": "audio_input",
+    "file": "file_input",
+}
 MANDATORY_INPUT_CAPABILITIES = frozenset(
     {"attachments", *INPUT_CAPABILITIES_BY_CONTENT_TYPE.values()}
 )
@@ -88,7 +93,9 @@ def select_auto_models(
     # UTF-8 bytes are a conservative tokenizer-independent upper bound for
     # byte-fallback model tokenizers, including CJK and large tool schemas.
     prompt_tokens = estimate_bounded_prompt_units(payload)
-    requested_output = payload.get("max_completion_tokens", payload.get("max_tokens", 2048))
+    requested_output = payload.get("max_completion_tokens")
+    if requested_output is None:
+        requested_output = payload.get("max_tokens", 2_048)
     try:
         output_tokens = max(1, int(requested_output))
     except (TypeError, ValueError):
@@ -317,17 +324,22 @@ def route_endpoints(
     candidates = [endpoint for endpoint in candidates if _privacy_matches(endpoint, policy)]
     input_capabilities = policy.required_capabilities.intersection(MANDATORY_INPUT_CAPABILITIES)
     if policy.automatic:
-        required_capabilities = policy.required_capabilities
+        enforced_input_capabilities = input_capabilities
     else:
-        # Explicit model requests retain their established passthrough
-        # behavior. Automatic routing alone makes modality compatibility a
-        # gateway-enforced contract.
-        required_capabilities = policy.required_capabilities - input_capabilities
+        # Preserve passthrough for older explicit models that do not declare
+        # the modality. Once a model declares it, enforce endpoint-level
+        # support because provider deployments can still differ.
+        enforced_input_capabilities = input_capabilities.intersection(
+            _declared_model_input_capabilities(config.models[model_id])
+        )
+    required_capabilities = (policy.required_capabilities - input_capabilities).union(
+        enforced_input_capabilities
+    )
     if not provider_policy.require_parameters:
         # Input modalities are not optional request parameters. Non-text input
-        # must never be sent to an endpoint that has not explicitly declared
-        # support for that modality when the gateway chooses the model.
-        required_capabilities = input_capabilities if policy.automatic else frozenset()
+        # must never be sent to an endpoint that has not declared support when
+        # Auto or the explicitly selected model promises that modality.
+        required_capabilities = enforced_input_capabilities
     if required_capabilities:
         candidates = [
             endpoint
@@ -431,10 +443,7 @@ def _satisfies_minimum_privacy(endpoint: Endpoint, minimum: str) -> bool:
 
 
 def _infer_capabilities(payload: dict[str, Any]) -> frozenset[str]:
-    capabilities: set[str] = set()
-    if payload.get("attachments"):
-        capabilities.add("attachments")
-    capabilities.update(_message_input_capabilities(payload.get("messages")))
+    capabilities = set(_recognized_non_text_inputs(payload))
     if payload.get("tools"):
         capabilities.add("tools")
     if payload.get("tool_choice") is not None:
@@ -446,37 +455,49 @@ def _infer_capabilities(payload: dict[str, Any]) -> frozenset[str]:
     return frozenset(capabilities)
 
 
-def _message_input_capabilities(messages: Any) -> set[str]:
-    capabilities: set[str] = set()
+def _recognized_non_text_inputs(payload: dict[str, Any]) -> tuple[str, ...]:
+    capabilities: list[str] = []
+    if payload.get("attachments"):
+        capabilities.extend(["attachments"] * _attachment_count(payload["attachments"]))
+    messages = payload.get("messages")
     if not isinstance(messages, list):
-        return capabilities
+        return tuple(capabilities)
     for message in messages:
         if not isinstance(message, dict):
             continue
         if message.get("attachments"):
-            capabilities.add("attachments")
+            capabilities.extend(["attachments"] * _attachment_count(message["attachments"]))
         content = message.get("content")
-        if not isinstance(content, list):
-            continue
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            capability = INPUT_CAPABILITIES_BY_CONTENT_TYPE.get(part.get("type"))
-            if capability:
-                capabilities.add(capability)
-    return capabilities
+        parts = content if isinstance(content, list) else [content]
+        for part in parts:
+            if isinstance(part, dict):
+                capability = INPUT_CAPABILITIES_BY_CONTENT_TYPE.get(part.get("type"))
+                if capability:
+                    capabilities.append(capability)
+    return tuple(capabilities)
+
+
+def _declared_model_input_capabilities(model: ModelRoute) -> frozenset[str]:
+    capabilities = set(model.capabilities).intersection(MANDATORY_INPUT_CAPABILITIES)
+    for modality in model.input_modalities:
+        capability = INPUT_CAPABILITIES_BY_MODALITY.get(modality)
+        if capability:
+            capabilities.add(capability)
+    return frozenset(capabilities)
 
 
 def estimate_bounded_prompt_units(payload: dict[str, Any]) -> int:
     """Estimate routing or fallback usage without counting encoded media as text."""
     estimation_payload = _payload_for_token_estimation(payload)
     text_upper_bound = len(json.dumps(estimation_payload, separators=(",", ":")).encode("utf-8"))
-    non_text_allowance = _count_non_text_inputs(payload) * NON_TEXT_INPUT_HEURISTIC_ALLOWANCE
+    non_text_allowance = (
+        len(_recognized_non_text_inputs(payload)) * NON_TEXT_INPUT_HEURISTIC_ALLOWANCE
+    )
     return max(1, text_upper_bound + non_text_allowance)
 
 
 def has_non_text_input(payload: dict[str, Any]) -> bool:
-    return _count_non_text_inputs(payload) > 0
+    return bool(_recognized_non_text_inputs(payload))
 
 
 def _payload_for_token_estimation(payload: dict[str, Any]) -> dict[str, Any]:
@@ -505,21 +526,6 @@ def _sanitize_estimation_value(value: Any) -> Any:
 def _attachment_placeholder(value: Any) -> dict[str, Any]:
     count = len(value) if isinstance(value, (list, tuple)) else 1
     return {"count": count, "input": NON_TEXT_INPUT_PLACEHOLDER}
-
-
-def _count_non_text_inputs(value: Any) -> int:
-    if isinstance(value, dict):
-        if value.get("type") in INPUT_CAPABILITIES_BY_CONTENT_TYPE:
-            return 1
-        return sum(
-            _attachment_count(item)
-            if key == "attachments" and item
-            else _count_non_text_inputs(item)
-            for key, item in value.items()
-        )
-    if isinstance(value, list):
-        return sum(_count_non_text_inputs(item) for item in value)
-    return 0
 
 
 def _attachment_count(value: Any) -> int:

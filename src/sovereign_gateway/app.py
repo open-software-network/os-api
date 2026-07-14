@@ -88,6 +88,7 @@ PACKAGE_DIR = Path(__file__).resolve().parent
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 SITE_AUTH_EXEMPT_PATHS = frozenset({"/healthz", "/readyz", "/v1"})
 DEFAULT_ASR_MODELS = ("nvidia/parakeet-tdt-0.6b-v3",)
+DEFAULT_NON_TEXT_MAX_COMPLETION_TOKENS = 2_048
 MODEL_ALIASES = {
     "zai-org-glm-5-2": "z-ai/glm-5.2",
     "kimi-k2-6": "moonshotai/kimi-k2.6",
@@ -95,6 +96,15 @@ MODEL_ALIASES = {
     "zai-org-glm-5": "z-ai/glm-5.2",
     "nvidia-nemotron-3-nano-30b-a3b": "qwen/qwen-2.5-7b-instruct",
 }
+
+
+def _enforce_non_text_output_cap(payload: dict[str, Any]) -> None:
+    if (
+        has_non_text_input(payload)
+        and payload.get("max_completion_tokens") is None
+        and payload.get("max_tokens") is None
+    ):
+        payload["max_completion_tokens"] = DEFAULT_NON_TEXT_MAX_COMPLETION_TOKENS
 
 
 def _site_auth_protects_path(path: str) -> bool:
@@ -871,6 +881,8 @@ def create_app() -> FastAPI:
                     and isinstance(fallback_models[0], str)
                 ):
                     payload["model"] = fallback_models[0]
+            if isinstance(payload, dict):
+                _enforce_non_text_output_cap(payload)
             parsed = InferenceRequest.model_validate(payload)
         except (json.JSONDecodeError, ValidationError):
             return openai_error(400, "Request body must include a valid model")
@@ -1876,7 +1888,24 @@ async def _settle_billing(
     if not billing or not request.app.state.managed_keys:
         return
     clean_usage = _clean_usage(usage)
-    actual = _actual_cost(route, clean_usage) if clean_usage else billing.fallback_charge_microusd
+    billable_usage = _has_billable_usage(clean_usage)
+    if not billable_usage:
+        logger.warning(
+            json.dumps(
+                {
+                    "severity": "WARNING",
+                    "event": "billing_usage_fallback",
+                    "request_id": request.state.request_id,
+                    "billing_id": billing.billing_id,
+                    "reason": "missing" if usage is None else "unbillable",
+                    "usage_fields": sorted(usage) if usage else [],
+                },
+                separators=(",", ":"),
+            )
+        )
+    actual = (
+        _actual_cost(route, clean_usage) if billable_usage else billing.fallback_charge_microusd
+    )
     event = {
         "request_id": request.state.request_id,
         "model": model,
@@ -2012,7 +2041,9 @@ def _estimate_output_tokens(
     *,
     conservative_non_text: bool,
 ) -> int:
-    requested_output = payload.get("max_completion_tokens", payload.get("max_tokens"))
+    requested_output = payload.get("max_completion_tokens")
+    if requested_output is None:
+        requested_output = payload.get("max_tokens")
     configured_limits = [limit for limit in (context_limit, max_output_length) if limit]
     configured_maximum = min(configured_limits) if configured_limits else None
     try:
@@ -2066,6 +2097,20 @@ def _actual_cost(route: ModelRoute | Endpoint, usage: dict[str, Any]) -> int:
             + 999_999
         )
         // 1_000_000,
+    )
+
+
+def _has_billable_usage(usage: dict[str, int]) -> bool:
+    return any(
+        usage.get(key, 0) > 0
+        for key in (
+            "prompt_tokens",
+            "completion_tokens",
+            "input_tokens",
+            "output_tokens",
+            "cached_tokens",
+            "cache_write_tokens",
+        )
     )
 
 
