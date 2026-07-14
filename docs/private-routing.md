@@ -206,8 +206,8 @@ messages are forbidden in production.
 
 ## Venice compatibility for June
 
-The dormant compatibility surface implements the Venice endpoints consumed by June API: typed
-model catalogs, audio transcription, and augment search/scrape. It is enabled only with
+The dormant compatibility surface implements Venice endpoints consumed by June API: typed model
+catalogs, audio transcription, augment search/scrape, and JSON image generation. It is enabled only with
 `VENICE_COMPAT_ENABLED=true` and only static service API keys may call it. These responses declare
 `X-OS-Billing-Owner: caller`, so June remains the single billing authority during a reversible
 canary. See `docs/os-june-venice-migration.md` for the no-cutover procedure.
