@@ -29,12 +29,13 @@ This repository is an original infrastructure implementation. It does not copy V
 - Live global HTTPS load balancer, Certificate Manager, Cloud Armor, uptime checks, and billing/5xx alerts; direct Cloud Run ingress is blocked
 - Keyless GitHub deployments with a zero-traffic candidate smoke test and digest-pinned promotion
 - Dependency auditing, a lockfile-enforced container build, liveness probes, and warm gateway capacity
+- Optional Intel TDX Confidential Space gateway with digest-bound runtime secret release and public nonce-bound Google attestation
 
 The standard L4 path and strict confidential routing on an Intel TDX node have both been exercised against real GCP resources; see [the live test record](docs/live-test.md). The production H100 + TDX path remains quota-gated.
 
 The API, developer dashboard, and docs are published at `https://api.opensoftware.co`. See [public API usage](docs/public-api.md) for the endpoint, model name, OpenAI client example, and shutdown procedure.
 
-The API does not persist prompts or responses. That is a behavior of this gateway, not a blanket guarantee about every GCP service or a model container you replace it with; see [the threat model](docs/threat-model.md).
+The API does not persist prompts or responses. That is a behavior of this gateway, not a blanket guarantee about every GCP service or a model container you replace it with; see [the threat model](docs/threat-model.md) and [Confidential Space gateway](docs/confidential-gateway.md).
 
 ## API privacy contract
 

@@ -70,6 +70,14 @@ output "production_edge_dns_authorization" {
   value = try(google_certificate_manager_dns_authorization.public_api[0].dns_resource_record[0], null)
 }
 
+output "confidential_gateway_workload_identity_provider" {
+  value = try(google_iam_workload_identity_pool_provider.confidential_gateway[0].name, null)
+}
+
+output "confidential_gateway_approved_image_digest" {
+  value = var.enable_confidential_gateway ? local.confidential_gateway_digest : null
+}
+
 output "github_workload_identity_provider" {
   value = try(google_iam_workload_identity_pool_provider.github[0].name, null)
 }

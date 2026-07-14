@@ -33,8 +33,10 @@ from . import __version__
 from .accounts import AccountsClient, WalletGrant
 from .auth import ApiKeyStore, Principal
 from .catalog import CatalogRefreshError, ProviderCatalog
+from .confidential_runtime import configure_confidential_runtime
 from .config import Endpoint, GatewayConfig, ModelRoute
 from .errors import openai_error
+from .gateway_attestation import GatewayAttestationUnavailable, request_gateway_attestation
 from .managed_keys import (
     KeyUnavailable,
     ManagedKeyRepository,
@@ -296,6 +298,7 @@ def _settings() -> tuple[
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    configure_confidential_runtime()
     config, keys, managed_keys, limiter, redis = _settings()
     app.state.config = config
     app.state.keys = keys
@@ -756,6 +759,49 @@ def create_app() -> FastAPI:
                 "quote_provider": evidence.get("provider"),
                 "quote": evidence.get("quote"),
             }
+        )
+
+    @app.post("/v1/gateway/attestation")
+    async def gateway_attestation(request: Request) -> Response:
+        try:
+            payload = json.loads(await request.body() or b"{}")
+        except json.JSONDecodeError:
+            return openai_error(400, "Request body must be JSON", code="invalid_request")
+        nonce = payload.get("nonce", "")
+        # Confidential Space accepts up to 88 bytes per nonce. Keep the
+        # public contract URL-safe so clients can generate and compare it
+        # without ambiguous encoding rules.
+        if not isinstance(nonce, str) or not re.fullmatch(r"[A-Za-z0-9_-]{10,88}", nonce):
+            return openai_error(
+                400,
+                "nonce must be 10-88 URL-safe characters",
+                code="invalid_nonce",
+            )
+        try:
+            evidence = await request_gateway_attestation(nonce)
+        except GatewayAttestationUnavailable:
+            logger.error(
+                json.dumps(
+                    {
+                        "severity": "ERROR",
+                        "event": "gateway_attestation_unavailable",
+                        "request_id": request.state.request_id,
+                    },
+                    separators=(",", ":"),
+                )
+            )
+            return openai_error(
+                503,
+                "Gateway attestation evidence is unavailable",
+                error_type="server_error",
+                code="gateway_attestation_unavailable",
+            )
+        return JSONResponse(
+            content=evidence.public_dict(),
+            headers={
+                "cache-control": "no-store",
+                "access-control-allow-origin": "*",
+            },
         )
 
     @app.post("/v1/audio/transcriptions")

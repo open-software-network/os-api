@@ -66,6 +66,36 @@ resource "google_compute_security_policy" "public_api" {
 
   rule {
     action      = "rate_based_ban"
+    priority    = 900
+    description = "Protect the public nonce-bound gateway attestation signer from request amplification"
+
+    match {
+      expr {
+        expression = "request.path == '/v1/gateway/attestation'"
+      }
+    }
+
+    rate_limit_options {
+      conform_action = "allow"
+      exceed_action  = "deny(429)"
+      enforce_on_key = "IP"
+
+      rate_limit_threshold {
+        count        = 30
+        interval_sec = 60
+      }
+
+      ban_threshold {
+        count        = 90
+        interval_sec = 60
+      }
+
+      ban_duration_sec = 600
+    }
+  }
+
+  rule {
+    action      = "rate_based_ban"
     priority    = 1000
     description = "Throttle abusive inference traffic and temporarily ban extreme sources; API-key quotas remain authoritative"
 
@@ -119,16 +149,18 @@ resource "google_compute_backend_service" "public_api" {
   security_policy       = google_compute_security_policy.public_api[0].id
 
   backend {
-    group = google_compute_region_network_endpoint_group.public_api[0].id
+    group = var.enable_confidential_gateway ? google_compute_region_instance_group_manager.confidential_gateway_primary[0].instance_group : google_compute_region_network_endpoint_group.public_api[0].id
   }
 
   dynamic "backend" {
     for_each = var.enable_multi_region_control_plane ? [1] : []
 
     content {
-      group = google_compute_region_network_endpoint_group.public_api_secondary[0].id
+      group = var.enable_confidential_gateway ? google_compute_region_instance_group_manager.confidential_gateway_secondary[0].instance_group : google_compute_region_network_endpoint_group.public_api_secondary[0].id
     }
   }
+
+  health_checks = var.enable_confidential_gateway ? [google_compute_health_check.confidential_gateway[0].id] : null
 
   log_config {
     enable      = true

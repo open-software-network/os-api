@@ -71,6 +71,28 @@ variable "enable_public_api" {
   default     = false
 }
 
+variable "enable_confidential_gateway" {
+  description = "Run the public gateway as a measured Confidential Space workload instead of routing requests to Cloud Run. The image must be pinned by sha256 digest."
+  type        = bool
+  default     = false
+}
+
+variable "confidential_gateway_machine_type" {
+  description = "Intel TDX machine type used by each Confidential Space gateway replica."
+  type        = string
+  default     = "c3-standard-4"
+}
+
+variable "confidential_gateway_primary_zone" {
+  type    = string
+  default = "us-central1-a"
+}
+
+variable "confidential_gateway_secondary_zone" {
+  type    = string
+  default = "us-east4-a"
+}
+
 variable "public_api_domain" {
   description = "Public hostname for the API and developer portal."
   type        = string
