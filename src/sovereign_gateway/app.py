@@ -103,17 +103,23 @@ def _enforce_non_text_output_cap(payload: dict[str, Any]) -> None:
         return
     max_completion_tokens = payload.get("max_completion_tokens")
     max_tokens = payload.get("max_tokens")
+    for name, limit in (
+        ("max_completion_tokens", max_completion_tokens),
+        ("max_tokens", max_tokens),
+    ):
+        if limit is not None and (
+            not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0
+        ):
+            raise RoutingError(
+                "invalid_output_limit",
+                f"{name} must be a positive integer for non-text input",
+            )
     if max_completion_tokens is None and max_tokens is None:
         payload["max_completion_tokens"] = DEFAULT_NON_TEXT_MAX_COMPLETION_TOKENS
         return
     if max_completion_tokens is None or max_tokens is None:
         return
     limits = (max_completion_tokens, max_tokens)
-    if any(not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0 for limit in limits):
-        raise RoutingError(
-            "invalid_output_limit",
-            "max_completion_tokens and max_tokens must be positive integers when both are set",
-        )
     payload["max_completion_tokens"] = max(limits)
     payload.pop("max_tokens")
 

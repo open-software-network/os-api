@@ -99,13 +99,14 @@ adds `max_completion_tokens: 2048` to the effective upstream request and reserve
 enforced cap. A valid explicit limit is forwarded unchanged and the reservation is capped at the
 model's configured maximum. If both `max_completion_tokens` and `max_tokens` are set, the gateway
 uses the larger positive integer as the canonical `max_completion_tokens` value and removes
-`max_tokens` before routing, billing, and forwarding. Invalid dual values fail with a 400 response.
-This prevents an upstream provider from honoring a larger alias than the gateway reserved against.
-Nested media content is never rewritten. Settlement uses billable
-prompt/completion usage reported by the upstream provider. Missing usage, `total_tokens` alone, or
-zero-only token fields emit a warning and fall back to the bounded structural estimate plus 4,096
-units per non-text input and the 2,048-token default output estimate. That fallback never exceeds or
-automatically charges the full-context reservation.
+`max_tokens` before routing, billing, and forwarding. Every supplied non-text output limit must be a
+positive, non-boolean integer; invalid single or dual values fail with a 400 response before any
+upstream call. This prevents an upstream provider from honoring a value that the gateway's billing
+estimate parsed or clamped differently. Nested media content is never rewritten. Settlement uses
+billable prompt/completion usage reported by the upstream provider. Missing usage, `total_tokens`
+alone, or zero-only token fields emit a warning and fall back to the bounded structural estimate
+plus 4,096 units per non-text input and the 2,048-token default output estimate. That fallback never
+exceeds or automatically charges the full-context reservation.
 
 The initial score snapshot and its limitations are recorded in
 [`auto-quality-policy.md`](auto-quality-policy.md). The slider is an ordinal product policy, not a

@@ -498,7 +498,41 @@ def test_non_text_invalid_dual_output_limits_fail_closed(
 
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_output_limit"
-    assert "must be positive integers" in response.json()["error"]["message"]
+    assert "must be a positive integer" in response.json()["error"]["message"]
+
+
+@pytest.mark.parametrize("name", ["max_completion_tokens", "max_tokens"])
+@pytest.mark.parametrize("value", [-1, 0, False, 1.5, "1"])
+def test_non_text_invalid_single_output_limit_fails_without_forwarding(
+    routed_client: TestClient,
+    name: str,
+    value: object,
+) -> None:
+    forwarded_before = len(routed_client.app.state.test_payloads)
+
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "open-software/auto",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": {
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.com/image.png"},
+                    },
+                }
+            ],
+            name: value,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_output_limit"
+    assert response.json()["error"]["message"] == (
+        f"{name} must be a positive integer for non-text input"
+    )
+    assert len(routed_client.app.state.test_payloads) == forwarded_before
 
 
 def test_auto_image_input_returns_actionable_error_without_vision_route(
