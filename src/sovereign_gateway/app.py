@@ -55,7 +55,6 @@ from .routing import (
     AUTO_MODEL_IDS,
     EndpointHealth,
     RoutingError,
-    estimate_prompt_tokens,
     parse_routing_policy,
     route_endpoints,
     select_auto_models,
@@ -1909,11 +1908,7 @@ async def _metered_stream(
 def _estimate_cost(
     route: ModelRoute | Endpoint, payload: dict[str, Any], request_bytes: int
 ) -> int:
-    prompt_upper_bound = (
-        estimate_prompt_tokens(payload)
-        if payload.get("model") in AUTO_MODEL_IDS
-        else max(1, request_bytes)
-    )
+    prompt_upper_bound = max(1, request_bytes)
     requested_output = payload.get("max_completion_tokens", payload.get("max_tokens"))
     try:
         output_tokens = int(requested_output) if requested_output is not None else 2_048

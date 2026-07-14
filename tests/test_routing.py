@@ -20,10 +20,10 @@ from sovereign_gateway.app import (
 )
 from sovereign_gateway.config import GatewayConfig
 from sovereign_gateway.routing import (
-    NON_TEXT_INPUT_ESTIMATE_TOKENS,
+    NON_TEXT_INPUT_ROUTING_ALLOWANCE,
     EndpointHealth,
     RoutingError,
-    estimate_prompt_tokens,
+    estimate_auto_context_units,
     parse_routing_policy,
     route_endpoints,
     select_auto_models,
@@ -378,29 +378,29 @@ def test_non_text_estimate_is_size_independent_and_multiplies_per_input() -> Non
 
     small_url = "data:image/png;base64,eA=="
     large_url = "data:image/png;base64," + base64.b64encode(b"x" * 1_000_000).decode()
-    small = estimate_prompt_tokens(payload([small_url]))
-    large = estimate_prompt_tokens(payload([large_url]))
-    two_inputs = estimate_prompt_tokens(payload([small_url, large_url]))
+    small = estimate_auto_context_units(payload([small_url]))
+    large = estimate_auto_context_units(payload([large_url]))
+    two_inputs = estimate_auto_context_units(payload([small_url, large_url]))
 
     assert large == small
-    assert two_inputs >= small + NON_TEXT_INPUT_ESTIMATE_TOKENS
+    assert two_inputs >= small + NON_TEXT_INPUT_ROUTING_ALLOWANCE
 
 
 def test_attachment_estimate_multiplies_per_attachment() -> None:
-    one = estimate_prompt_tokens(
+    one = estimate_auto_context_units(
         {"model": "open-software/auto", "attachments": [{"file_id": "file-1"}]}
     )
-    two = estimate_prompt_tokens(
+    two = estimate_auto_context_units(
         {
             "model": "open-software/auto",
             "attachments": [{"file_id": "file-1"}, {"file_id": "file-2"}],
         }
     )
 
-    assert two >= one + NON_TEXT_INPUT_ESTIMATE_TOKENS
+    assert two >= one + NON_TEXT_INPUT_ROUTING_ALLOWANCE
 
 
-def test_auto_large_image_data_url_does_not_inflate_billing_reservation() -> None:
+def test_auto_large_image_billing_reservation_uses_raw_request_bytes() -> None:
     config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
     route = config.endpoints["venice-kimi-k2.6-private"]
     large_url = "data:image/png;base64," + base64.b64encode(b"x" * 1_000_000).decode()
@@ -418,20 +418,22 @@ def test_auto_large_image_data_url_does_not_inflate_billing_reservation() -> Non
 
     small = payload("data:image/png;base64,eA==")
     large = payload(large_url)
-    explicit = payload(large_url, "moonshotai/kimi-k2.6")
-
-    small_estimate = _estimate_cost(route, small, len(json.dumps(small).encode()))
-    large_estimate = _estimate_cost(route, large, len(json.dumps(large).encode()))
-    explicit_estimate = _estimate_cost(route, explicit, len(json.dumps(explicit).encode()))
-    text_only_estimate = _estimate_cost(
-        route,
-        {"model": "open-software/auto", "messages": [{"role": "user", "content": "x"}]},
+    small_bytes = len(json.dumps(small).encode())
+    large_bytes = len(json.dumps(large).encode())
+    small_estimate = _estimate_cost(route, small, small_bytes)
+    large_estimate = _estimate_cost(route, large, large_bytes)
+    expected_large_estimate = max(
         1,
+        (
+            large_bytes * route.input_price_microusd_per_million
+            + 2_048 * route.output_price_microusd_per_million
+            + 999_999
+        )
+        // 1_000_000,
     )
 
-    assert large_estimate == small_estimate
-    assert large_estimate > text_only_estimate
-    assert explicit_estimate > large_estimate
+    assert large_estimate == expected_large_estimate
+    assert large_estimate > small_estimate
 
 
 @pytest.mark.parametrize(

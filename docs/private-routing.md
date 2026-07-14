@@ -85,11 +85,12 @@ remains text-only in this catalog until its image-input support is independently
 provider or privacy controls exclude every reviewed vision endpoint, the request fails with
 `auto_route_unavailable` instead of sending the image to a text-only route.
 
-Auto's context and billing-reservation estimates substitute bounded placeholders for non-text input
-payloads and attachments. Large base64 data URLs therefore do not consume the text-token estimate,
-while each non-text content part and each attachment adds a fixed 4,096-unit allowance. Multiple
-inputs multiply that allowance. The original request body is forwarded unchanged to the selected
-endpoint, and settlement still uses the upstream provider's reported usage.
+Auto's routing-context heuristic substitutes bounded placeholders for non-text input payloads and
+attachments. Large base64 data URLs therefore do not consume the text-token estimate, while each
+non-text content part and each attachment adds a fixed 4,096-unit routing allowance. Multiple inputs
+multiply that allowance. This heuristic is not used as a billing bound: authorization reserves
+against the full raw request byte size, and settlement uses the upstream provider's reported usage.
+The original request body is forwarded unchanged to the selected endpoint.
 
 The initial score snapshot and its limitations are recorded in
 [`auto-quality-policy.md`](auto-quality-policy.md). The slider is an ordinal product policy, not a
