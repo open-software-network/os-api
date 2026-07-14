@@ -370,6 +370,56 @@ def test_auto_bare_image_content_uses_same_routing_and_billing_detection() -> No
     assert [endpoint.id for endpoint in endpoints] == ["venice-kimi-k2.6-private"]
 
 
+def test_auto_responses_input_image_uses_vision_routing_and_billing_detection() -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    payload = {
+        "model": "open-software/auto",
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Describe this image."},
+                    {
+                        "type": "input_image",
+                        "image_url": "https://example.com/image.png",
+                    },
+                ],
+            }
+        ],
+    }
+
+    _enforce_non_text_output_cap(payload)
+    policy = parse_routing_policy(payload, None)
+    models = select_auto_models(config, policy, EndpointHealth(), payload)
+    endpoints = route_endpoints(config, models[0], policy, EndpointHealth())
+
+    assert payload["max_completion_tokens"] == DEFAULT_NON_TEXT_MAX_COMPLETION_TOKENS
+    assert policy.required_capabilities == frozenset({"vision"})
+    assert models == ["moonshotai/kimi-k2.6"]
+    assert [endpoint.id for endpoint in endpoints] == ["venice-kimi-k2.6-private"]
+
+
+def test_auto_responses_input_file_fails_closed(routed_client: TestClient) -> None:
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "open-software/auto",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_file", "file_id": "file-1"},
+                    ],
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "auto_route_unavailable"
+    assert "required capabilities (file_input)" in response.json()["error"]["message"]
+
+
 def test_non_text_output_cap_is_forwarded_without_rewriting_media(
     routed_client: TestClient,
 ) -> None:

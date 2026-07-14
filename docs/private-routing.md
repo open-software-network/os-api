@@ -48,7 +48,7 @@ Supported provider controls are `order`, `only`, `ignore`, `allow_fallbacks`,
 `regions`. Tool, structured-output, and reasoning parameters automatically become required endpoint
 capabilities. During Auto selection, non-text input modalities are mandatory even when
 `provider.require_parameters` is false. Image-bearing chat content (`image_url` or `input_image`, as
-a content object or list part) requires an endpoint explicitly marked for vision. File parts
+a message content part or under top-level Responses `input`) requires an endpoint explicitly marked for vision. File parts
 (`input_file` or `file`), audio parts (`input_audio` or `audio_url`), and non-empty attachments fail
 closed until an endpoint is explicitly reviewed for the corresponding capability. Explicit models
 that declare a modality also require endpoint-level support; models without that declaration retain

@@ -459,6 +459,7 @@ def _recognized_non_text_inputs(payload: dict[str, Any]) -> tuple[str, ...]:
     capabilities: list[str] = []
     if payload.get("attachments"):
         capabilities.extend(["attachments"] * _attachment_count(payload["attachments"]))
+    capabilities.extend(_content_non_text_inputs(payload.get("input")))
     messages = payload.get("messages")
     if not isinstance(messages, list):
         return tuple(capabilities)
@@ -467,14 +468,23 @@ def _recognized_non_text_inputs(payload: dict[str, Any]) -> tuple[str, ...]:
             continue
         if message.get("attachments"):
             capabilities.extend(["attachments"] * _attachment_count(message["attachments"]))
-        content = message.get("content")
-        parts = content if isinstance(content, list) else [content]
-        for part in parts:
-            if isinstance(part, dict):
-                capability = INPUT_CAPABILITIES_BY_CONTENT_TYPE.get(part.get("type"))
-                if capability:
-                    capabilities.append(capability)
+        capabilities.extend(_content_non_text_inputs(message.get("content")))
     return tuple(capabilities)
+
+
+def _content_non_text_inputs(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [capability for item in value for capability in _content_non_text_inputs(item)]
+    if not isinstance(value, dict):
+        return []
+    capability = INPUT_CAPABILITIES_BY_CONTENT_TYPE.get(value.get("type"))
+    if capability:
+        return [capability]
+    capabilities: list[str] = []
+    if value.get("attachments"):
+        capabilities.extend(["attachments"] * _attachment_count(value["attachments"]))
+    capabilities.extend(_content_non_text_inputs(value.get("content")))
+    return capabilities
 
 
 def _declared_model_input_capabilities(model: ModelRoute) -> frozenset[str]:
