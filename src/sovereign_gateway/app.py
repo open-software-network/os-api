@@ -1958,7 +1958,7 @@ def _compat_video_json_response(status_code: int, body: bytes, headers: dict[str
         content = json.loads(body)
     except (json.JSONDecodeError, UnicodeDecodeError):
         status = status_code
-        if status < 400 or status >= 500 and status != 503:
+        if status < 400 or (status >= 500 and status != 503):
             status = 502
         response = openai_error(
             status,
