@@ -26,6 +26,12 @@ provider-policy privacy guarantee, not a confidential-compute guarantee. Set
 `X-Confidential-Compute: required` when TEE execution is required; it can never downgrade to a
 non-TEE endpoint. The structured policy provides finer control:
 
+This is a deliberate breaking policy change from the earlier TEE-first default, approved on July
+14, 2026. Existing callers that relied on an omitted header as an implicit hardware guarantee must
+send `X-Confidential-Compute: required`. A default request does not fall below zero retention when
+Venice and Phala are unavailable; ordinary standard fallback requires the caller to explicitly set
+`privacy.allow_downgrade: true`.
+
 ```json
 {
   "model": "openai/gpt-oss-20b",
@@ -129,6 +135,11 @@ zero-retention Venice private endpoint first and then a compatible Phala TEE end
 reports the actual privacy level and endpoint in headers. Set the header to `required` when
 confidential compute is mandatory; client-encrypted Venice E2EE routes remain isolated from
 plaintext fallback because their ciphertext and key agreement are endpoint-specific.
+
+Hosted-provider responses expose the exact contract in `X-OS-Privacy-Level`: Venice private reports
+`no-retention`, Phala reports `tee`, and an encrypted Venice route reports `e2ee-tee`. The legacy
+`X-Compute-Privacy` header remains a coarse compute-class field, so Venice private reports
+`standard`; clients must not interpret that field or the default header behavior as TEE evidence.
 
 Semantic model fallback is opt-in through an ordered `models` array. Every model in the array is
 independently filtered by the same privacy, provider, region, price, and capability policy. The

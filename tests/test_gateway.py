@@ -100,6 +100,7 @@ def test_responses_identify_model_revision_when_pinned(
     )
     unpinned = client.post(
         "/v1/chat/completions",
+        headers={"X-Confidential-Compute": "disabled"},
         json={"model": "standard-only", "messages": []},
     )
 
@@ -123,12 +124,29 @@ def test_required_never_downgrades(
     assert not upstream_requests
 
 
-def test_preferred_reports_standard_fallback(
+def test_default_zero_retention_does_not_use_standard_fallback(
     client: TestClient, upstream_requests: list[httpx.Request]
 ) -> None:
     response = client.post(
         "/v1/chat/completions",
         json={"model": "standard-only", "messages": []},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "privacy_requirements_unavailable"
+    assert not upstream_requests
+
+
+def test_explicit_downgrade_reports_standard_fallback(
+    client: TestClient, upstream_requests: list[httpx.Request]
+) -> None:
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "standard-only",
+            "messages": [],
+            "privacy": {"allow_downgrade": True},
+        },
     )
 
     assert response.status_code == 200

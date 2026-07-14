@@ -19,6 +19,7 @@ from sovereign_gateway.app import (
     BillingContext,
     _actual_cost,
     _auto_catalog_model,
+    _endpoint_headers,
     _enforce_non_text_output_cap,
     _estimate_fallback_charge,
     _estimate_reservation_cost,
@@ -1432,9 +1433,19 @@ def test_default_privacy_requires_zero_retention_but_not_tee() -> None:
     required = parse_routing_policy({"model": "openai/gpt-oss-120b"}, "required")
 
     assert preferred.privacy.minimum == "no-retention"
-    assert preferred.privacy.allow_downgrade is True
+    assert preferred.privacy.allow_downgrade is False
     assert required.privacy.minimum == "tee"
     assert required.privacy.allow_downgrade is False
+
+
+def test_venice_private_response_headers_report_non_tee_privacy() -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    endpoint = config.endpoints["venice-glm-5.2-private"]
+
+    headers = _endpoint_headers(endpoint, None)
+
+    assert headers["x-compute-privacy"] == "standard"
+    assert headers["x-os-privacy-level"] == "no-retention"
 
 
 def test_production_auto_slider_is_monotonic_for_quality_and_primary_cost() -> None:

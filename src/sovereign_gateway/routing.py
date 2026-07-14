@@ -241,7 +241,10 @@ def parse_routing_policy(
     minimum = str(privacy_raw.get("minimum", default_minimum))
     if minimum not in PRIVACY_LEVELS:
         raise RoutingError("invalid_privacy_policy", f"Unknown privacy level {minimum!r}")
-    allow_downgrade = bool(privacy_raw.get("allow_downgrade", header == "preferred"))
+    # A caller must explicitly authorize routing below its requested privacy
+    # floor. "preferred" selects the product default; it is not consent to
+    # abandon zero retention when those routes are unavailable.
+    allow_downgrade = bool(privacy_raw.get("allow_downgrade", False))
     # "required" is an unconditional fail-closed override.
     if header == "required":
         allow_downgrade = False
