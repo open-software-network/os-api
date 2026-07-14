@@ -1283,7 +1283,11 @@ def create_app() -> FastAPI:
             return openai_error(413, "Request body is too large", code="request_too_large")
         try:
             payload = json.loads(raw)
+            if isinstance(payload, dict):
+                _enforce_non_text_output_cap(payload)
             parsed = InferenceRequest.model_validate(payload)
+        except RoutingError as exc:
+            return openai_error(400, str(exc), code=exc.code)
         except (json.JSONDecodeError, ValidationError):
             return openai_error(400, "Request body must include a valid model")
 
