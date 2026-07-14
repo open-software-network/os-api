@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 
 from sovereign_gateway.app import (
     _actual_cost,
+    _auto_catalog_model,
     _validate_client_encryption_key,
     create_app,
 )
@@ -274,6 +275,63 @@ def test_auto_filters_models_that_lack_required_tools(routed_client: TestClient)
 
     assert response.status_code == 200
     assert response.headers["x-os-auto-selected-model"] == "openai/gpt-oss-20b"
+
+
+@pytest.mark.parametrize(
+    "image_part",
+    [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,aW1hZ2U="}},
+        {"type": "input_image", "image_url": "data:image/png;base64,aW1hZ2U="},
+    ],
+)
+def test_auto_image_input_selects_only_verified_vision_route(image_part: dict[str, object]) -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    payload = {
+        "model": "open-software/auto",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image."},
+                    image_part,
+                ],
+            }
+        ],
+        # Image compatibility remains mandatory because it is an input
+        # modality, even when optional parameter filtering is disabled.
+        "provider": {"require_parameters": False},
+    }
+    policy = parse_routing_policy(payload, None)
+
+    models = select_auto_models(config, policy, EndpointHealth(), payload)
+    endpoints = route_endpoints(config, models[0], policy, EndpointHealth())
+
+    assert policy.required_capabilities == frozenset({"vision"})
+    assert models == ["moonshotai/kimi-k2.6"]
+    assert [endpoint.id for endpoint in endpoints] == ["venice-kimi-k2.6-private"]
+
+
+def test_auto_image_input_returns_actionable_error_without_vision_route(
+    routed_client: TestClient,
+) -> None:
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "open-software/auto",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+                    ],
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "auto_route_unavailable"
+    assert "required capabilities (vision)" in response.json()["error"]["message"]
 
 
 def test_auto_forwards_hermes_shape_with_selected_model(routed_client: TestClient) -> None:
@@ -606,6 +664,20 @@ def test_venice_catalog_shape_supports_june_bootstrap(routed_client: TestClient)
     assert asr_models.status_code == 200
     assert asr_models.json()["data"][0]["type"] == "asr"
     assert asr_models.json()["data"][0]["model_spec"]["pricing"]["per_audio_second"]
+
+
+def test_production_auto_catalog_advertises_guaranteed_image_input() -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+
+    auto = _auto_catalog_model(config, created=0)
+    kimi = config.models["moonshotai/kimi-k2.6"]
+
+    assert auto["architecture"]["input_modalities"] == ["text", "image"]
+    assert auto["model_spec"]["capabilities"]["supportsVision"] is True
+    assert kimi.input_modalities == ("text", "image")
+    assert "vision" in kimi.capabilities
+    assert "vision" not in config.endpoints["phala-kimi-k2.6"].capabilities
+    assert "vision" in config.endpoints["venice-kimi-k2.6-private"].capabilities
 
 
 def test_audio_transcription_matches_venice_upstream_contract(routed_client: TestClient) -> None:

@@ -110,6 +110,8 @@ def _asr_models() -> tuple[str, ...]:
 
 def _venice_capabilities(capabilities: frozenset[str]) -> dict[str, bool]:
     names: dict[str, bool] = {}
+    if "vision" in capabilities:
+        names["supportsVision"] = True
     if "tools" in capabilities:
         names["supportsFunctionCalling"] = True
     if "reasoning" in capabilities:
@@ -123,6 +125,20 @@ def _venice_capabilities(capabilities: frozenset[str]) -> dict[str, bool]:
 def _auto_catalog_model(config: GatewayConfig, created: int) -> dict[str, Any]:
     # June owns billing on the compatibility path, so advertise conservative
     # maximum rates. Actual provider cost can only be lower than its hold.
+    supports_vision = any(
+        "vision" in endpoint.capabilities
+        for model in config.models.values()
+        if model.quality_score is not None
+        for endpoint in config.endpoints_for(model.id)
+    )
+    capabilities = {
+        "supportsFunctionCalling": True,
+        "supportsReasoning": True,
+        "supportsReasoningEffort": True,
+        "supportsResponseSchema": True,
+    }
+    if supports_vision:
+        capabilities["supportsVision"] = True
     return {
         "id": "open-software/auto",
         "object": "model",
@@ -131,7 +147,10 @@ def _auto_catalog_model(config: GatewayConfig, created: int) -> dict[str, Any]:
         "owned_by": "open-software",
         "description": "Privacy-safe automatic cost and quality routing",
         "supported_parameters": ["auto.cost_quality", "privacy", "provider"],
-        "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
+        "architecture": {
+            "input_modalities": ["text", "image"] if supports_vision else ["text"],
+            "output_modalities": ["text"],
+        },
         "model_spec": {
             "name": "Automatic private model",
             "description": "Automatically selects an eligible private model",
@@ -168,12 +187,7 @@ def _auto_catalog_model(config: GatewayConfig, created: int) -> dict[str, Any]:
                 ),
                 default=32_768,
             ),
-            "capabilities": {
-                "supportsFunctionCalling": True,
-                "supportsReasoning": True,
-                "supportsReasoningEffort": True,
-                "supportsResponseSchema": True,
-            },
+            "capabilities": capabilities,
             "traits": ["automatic"],
             "offline": False,
         },

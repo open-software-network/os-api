@@ -68,6 +68,7 @@ async def main() -> int:
             cache_read = _usd_price(pricing, "cache_input")
             context_length = int(model.get("model_spec", {}).get("availableContextTokens", 0))
             live_capabilities = {
+                "vision": bool(capabilities.get("supportsVision")),
                 "tools": bool(capabilities.get("supportsFunctionCalling")),
                 "tool_choice": bool(capabilities.get("supportsFunctionCalling")),
                 "structured_outputs": bool(capabilities.get("supportsResponseSchema")),

@@ -46,7 +46,8 @@ The structured policy provides finer control:
 Supported provider controls are `order`, `only`, `ignore`, `allow_fallbacks`,
 `require_parameters`, `sort` (`priority`, `price`, `latency`, or `throughput`), `max_price`, and
 `regions`. Tool, structured-output, and reasoning parameters automatically become required endpoint
-capabilities.
+capabilities. Image-bearing chat content (`image_url` or `input_image` parts) requires an endpoint
+explicitly marked for vision, even when `provider.require_parameters` is false.
 
 ## Automatic model selection
 
@@ -73,6 +74,12 @@ not provider marketing labels. Models without a score are excluded from automati
 catalog release must update scores only from a documented evaluation snapshot and rerun the router
 regression suite. Explicit model IDs remain available when reproducibility matters more than
 automatic optimization.
+
+For image input, Auto removes text-only models and endpoints before cost/quality ranking. The
+initial reviewed vision route is Venice's private Kimi K2.6 endpoint. The Phala Kimi K2.6 endpoint
+remains text-only in this catalog until its image-input support is independently confirmed. If
+provider or privacy controls exclude every reviewed vision endpoint, the request fails with
+`auto_route_unavailable` instead of sending the image to a text-only route.
 
 The initial score snapshot and its limitations are recorded in
 [`auto-quality-policy.md`](auto-quality-policy.md). The slider is an ordinal product policy, not a

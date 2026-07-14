@@ -60,7 +60,8 @@ models:
     # Venice's private endpoint advertises 256,000 tokens.
     max_context_length: 256000
     max_output_length: 256000
-    capabilities: [tools, tool_choice, structured_outputs, reasoning]
+    capabilities: [vision, tools, tool_choice, structured_outputs, reasoning]
+    input_modalities: [text, image]
 
 endpoints:
   phala-gpt-oss-20b:
@@ -370,7 +371,7 @@ endpoints:
     provider: venice
     upstream_model: kimi-k2-6
     priority: 100
-    capabilities: [tools, tool_choice, structured_outputs, reasoning]
+    capabilities: [vision, tools, tool_choice, structured_outputs, reasoning]
     privacy:
       level: no-retention
       execution: standard

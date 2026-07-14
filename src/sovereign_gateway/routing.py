@@ -99,8 +99,15 @@ def select_auto_models(
         )
         ranked.append((model_id, model.quality_score, float(cost)))
     if not ranked:
+        capability_detail = ""
+        if policy.required_capabilities:
+            capability_detail = (
+                f" with required capabilities ({', '.join(sorted(policy.required_capabilities))})"
+            )
         raise RoutingError(
-            "auto_route_unavailable", "No scored model satisfies the request policy and context"
+            "auto_route_unavailable",
+            f"No scored model has an endpoint{capability_detail} satisfying the request policy "
+            "and context",
         )
     qualities = [item[1] for item in ranked]
     costs = [item[2] for item in ranked]
@@ -289,12 +296,19 @@ def route_endpoints(
             )
         ]
     candidates = [endpoint for endpoint in candidates if _privacy_matches(endpoint, policy)]
-    if provider_policy.require_parameters:
+    required_capabilities = policy.required_capabilities
+    if not provider_policy.require_parameters:
+        # Vision is an input modality, not an optional request parameter. An
+        # image-bearing request must never be sent to a text-only endpoint.
+        required_capabilities = required_capabilities.intersection({"vision"})
+    if required_capabilities:
         candidates = [
             endpoint
             for endpoint in candidates
-            if policy.required_capabilities.issubset(
-                endpoint.capabilities or config.models[model_id].capabilities
+            if _supports_capabilities(
+                endpoint,
+                config.models[model_id].capabilities,
+                required_capabilities,
             )
         ]
     if provider_policy.max_input_price_microusd_per_million is not None:
@@ -390,6 +404,8 @@ def _satisfies_minimum_privacy(endpoint: Endpoint, minimum: str) -> bool:
 
 def _infer_capabilities(payload: dict[str, Any]) -> frozenset[str]:
     capabilities: set[str] = set()
+    if _has_image_content(payload.get("messages")):
+        capabilities.add("vision")
     if payload.get("tools"):
         capabilities.add("tools")
     if payload.get("tool_choice") is not None:
@@ -399,6 +415,37 @@ def _infer_capabilities(payload: dict[str, Any]) -> frozenset[str]:
     if payload.get("reasoning") is not None or payload.get("reasoning_effort") is not None:
         capabilities.add("reasoning")
     return frozenset(capabilities)
+
+
+def _has_image_content(messages: Any) -> bool:
+    if not isinstance(messages, list):
+        return False
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        if any(
+            isinstance(part, dict) and part.get("type") in {"image_url", "input_image"}
+            for part in content
+        ):
+            return True
+    return False
+
+
+def _supports_capabilities(
+    endpoint: Endpoint,
+    model_capabilities: frozenset[str],
+    required_capabilities: frozenset[str],
+) -> bool:
+    # Vision is endpoint-specific: a multimodal model may be exposed through
+    # another provider or deployment that accepts text only. Other capability
+    # declarations retain the legacy model-level fallback.
+    if "vision" in required_capabilities and "vision" not in endpoint.capabilities:
+        return False
+    remaining = required_capabilities - {"vision"}
+    return remaining.issubset(endpoint.capabilities or model_capabilities)
 
 
 def _strings(value: Any, name: str) -> tuple[str, ...]:
