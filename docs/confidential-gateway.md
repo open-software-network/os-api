@@ -56,9 +56,14 @@ development evidence. Responses use `Cache-Control: no-store`.
    digest in `confidential_gateway_additional_image_digests`. Roll and verify the
    primary managed instance group through the isolated staging load balancer,
    then roll the secondary group.
-4. Verify the public source, health checks, load behavior, and fresh evidence
-   before shifting user traffic.
-5. Remove the old digest from `confidential_gateway_additional_image_digests`
+4. Create and warm the separate `os-api-edge-confidential` backend service.
+   Verify both regional backends are healthy and exercise fresh evidence before
+   changing the production URL map. Do not replace the Cloud Run backends on
+   `os-api-edge`; they remain warm for rollback.
+5. Shift traffic by changing only the production URL map's default service.
+   If public probes fail, point the URL map back to `os-api-edge`; neither
+   backend service needs to be rebuilt or mutated during the rollback.
+6. Remove the old digest from `confidential_gateway_additional_image_digests`
    and apply again. Steady state authorizes only `gateway_image`.
 
 Cloud Run remains the default until the switch is enabled. This change does not
