@@ -16,6 +16,10 @@
 - API keys are compared as SHA-256 digests and are not stored in plaintext by the gateway.
 - Hosted endpoints are filtered by the requested privacy and capability policy before health or
   price ranking; same-model fallback cannot silently weaken a fail-closed request.
+- When the Confidential Space deployment is enabled, provider keys are released only to a stable,
+  non-debug Intel TDX workload running the exact approved os-api image digest.
+- Any user can request fresh nonce-bound Google Cloud Attestation evidence from
+  `POST /v1/gateway/attestation`; local and ordinary-VM deployments fail closed.
 
 ## Claims it cannot make yet
 
@@ -46,7 +50,7 @@
 ## Required production controls
 
 1. Pin all deployed images by digest, sign them, and enforce signatures with Binary Authorization.
-2. Use an attestation policy bound to the exact workload image digest before releasing model or decryption keys. Confidential Space is a strong option when externally verifiable single-workload attestation matters more than Kubernetes orchestration.
+2. Keep the Confidential Space workload identity condition and June verifier pinned to the exact promoted image digest. Treat any digest drift as a failed deployment, not an automatic upgrade.
 3. Disable body capture at the HTTPS edge, APM, service mesh, exception tracker, and vLLM layer—not only in this gateway.
 4. Use VPC Service Controls, private nodes, egress allowlists, and separate service accounts per workload.
 5. Rotate tenant and upstream keys; support immediate revocation through a control-plane datastore/cache.

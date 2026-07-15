@@ -6,7 +6,7 @@
 flowchart LR
   C["API client"] --> E["Global HTTPS load balancer"]
   E --> A["Cloud Armor abuse controls"]
-  A --> G["Cloud Run gateway"]
+  A --> G["Confidential Space gateway"]
   G --> R["Memorystore rate limits"]
   G --> F["Firestore keys and usage"]
   G --> O["OpenSoftware Accounts wallet"]
@@ -30,9 +30,11 @@ gateway.
 
 ## Trust boundaries
 
-- Certificate Manager terminates public TLS at the global load balancer. Cloud Armor applies an approximate source-IP throttle without inspecting prompt bodies. Cloud Run ingress rejects direct internet paths after edge cutover.
+- Certificate Manager terminates public TLS at the global load balancer. Cloud Armor applies an approximate source-IP throttle without inspecting prompt bodies. Production can route to regional Confidential Space managed instance groups; Cloud Run remains the migration fallback.
+- The gateway runtime is pinned by image digest. Google Cloud Attestation releases its runtime identity only to a stable, non-debug Intel TDX Confidential Space workload with that exact digest.
 - The gateway authenticates tenant keys, applies request limits, makes the privacy decision, and streams bytes. It intentionally has no prompt database.
 - Hosted provider credentials come from Secret Manager and are never exposed to API clients.
+- The bootstrap identity cannot read hosted provider credentials. Secret Manager access is available only after attestation-bound runtime service-account impersonation.
 - Provider evidence is recorded as present or missing until cryptographic verification succeeds;
   the gateway does not equate an evidence header with verified attestation.
 - Standard vLLM nodes protect data at rest and in transit but do not provide memory encryption against the cloud/hypervisor boundary.
