@@ -15,13 +15,16 @@ load balancer keeps the same public API surface.
 
 The bootstrap VM service account can pull the pinned container and write logs,
 but it cannot read runtime secrets. Google Cloud Attestation accepts only a
-stable, non-debug Confidential Space workload on Intel TDX with the exact
-`gateway_image` digest. Only that attested identity may impersonate the runtime
-service account. The application then reads provider credentials and config
-from Secret Manager before it starts serving.
+stable, non-debug Confidential Space workload on Intel TDX launched with that
+dedicated bootstrap service account. An identity that passes that hardware
+policy may impersonate the runtime service account. The application then reads
+provider credentials and config from Secret Manager before it starts serving.
 
-An image tag, debug workload, different digest, ordinary VM, or unavailable
-attestation service cannot obtain runtime credentials.
+A debug workload, ordinary VM, workload using another bootstrap identity, or
+unavailable attestation service cannot obtain runtime credentials. The policy
+does not pin one application image digest. Instead, each immutable deployment
+publishes its actual digest in the public attestation so changes are independently
+visible without coordinating releases with June or Chat.
 
 ## Public verification
 

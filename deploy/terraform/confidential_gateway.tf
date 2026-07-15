@@ -74,7 +74,6 @@ resource "google_iam_workload_identity_pool_provider" "confidential_gateway" {
     "assertion.dbgstat == 'disabled-since-boot'",
     "assertion.hwmodel == 'GCP_INTEL_TDX'",
     "'STABLE' in assertion.submods.confidential_space.support_attributes",
-    "assertion.submods.container.image_digest == '${local.confidential_gateway_digest}'",
     "'${google_service_account.confidential_gateway_bootstrap[0].email}' in assertion.google_service_accounts",
   ])
 
@@ -88,7 +87,7 @@ resource "google_service_account_iam_member" "confidential_gateway_impersonates_
   count              = var.enable_confidential_gateway ? 1 : 0
   service_account_id = google_service_account.api_runtime.name
   role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.confidential_gateway[0].name}/attribute.image_digest/${local.confidential_gateway_digest}"
+  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.confidential_gateway[0].name}/*"
 }
 
 locals {

@@ -17,7 +17,7 @@
 - Hosted endpoints are filtered by the requested privacy and capability policy before health or
   price ranking; same-model fallback cannot silently weaken a fail-closed request.
 - When the Confidential Space deployment is enabled, provider keys are released only to a stable,
-  non-debug Intel TDX workload running the exact approved os-api image digest.
+  non-debug Intel TDX workload launched with the dedicated bootstrap service account.
 - Any user can request fresh nonce-bound Google Cloud Attestation evidence from
   `POST /v1/gateway/attestation`; local and ordinary-VM deployments fail closed.
 
@@ -27,6 +27,9 @@
   chain. Evidence is conservatively reported as present or missing until a verifier establishes
   freshness, measurements, and signing-key binding.
 - Protection from a malicious application image. A TEE protects the workload boundary; it does not make vulnerable or exfiltrating code safe.
+- Prevention of an authorized operator launching a different image under the same attested
+  hardware policy. The public attestation exposes that image digest so independent monitors can
+  detect the change, but secret release does not pin one application digest.
 - Guaranteed deletion from GPU/CPU memory at a user-selected instant.
 - Anonymity from network metadata, tenant usage records, abuse systems, or billing systems.
 - High availability for confidential H100 inference. Current GCP H100 confidential nodes require interruptible provisioning and quota/capacity planning.
@@ -50,7 +53,7 @@
 ## Required production controls
 
 1. Pin all deployed images by digest, sign them, and enforce signatures with Binary Authorization.
-2. Keep the Confidential Space workload identity condition and June verifier pinned to the exact promoted image digest. Treat any digest drift as a failed deployment, not an automatic upgrade.
+2. Monitor the public Confidential Space evidence and alert when its image digest changes outside an approved deployment. Do not make another product's availability depend on that digest.
 3. Disable body capture at the HTTPS edge, APM, service mesh, exception tracker, and vLLM layer—not only in this gateway.
 4. Use VPC Service Controls, private nodes, egress allowlists, and separate service accounts per workload.
 5. Rotate tenant and upstream keys; support immediate revocation through a control-plane datastore/cache.
