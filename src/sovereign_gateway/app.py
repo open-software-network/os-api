@@ -818,13 +818,14 @@ def create_app() -> FastAPI:
             )
         try:
             evidence = await request_gateway_attestation(nonce)
-        except GatewayAttestationUnavailable:
+        except GatewayAttestationUnavailable as exc:
             logger.error(
                 json.dumps(
                     {
                         "severity": "ERROR",
                         "event": "gateway_attestation_unavailable",
                         "request_id": request.state.request_id,
+                        "reason": str(exc) or "unspecified",
                     },
                     separators=(",", ":"),
                 )
