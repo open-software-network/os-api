@@ -151,7 +151,6 @@ resource "google_compute_backend_service" "public_api" {
   port_name             = "http"
   load_balancing_scheme = "EXTERNAL_MANAGED"
   security_policy       = google_compute_security_policy.public_api[0].id
-  timeout_sec           = 620
 
   backend {
     group = google_compute_region_network_endpoint_group.public_api[0].id
