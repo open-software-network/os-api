@@ -72,7 +72,13 @@ variable "enable_public_api" {
 }
 
 variable "enable_confidential_gateway" {
-  description = "Run the public gateway as a measured Confidential Space workload instead of routing requests to Cloud Run. The image must be pinned by sha256 digest."
+  description = "Provision the measured Confidential Space gateway stack. The image must be pinned by sha256 digest. This does not route public traffic."
+  type        = bool
+  default     = false
+}
+
+variable "route_public_api_to_confidential_gateway" {
+  description = "Route the production public URL map to the already-provisioned Confidential Space backend. Set false for an atomic rollback to warm Cloud Run without destroying confidential infrastructure."
   type        = bool
   default     = false
 }

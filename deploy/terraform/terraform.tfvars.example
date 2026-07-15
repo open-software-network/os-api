@@ -18,6 +18,11 @@ confidential_gateway_additional_image_digests = []
 # Enable only after populating the Cloud Run model, API-key, and Redis secrets.
 enable_public_api = false
 
+# Provisioning and traffic are independent so rollback never destroys the
+# measured gateway stack. Warm and verify it before enabling public routing.
+enable_confidential_gateway              = false
+route_public_api_to_confidential_gateway = false
+
 # Production control-plane defaults. Leave the legacy mapping enabled until the
 # Certificate Manager DNS authorization has issued and the edge IP is live.
 enable_production_edge       = false
