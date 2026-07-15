@@ -66,8 +66,9 @@ resource "google_iam_workload_identity_pool_provider" "confidential_gateway" {
   display_name                       = "Google Cloud Attestation"
 
   attribute_mapping = {
-    "google.subject"         = "assertion.submods.container.image_digest"
-    "attribute.image_digest" = "assertion.submods.container.image_digest"
+    "google.subject"                      = "assertion.submods.container.image_digest"
+    "attribute.image_digest"              = "assertion.submods.container.image_digest"
+    "attribute.bootstrap_service_account" = "'${google_service_account.confidential_gateway_bootstrap[0].email}' in assertion.google_service_accounts ? '${google_service_account.confidential_gateway_bootstrap[0].email}' : ''"
   }
   attribute_condition = join(" && ", [
     "assertion.swname == 'CONFIDENTIAL_SPACE'",
@@ -87,7 +88,17 @@ resource "google_service_account_iam_member" "confidential_gateway_impersonates_
   count              = var.enable_confidential_gateway ? 1 : 0
   service_account_id = google_service_account.api_runtime.name
   role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.confidential_gateway[0].name}/*"
+  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.confidential_gateway[0].name}/attribute.bootstrap_service_account/${google_service_account.confidential_gateway_bootstrap[0].email}"
+}
+
+check "confidential_runtime_impersonation_is_bootstrap_scoped" {
+  assert {
+    condition = !var.enable_confidential_gateway || endswith(
+      google_service_account_iam_member.confidential_gateway_impersonates_runtime[0].member,
+      "/attribute.bootstrap_service_account/${google_service_account.confidential_gateway_bootstrap[0].email}",
+    )
+    error_message = "Confidential runtime impersonation must stay scoped to the attested bootstrap service-account attribute."
+  }
 }
 
 locals {
