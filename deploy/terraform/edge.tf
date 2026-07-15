@@ -1,3 +1,7 @@
+locals {
+  use_confidential_public_api = var.enable_public_api && var.enable_production_edge && var.enable_confidential_gateway
+}
+
 resource "google_compute_global_address" "public_api" {
   count = var.enable_public_api && var.enable_production_edge ? 1 : 0
 
@@ -147,6 +151,7 @@ resource "google_compute_backend_service" "public_api" {
   port_name             = "http"
   load_balancing_scheme = "EXTERNAL_MANAGED"
   security_policy       = google_compute_security_policy.public_api[0].id
+  timeout_sec           = 620
 
   backend {
     group = google_compute_region_network_endpoint_group.public_api[0].id
@@ -167,7 +172,7 @@ resource "google_compute_backend_service" "public_api" {
 }
 
 resource "google_compute_backend_service" "confidential_public_api" {
-  count = var.enable_public_api && var.enable_production_edge && var.enable_confidential_gateway ? 1 : 0
+  count = local.use_confidential_public_api ? 1 : 0
 
   name                  = "os-api-edge-confidential"
   protocol              = "HTTP"
@@ -204,7 +209,7 @@ resource "google_compute_url_map" "public_api" {
   count = var.enable_public_api && var.enable_production_edge ? 1 : 0
 
   name            = "os-api-edge"
-  default_service = var.enable_confidential_gateway ? google_compute_backend_service.confidential_public_api[0].id : google_compute_backend_service.public_api[0].id
+  default_service = local.use_confidential_public_api ? google_compute_backend_service.confidential_public_api[0].id : google_compute_backend_service.public_api[0].id
 }
 
 resource "google_compute_target_https_proxy" "public_api" {
