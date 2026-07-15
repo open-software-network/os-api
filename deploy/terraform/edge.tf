@@ -149,22 +149,50 @@ resource "google_compute_backend_service" "public_api" {
   security_policy       = google_compute_security_policy.public_api[0].id
 
   backend {
-    group           = var.enable_confidential_gateway ? google_compute_region_instance_group_manager.confidential_gateway_primary[0].instance_group : google_compute_region_network_endpoint_group.public_api[0].id
-    balancing_mode  = var.enable_confidential_gateway ? "UTILIZATION" : null
-    max_utilization = var.enable_confidential_gateway ? 0.8 : null
+    group = google_compute_region_network_endpoint_group.public_api[0].id
   }
 
   dynamic "backend" {
     for_each = var.enable_multi_region_control_plane ? [1] : []
 
     content {
-      group           = var.enable_confidential_gateway ? google_compute_region_instance_group_manager.confidential_gateway_secondary[0].instance_group : google_compute_region_network_endpoint_group.public_api_secondary[0].id
-      balancing_mode  = var.enable_confidential_gateway ? "UTILIZATION" : null
-      max_utilization = var.enable_confidential_gateway ? 0.8 : null
+      group = google_compute_region_network_endpoint_group.public_api_secondary[0].id
     }
   }
 
-  health_checks = var.enable_confidential_gateway ? [google_compute_health_check.confidential_gateway[0].id] : null
+  log_config {
+    enable      = true
+    sample_rate = 1
+  }
+}
+
+resource "google_compute_backend_service" "confidential_public_api" {
+  count = var.enable_public_api && var.enable_production_edge && var.enable_confidential_gateway ? 1 : 0
+
+  name                  = "os-api-edge-confidential"
+  protocol              = "HTTP"
+  port_name             = "http"
+  load_balancing_scheme = "EXTERNAL_MANAGED"
+  security_policy       = google_compute_security_policy.public_api[0].id
+  timeout_sec           = 620
+
+  backend {
+    group           = google_compute_region_instance_group_manager.confidential_gateway_primary[0].instance_group
+    balancing_mode  = "UTILIZATION"
+    max_utilization = 0.8
+  }
+
+  dynamic "backend" {
+    for_each = var.enable_multi_region_control_plane ? [1] : []
+
+    content {
+      group           = google_compute_region_instance_group_manager.confidential_gateway_secondary[0].instance_group
+      balancing_mode  = "UTILIZATION"
+      max_utilization = 0.8
+    }
+  }
+
+  health_checks = [google_compute_health_check.confidential_gateway[0].id]
 
   log_config {
     enable      = true
@@ -176,7 +204,7 @@ resource "google_compute_url_map" "public_api" {
   count = var.enable_public_api && var.enable_production_edge ? 1 : 0
 
   name            = "os-api-edge"
-  default_service = google_compute_backend_service.public_api[0].id
+  default_service = var.enable_confidential_gateway ? google_compute_backend_service.confidential_public_api[0].id : google_compute_backend_service.public_api[0].id
 }
 
 resource "google_compute_target_https_proxy" "public_api" {
