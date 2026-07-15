@@ -61,6 +61,11 @@ async def docs(request: Request) -> Response:
     return _html("docs.html", request=request, models=list(config.models.values()))
 
 
+@router.get("/verify", response_class=HTMLResponse, include_in_schema=False)
+async def verify(request: Request) -> Response:
+    return _html("verify.html", request=request)
+
+
 @router.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
 async def dashboard(request: Request) -> Response:
     session = await _session(request)

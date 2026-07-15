@@ -1,10 +1,10 @@
 # Attested Confidential Space gateway
 
 Production can run os-api as a Google Cloud Confidential Space workload instead
-of Cloud Run. The chain is:
+of Cloud Run. This deployment is verified independently:
 
 ```text
-June client -> attested June API -> attested os-api gateway -> private or attested model
+caller -> attested os-api gateway -> selected model provider
 ```
 
 The Terraform `enable_confidential_gateway` switch creates regional managed
@@ -34,12 +34,13 @@ curl https://api.opensoftware.co/v1/gateway/attestation \
   -d '{"nonce":"replace-with-a-fresh-random-nonce"}'
 ```
 
-The response contains a Google Cloud Attestation OIDC token bound to that nonce
-and the June gateway audience. A verifier must check Google's signature,
+The response contains a Google Cloud Attestation OIDC token bound to that nonce.
+Its audience retains the legacy `https://june-api.opensoftware.co/os-api-gateway`
+value for compatibility, but verification does not depend on June. A verifier
+must check Google's signature,
 expiration, issuer, audience, nonce, `CONFIDENTIAL_SPACE`, debug-disabled state,
 Intel TDX hardware, `STABLE` support attribute, and the exact approved image
-digest. June API performs all of those checks and exposes an in-browser verifier
-on its `/verify` page.
+digest. The API's public `/verify` page links this evidence and the public source.
 
 The endpoint returns `503` outside Confidential Space. It never manufactures
 development evidence. Responses use `Cache-Control: no-store`.
@@ -50,8 +51,8 @@ development evidence. Responses use `Cache-Control: no-store`.
 2. Set `gateway_image` to that digest and enable `enable_confidential_gateway`.
 3. Apply Terraform and wait for both regional managed instance groups to pass
    the private health check.
-4. Enable June's gateway policy with the same digest.
-5. Verify from June's `/verify` page before shifting user traffic.
+4. Verify the public source and request fresh evidence from the candidate.
+5. Shift user traffic only after health checks and verification pass.
 
 Cloud Run remains the default until the switch is enabled. This change does not
 deploy production by itself.
