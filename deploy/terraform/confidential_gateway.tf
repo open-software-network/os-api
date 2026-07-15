@@ -1,5 +1,9 @@
 locals {
   confidential_gateway_digest = try(regex("sha256:[0-9a-f]{64}$", var.gateway_image), "")
+  confidential_gateway_allowed_image_digests = sort(distinct(concat(
+    [local.confidential_gateway_digest],
+    tolist(var.confidential_gateway_additional_image_digests),
+  )))
   confidential_secret_environment = jsonencode({
     API_KEY_HASHES           = "gateway-api-key-hashes"
     REDIS_URL                = "gateway-redis-url"
@@ -30,8 +34,12 @@ locals {
 
 check "confidential_gateway_image_is_pinned" {
   assert {
-    condition     = !var.enable_confidential_gateway || local.confidential_gateway_digest != ""
-    error_message = "Confidential Space requires gateway_image to be pinned by a sha256 digest."
+    condition = !var.enable_confidential_gateway || (
+      local.confidential_gateway_digest != "" && alltrue([
+        for digest in var.confidential_gateway_additional_image_digests : can(regex("^sha256:[0-9a-f]{64}$", digest))
+      ])
+    )
+    error_message = "Confidential Space requires gateway_image and every temporary additional image to be pinned by a sha256 digest."
   }
 }
 
@@ -74,7 +82,9 @@ resource "google_iam_workload_identity_pool_provider" "confidential_gateway" {
     "assertion.dbgstat == 'disabled-since-boot'",
     "assertion.hwmodel == 'GCP_INTEL_TDX'",
     "'STABLE' in assertion.submods.confidential_space.support_attributes",
-    "assertion.submods.container.image_digest == '${local.confidential_gateway_digest}'",
+    format("(%s)", join(" || ", [
+      for digest in local.confidential_gateway_allowed_image_digests : "assertion.submods.container.image_digest == '${digest}'"
+    ])),
     "'${google_service_account.confidential_gateway_bootstrap[0].email}' in assertion.google_service_accounts",
   ])
 
@@ -85,10 +95,18 @@ resource "google_iam_workload_identity_pool_provider" "confidential_gateway" {
 }
 
 resource "google_service_account_iam_member" "confidential_gateway_impersonates_runtime" {
-  count              = var.enable_confidential_gateway ? 1 : 0
+  for_each           = var.enable_confidential_gateway ? toset(local.confidential_gateway_allowed_image_digests) : toset([])
   service_account_id = google_service_account.api_runtime.name
   role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.confidential_gateway[0].name}/attribute.image_digest/${local.confidential_gateway_digest}"
+  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.confidential_gateway[0].name}/attribute.image_digest/${each.value}"
+}
+
+moved {
+  # One-time migration for the production binding created by the original
+  # count-based resource. Terraform moved destinations must be static; verify
+  # this digest against remote state before applying the migration.
+  from = google_service_account_iam_member.confidential_gateway_impersonates_runtime[0]
+  to   = google_service_account_iam_member.confidential_gateway_impersonates_runtime["sha256:9019aa7bb0587a2b4767b6a52e10cdc043d3fb23fb971313c66d9e81f17cf1a6"]
 }
 
 locals {
