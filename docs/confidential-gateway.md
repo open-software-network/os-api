@@ -60,14 +60,20 @@ development evidence. Responses use `Cache-Control: no-store`.
    Verify both regional backends are healthy and exercise fresh evidence before
    changing the production URL map. Do not replace the Cloud Run backends on
    `os-api-edge`; they remain warm for rollback.
-5. Shift traffic by changing only the production URL map's default service.
-   If public probes fail, point the URL map back to `os-api-edge`; neither
-   backend service needs to be rebuilt or mutated during the rollback.
+5. Set `route_public_api_to_confidential_gateway=true` to shift traffic by
+   changing only the production URL map's default service. If public probes
+   fail, set it back to `false`; Terraform points the URL map to `os-api-edge`
+   without destroying or mutating either backend service.
 6. Remove the old digest from `confidential_gateway_additional_image_digests`
    and apply again. Steady state authorizes only `gateway_image`.
 
 Cloud Run remains the default until the switch is enabled. This change does not
 deploy production by itself.
+
+The Confidential Space gateway loads `/app/config/models.yaml` from its
+digest-pinned image. Do not override it with the mutable `cloudrun-model-config`
+secret: doing so breaks the correspondence between reviewed source,
+attestation, and the live routing policy.
 
 Confidential Space mounts its on-demand attestation socket read-only, owned by
 root, with mode `0755`. Connecting to a Unix socket requires write permission,

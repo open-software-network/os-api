@@ -1,5 +1,6 @@
 locals {
-  use_confidential_public_api = var.enable_public_api && var.enable_production_edge && var.enable_confidential_gateway
+  provision_confidential_public_api = var.enable_public_api && var.enable_production_edge && var.enable_confidential_gateway
+  use_confidential_public_api       = local.provision_confidential_public_api && var.route_public_api_to_confidential_gateway
 }
 
 resource "google_compute_global_address" "public_api" {
@@ -171,7 +172,7 @@ resource "google_compute_backend_service" "public_api" {
 }
 
 resource "google_compute_backend_service" "confidential_public_api" {
-  count = local.use_confidential_public_api ? 1 : 0
+  count = local.provision_confidential_public_api ? 1 : 0
 
   name                  = "os-api-edge-confidential"
   protocol              = "HTTP"
