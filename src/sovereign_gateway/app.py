@@ -948,7 +948,7 @@ def create_app() -> FastAPI:
             )
         try:
             payload = json.loads(raw or b"{}")
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return _gateway_attestation_response(
                 openai_error(400, "Request body must be JSON", code="invalid_request")
             )

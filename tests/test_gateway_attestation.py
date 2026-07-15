@@ -95,6 +95,18 @@ def test_gateway_attestation_rejects_non_object_json(client: TestClient) -> None
     assert response.headers["access-control-allow-origin"] == "*"
 
 
+def test_gateway_attestation_rejects_malformed_utf8_json(client: TestClient) -> None:
+    response = client.post(
+        "/v1/gateway/attestation",
+        content=b'{"nonce":"client-nonce-\xff"}',
+        headers={"content-type": "application/json"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
+    assert response.headers["access-control-allow-origin"] == "*"
+
+
 def test_gateway_attestation_caps_chunked_request_body(client: TestClient) -> None:
     body = b'{"nonce":"client-nonce-0001","padding":"' + b"x" * 5_000 + b'"}'
 
