@@ -48,8 +48,10 @@ Set one request header:
 | `X-Confidential-Compute: disabled` | Use the lower-cost standard GPU pool only. |
 
 Responses include `X-Compute-Privacy` and `X-Model-Backend`. A production edge proxy must preserve these headers.
-Chat and legacy-completions requests always carry an explicit output bound. When neither OpenAI
-output-limit field is supplied, the gateway applies a 2,048-token default; embeddings are unchanged.
+Explicit chat and legacy-completions output limits are validated and forwarded as one canonical
+field. Text-only requests that omit a limit preserve the provider default; managed billing reserves
+against the model's configured maximum. Non-text requests without a limit receive a 2,048-token
+bound because their media cost cannot be known in advance. Embeddings are unchanged.
 The default was deliberately changed from TEE-first to Venice-private-first on July 14, 2026. This
 is a breaking privacy-policy choice: callers that require a hardware execution guarantee must send
 `X-Confidential-Compute: required` rather than infer TEE use from an omitted header. For hosted
@@ -64,6 +66,7 @@ curl http://localhost:8080/v1/chat/completions \
   -d '{
     "model": "openai/gpt-oss-20b",
     "messages": [{"role": "user", "content": "Hello"}],
+    "max_completion_tokens": 2048,
     "stream": true
   }'
 ```

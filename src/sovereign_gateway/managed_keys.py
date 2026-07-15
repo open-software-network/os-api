@@ -428,6 +428,9 @@ class FirestoreKeyRepository:
         bounded_limit = _key_page_limit(limit)
         _validate_key_cursor(cursor)
 
+        # Pages are independent reads rather than a cross-request snapshot.
+        # Keys created while paging may require a fresh first-page read; a
+        # transaction here would not make separate HTTP requests atomic.
         def fetch() -> ApiKeyPage:
             query = self.keys.where("user_id", "==", user_id).order_by(
                 "created_at",

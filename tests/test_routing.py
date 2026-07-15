@@ -24,11 +24,13 @@ from sovereign_gateway.app import (
     _estimate_fallback_charge,
     _estimate_reservation_cost,
     _metered_stream,
+    _prepare_billing,
     _settle_billing,
     _stream_video_response,
     _validate_client_encryption_key,
     create_app,
 )
+from sovereign_gateway.auth import Principal
 from sovereign_gateway.config import GatewayConfig
 from sovereign_gateway.routing import (
     NON_TEXT_INPUT_HEURISTIC_ALLOWANCE,
@@ -747,7 +749,7 @@ def test_non_text_output_cap_is_forwarded_without_rewriting_media(
     assert forwarded["messages"] == messages
 
 
-def test_text_request_without_output_limit_gets_enforced_default(
+def test_text_request_without_output_limit_preserves_provider_default(
     routed_client: TestClient,
 ) -> None:
     response = routed_client.post(
@@ -760,7 +762,8 @@ def test_text_request_without_output_limit_gets_enforced_default(
 
     assert response.status_code == 200
     forwarded = routed_client.app.state.test_payloads[-1]
-    assert forwarded["max_completion_tokens"] == DEFAULT_NON_TEXT_MAX_COMPLETION_TOKENS
+    assert "max_completion_tokens" not in forwarded
+    assert "max_tokens" not in forwarded
 
 
 def test_text_dual_output_limits_forward_only_the_larger_bound(
@@ -782,7 +785,7 @@ def test_text_dual_output_limits_forward_only_the_larger_bound(
     assert "max_tokens" not in forwarded
 
 
-def test_legacy_completions_default_is_forwarded_as_max_tokens(
+def test_legacy_completions_without_output_limit_preserves_provider_default(
     routed_client: TestClient,
 ) -> None:
     response = routed_client.post(
@@ -792,8 +795,27 @@ def test_legacy_completions_default_is_forwarded_as_max_tokens(
 
     assert response.status_code == 200
     forwarded = routed_client.app.state.test_payloads[-1]
-    assert forwarded["max_tokens"] == DEFAULT_NON_TEXT_MAX_COMPLETION_TOKENS
+    assert "max_tokens" not in forwarded
     assert "max_completion_tokens" not in forwarded
+
+
+def test_text_null_output_limits_are_removed_without_adding_a_default(
+    routed_client: TestClient,
+) -> None:
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "openai/gpt-oss-20b",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_completion_tokens": None,
+            "max_tokens": None,
+        },
+    )
+
+    assert response.status_code == 200
+    forwarded = routed_client.app.state.test_payloads[-1]
+    assert "max_completion_tokens" not in forwarded
+    assert "max_tokens" not in forwarded
 
 
 def test_legacy_completions_dual_limits_forward_larger_as_max_tokens(
@@ -1498,7 +1520,7 @@ async def test_client_disconnect_settles_without_health_penalty() -> None:
     assert stats.consecutive_failures == 0
 
 
-def test_text_missing_usage_fallback_preserves_reservation_estimate() -> None:
+def test_text_missing_usage_fallback_is_lower_than_conservative_reservation() -> None:
     config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
     route = config.endpoints["venice-kimi-k2.6-private"]
     model = config.models[route.model_id]
@@ -1514,6 +1536,7 @@ def test_text_missing_usage_fallback_preserves_reservation_estimate() -> None:
         request_bytes,
         model.max_context_length,
         model.max_output_length,
+        reserve_omitted_output_maximum=True,
     )
     fallback_charge = _estimate_fallback_charge(
         route,
@@ -1522,7 +1545,60 @@ def test_text_missing_usage_fallback_preserves_reservation_estimate() -> None:
         model.max_context_length,
     )
 
-    assert fallback_charge == reservation
+    configured_output_maximum = min(
+        limit for limit in (model.max_context_length, model.max_output_length) if limit is not None
+    )
+    assert reservation == _actual_cost(
+        route,
+        {
+            "prompt_tokens": request_bytes,
+            "completion_tokens": configured_output_maximum,
+        },
+    )
+    assert fallback_charge < reservation
+
+
+@pytest.mark.anyio
+async def test_managed_text_without_limit_fails_when_model_has_no_billing_bound() -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    route = config.endpoints["venice-kimi-k2.6-private"]
+    config.models[route.model_id] = replace(
+        config.models[route.model_id],
+        max_context_length=None,
+        max_output_length=None,
+    )
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                managed_keys=object(),
+                config=config,
+            )
+        ),
+        state=SimpleNamespace(
+            principal=Principal(
+                tenant_id="tenant-1",
+                key_fingerprint="fingerprint",
+                key_id="key-1",
+                user_id="user-1",
+            )
+        ),
+    )
+    payload = {
+        "model": route.model_id,
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+
+    response = await _prepare_billing(
+        request,
+        route,
+        payload,
+        len(json.dumps(payload).encode()),
+        reserve_omitted_output_maximum=True,
+    )
+
+    assert response is not None
+    assert response.status_code == 409
+    assert json.loads(response.body)["error"]["code"] == "billing_bound_unavailable"
 
 
 @pytest.mark.parametrize(

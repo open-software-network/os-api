@@ -103,15 +103,18 @@ against the larger of the full raw request byte size and the selected model's en
 capacity whenever non-text input is present. This covers both large inline data URLs and short
 remote URLs whose visual token usage is not knowable before inference. Fallback candidates are
 compared using this bound. Metered non-text requests fail closed if an eligible model has no
-configured context capacity. Every chat or legacy-completions request has an enforced output bound:
-omitting both output-limit fields adds a 2,048-token default. A valid explicit limit is forwarded
-and the reservation is capped at the model's configured maximum. If both `max_completion_tokens`
-and `max_tokens` are set, the gateway uses the larger positive integer and forwards one canonical
-field (`max_completion_tokens` for chat, `max_tokens` for the legacy completions endpoint). Every
-supplied output limit must be a positive, non-boolean integer; explicit `null` values are removed
-and treated as omitted. Invalid single or dual values fail with a 400 response before any upstream
-call. Embedding requests are not given a generation limit. This prevents an upstream provider from
-honoring a value that the gateway's billing estimate parsed or clamped differently.
+configured context capacity. Non-text chat or legacy-completions requests that omit both output-limit
+fields receive a 2,048-token bound. Text-only requests preserve the upstream provider's default; for
+managed keys, authorization conservatively reserves against the selected model's configured maximum
+while missing-usage settlement retains the smaller 2,048-token fallback estimate. A valid explicit
+limit is forwarded and the reservation is capped at the model's configured maximum. If both
+`max_completion_tokens` and `max_tokens` are set, the gateway uses the larger positive integer and
+forwards one canonical field (`max_completion_tokens` for chat, `max_tokens` for the legacy
+completions endpoint). Every supplied output limit must be a positive, non-boolean integer; explicit
+`null` values are removed and treated as omitted. Invalid single or dual values fail with a 400
+response before any upstream call. Embedding requests are not given a generation limit. This
+prevents an upstream provider from honoring a value that the gateway's billing estimate parsed or
+clamped differently.
 Nested media content is never rewritten. Settlement uses
 billable prompt/completion usage reported by the upstream provider. Missing usage, `total_tokens`
 alone, or zero-only token fields emit a warning and fall back to the bounded structural estimate

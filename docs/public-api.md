@@ -33,6 +33,7 @@ client = OpenAI(
 response = client.chat.completions.create(
     model="openai/gpt-oss-20b",
     messages=[{"role": "user", "content": "Hello from my app"}],
+    max_completion_tokens=2048,
 )
 print(response.choices[0].message.content)
 ```
@@ -47,6 +48,7 @@ curl "$OS_API_BASE_URL/chat/completions" \
   -d '{
     "model": "openai/gpt-oss-20b",
     "messages": [{"role": "user", "content": "Hello from my app"}],
+    "max_completion_tokens": 2048,
     "stream": false
   }'
 ```

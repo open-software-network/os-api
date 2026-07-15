@@ -161,6 +161,8 @@ MODEL_ALIASES = {
 def _canonicalize_output_limit(
     payload: dict[str, Any],
     output_field: Literal["max_completion_tokens", "max_tokens"] = "max_completion_tokens",
+    *,
+    default_output_tokens: int | None = None,
 ) -> None:
     for name in ("max_completion_tokens", "max_tokens"):
         if name in payload and payload[name] is None:
@@ -179,16 +181,23 @@ def _canonicalize_output_limit(
                 f"{name} must be a positive integer",
             )
     limits = [limit for limit in (max_completion_tokens, max_tokens) if limit is not None]
-    canonical_limit = max(limits) if limits else DEFAULT_MAX_COMPLETION_TOKENS
     payload.pop("max_completion_tokens", None)
     payload.pop("max_tokens", None)
-    payload[output_field] = canonical_limit
+    if limits:
+        payload[output_field] = max(limits)
+    elif default_output_tokens is not None:
+        payload[output_field] = default_output_tokens
 
 
 def _enforce_non_text_output_cap(payload: dict[str, Any]) -> None:
-    """Backward-compatible alias for universal output-limit enforcement."""
+    """Validate limits and bound requests whose media cost cannot be known in advance."""
 
-    _canonicalize_output_limit(payload)
+    _canonicalize_output_limit(
+        payload,
+        default_output_tokens=(
+            DEFAULT_MAX_COMPLETION_TOKENS if has_non_text_input(payload) else None
+        ),
+    )
 
 
 def _validate_environment() -> None:
@@ -1246,6 +1255,9 @@ def create_app() -> FastAPI:
                 _canonicalize_output_limit(
                     payload,
                     "max_tokens" if proxy_path == "completions" else "max_completion_tokens",
+                    default_output_tokens=(
+                        DEFAULT_MAX_COMPLETION_TOKENS if has_non_text_input(payload) else None
+                    ),
                 )
             parsed = InferenceRequest.model_validate(payload)
         except RoutingError as exc:
@@ -1355,27 +1367,43 @@ def create_app() -> FastAPI:
         # cannot bypass a key or wallet spend limit. For non-text input, model
         # context capacity is part of the estimate and can outweigh unit price.
         non_text_input = has_non_text_input(payload)
+        generation_request = proxy_path in GENERATION_PROXY_PATHS
 
         def billing_estimate(endpoint: Endpoint) -> float:
-            context_limit = config.models[endpoint.model_id].max_context_length
+            model = config.models[endpoint.model_id]
+            context_limit = model.max_context_length
             if non_text_input and context_limit is None:
                 # Force the unknown-bound endpoint into _prepare_billing,
                 # which fails closed for metered requests.
                 return float("inf")
-            model = config.models[endpoint.model_id]
+            if (
+                generation_request
+                and payload.get("max_completion_tokens") is None
+                and payload.get("max_tokens") is None
+                and context_limit is None
+                and model.max_output_length is None
+            ):
+                return float("inf")
             return _estimate_reservation_cost(
                 endpoint,
                 payload,
                 len(raw),
                 context_limit,
                 model.max_output_length,
+                reserve_omitted_output_maximum=generation_request,
             )
 
         estimate_endpoint = max(
             candidates,
             key=billing_estimate,
         )
-        billing = await _prepare_billing(request, estimate_endpoint, payload, len(raw))
+        billing = await _prepare_billing(
+            request,
+            estimate_endpoint,
+            payload,
+            len(raw),
+            reserve_omitted_output_maximum=generation_request,
+        )
         if isinstance(billing, Response):
             return billing
 
@@ -2200,6 +2228,8 @@ async def _prepare_billing(
     route: ModelRoute | Endpoint,
     payload: dict[str, Any],
     request_bytes: int,
+    *,
+    reserve_omitted_output_maximum: bool = False,
 ) -> BillingContext | None | Response:
     principal: Principal = request.state.principal
     repository: ManagedKeyRepository | None = request.app.state.managed_keys
@@ -2220,12 +2250,27 @@ async def _prepare_billing(
             error_type="billing_error",
             code="billing_bound_unavailable",
         )
+    if (
+        reserve_omitted_output_maximum
+        and payload.get("max_completion_tokens") is None
+        and payload.get("max_tokens") is None
+        and context_limit is None
+        and max_output_length is None
+    ):
+        return openai_error(
+            409,
+            "The selected model has no configured output billing bound; "
+            "supply an explicit output limit",
+            error_type="billing_error",
+            code="billing_bound_unavailable",
+        )
     reservation = _estimate_reservation_cost(
         route,
         payload,
         request_bytes,
         context_limit,
         max_output_length,
+        reserve_omitted_output_maximum=reserve_omitted_output_maximum,
     )
     fallback_charge = min(
         reservation,
@@ -2468,6 +2513,9 @@ async def _metered_stream(
             finally:
                 if stream_error is not None:
                     if endpoint_health is not None:
+                        # Protocol and size-limit breaches cannot complete through
+                        # this gateway, so they count as endpoint failures. Client
+                        # disconnects do not set stream_error and remain exempt.
                         await endpoint_health.failure(backend)
                     await _release_billing(
                         request,
@@ -2509,6 +2557,8 @@ def _estimate_reservation_cost(
     request_bytes: int,
     context_limit: int | None = None,
     max_output_length: int | None = None,
+    *,
+    reserve_omitted_output_maximum: bool = False,
 ) -> int:
     prompt_upper_bound = max(1, request_bytes)
     non_text_input = has_non_text_input(payload)
@@ -2522,7 +2572,7 @@ def _estimate_reservation_cost(
         payload,
         context_limit,
         max_output_length,
-        conservative_non_text=non_text_input,
+        conservative_omitted_output=(reserve_omitted_output_maximum or non_text_input),
     )
     return _cost_from_bounds(route, prompt_upper_bound, output_tokens)
 
@@ -2543,7 +2593,7 @@ def _estimate_fallback_charge(
         payload,
         context_limit,
         max_output_length,
-        conservative_non_text=False,
+        conservative_omitted_output=False,
     )
     return _cost_from_bounds(route, prompt_units, output_tokens)
 
@@ -2553,7 +2603,7 @@ def _estimate_output_tokens(
     context_limit: int | None,
     max_output_length: int | None,
     *,
-    conservative_non_text: bool,
+    conservative_omitted_output: bool,
 ) -> int:
     requested_output = payload.get("max_completion_tokens")
     if requested_output is None:
@@ -2561,13 +2611,13 @@ def _estimate_output_tokens(
     configured_limits = [limit for limit in (context_limit, max_output_length) if limit]
     configured_maximum = min(configured_limits) if configured_limits else None
     try:
-        if requested_output is None and conservative_non_text:
+        if requested_output is None and conservative_omitted_output:
             output_tokens = configured_maximum or 2_048
         else:
             output_tokens = int(requested_output) if requested_output is not None else 2_048
     except (TypeError, ValueError):
-        output_tokens = (configured_maximum or 2_048) if conservative_non_text else 2_048
-    cap = configured_maximum if conservative_non_text or max_output_length else context_limit
+        output_tokens = (configured_maximum or 2_048) if conservative_omitted_output else 2_048
+    cap = configured_maximum if conservative_omitted_output or max_output_length else context_limit
     if cap:
         output_tokens = min(max(1, output_tokens), cap)
     return max(1, output_tokens)

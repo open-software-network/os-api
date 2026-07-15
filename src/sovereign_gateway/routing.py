@@ -170,6 +170,8 @@ class EndpointStats:
 
     @property
     def healthy(self) -> bool:
+        """Report only a fully closed circuit; half-open probes are not yet healthy."""
+
         return self.circuit_open_until == 0
 
     @property
