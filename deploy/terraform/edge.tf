@@ -150,6 +150,7 @@ resource "google_compute_backend_service" "public_api" {
 
   backend {
     group           = var.enable_confidential_gateway ? google_compute_region_instance_group_manager.confidential_gateway_primary[0].instance_group : google_compute_region_network_endpoint_group.public_api[0].id
+    balancing_mode  = var.enable_confidential_gateway ? "UTILIZATION" : null
     max_utilization = var.enable_confidential_gateway ? 0.8 : null
   }
 
@@ -158,6 +159,7 @@ resource "google_compute_backend_service" "public_api" {
 
     content {
       group           = var.enable_confidential_gateway ? google_compute_region_instance_group_manager.confidential_gateway_secondary[0].instance_group : google_compute_region_network_endpoint_group.public_api_secondary[0].id
+      balancing_mode  = var.enable_confidential_gateway ? "UTILIZATION" : null
       max_utilization = var.enable_confidential_gateway ? 0.8 : null
     }
   }
