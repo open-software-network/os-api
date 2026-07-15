@@ -48,11 +48,18 @@ development evidence. Responses use `Cache-Control: no-store`.
 ## Rollout
 
 1. Build and publish os-api, then record its immutable `sha256:` digest.
-2. Set `gateway_image` to that digest and enable `enable_confidential_gateway`.
-3. Apply Terraform and wait for both regional managed instance groups to pass
-   the private health check.
-4. Verify the public source and request fresh evidence from the candidate.
-5. Shift user traffic only after health checks and verification pass.
+2. Add the next digest to `confidential_gateway_additional_image_digests` while
+   leaving the current `gateway_image` unchanged, then apply only the workload
+   identity provider and digest-scoped IAM members. Exactly those two images are
+   now authorized.
+3. Set `gateway_image` to the next digest while temporarily retaining the old
+   digest in `confidential_gateway_additional_image_digests`. Roll and verify the
+   primary managed instance group through the isolated staging load balancer,
+   then roll the secondary group.
+4. Verify the public source, health checks, load behavior, and fresh evidence
+   before shifting user traffic.
+5. Remove the old digest from `confidential_gateway_additional_image_digests`
+   and apply again. Steady state authorizes only `gateway_image`.
 
 Cloud Run remains the default until the switch is enabled. This change does not
 deploy production by itself.

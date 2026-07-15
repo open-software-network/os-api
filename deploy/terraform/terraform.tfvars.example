@@ -10,6 +10,11 @@ enable_confidential_gpu_pool = false
 enable_confidential_cpu_pool = false
 confidential_gpu_zone        = "us-central1-a"
 
+# Keep empty in steady state. During a measured-image rollout, temporarily add
+# the next digest, roll and verify both regions, then promote it to gateway_image
+# and remove the old digest.
+confidential_gateway_additional_image_digests = []
+
 # Enable only after populating the Cloud Run model, API-key, and Redis secrets.
 enable_public_api = false
 
