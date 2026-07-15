@@ -84,7 +84,9 @@ log "previous image: ${PREVIOUS_IMAGE}"
 
 PF_PID=""
 cleanup() {
-  [[ -n "${PF_PID}" ]] && kill "${PF_PID}" 2>/dev/null || true
+  if [[ -n "${PF_PID}" ]]; then
+    kill "${PF_PID}" 2>/dev/null || true
+  fi
   kubectl -n "${NAMESPACE}" delete deployment "${CANARY}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
