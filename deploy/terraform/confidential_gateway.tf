@@ -111,7 +111,7 @@ locals {
     "tee-env-OS_ACCOUNTS_URL"                                = "https://accounts.opensoftware.co"
     "tee-env-OS_ACCOUNTS_API_URL"                            = "https://accounts-api.opensoftware.co"
     "tee-env-SITE_BASIC_AUTH_USERNAME"                       = "alongside"
-    "tee-env-GATEWAY_ATTESTATION_AUDIENCE"                   = "https://june-api.opensoftware.co/os-api-gateway"
+    "tee-env-GATEWAY_ATTESTATION_AUDIENCE"                   = "https://api.opensoftware.co/verify"
   } : {}
 }
 

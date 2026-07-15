@@ -37,6 +37,10 @@ The API, developer dashboard, and docs are published at `https://api.opensoftwar
 
 The API does not persist prompts or responses. That is a behavior of this gateway, not a blanket guarantee about every GCP service or a model container you replace it with; see [the threat model](docs/threat-model.md) and [Confidential Space gateway](docs/confidential-gateway.md).
 
+Anyone can inspect the source and request fresh, nonce-bound hardware evidence at
+[`https://api.opensoftware.co/verify`](https://api.opensoftware.co/verify). This is an
+independent API check; it does not depend on trusting or running June or Chat.
+
 ## API privacy contract
 
 Set one request header:

@@ -39,6 +39,19 @@ def test_attestation_requires_authentication(attestation_client: TestClient) -> 
     assert response.status_code == 401
 
 
+def test_verify_explains_independent_scope(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SITE_BASIC_AUTH_USERNAME", "private-site")
+    monkeypatch.setenv("SITE_BASIC_AUTH_PASSWORD", "private-site")
+    response = client.get("/verify")
+    text = " ".join(response.text.split())
+
+    assert response.status_code == 200
+    assert "without trusting June or Chat" in text
+    assert "does not prove that every model provider is private" in text
+
+
 def test_attestation_rejects_weak_nonce(attestation_client: TestClient) -> None:
     response = attestation_client.post("/v1/attestation", json={"nonce": "short"})
 
