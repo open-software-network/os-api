@@ -123,6 +123,7 @@ resource "google_compute_instance_template" "confidential_gateway_primary" {
 
   disk {
     source_image = "projects/confidential-space-images/global/images/family/confidential-space"
+    disk_type    = "pd-balanced"
     boot         = true
     auto_delete  = true
   }
@@ -161,6 +162,7 @@ resource "google_compute_instance_template" "confidential_gateway_secondary" {
 
   disk {
     source_image = "projects/confidential-space-images/global/images/family/confidential-space"
+    disk_type    = "pd-balanced"
     boot         = true
     auto_delete  = true
   }
