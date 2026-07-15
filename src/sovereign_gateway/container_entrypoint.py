@@ -21,11 +21,9 @@ def prepare_launcher_socket(socket_path: str, *, required: bool) -> None:
     if not stat.S_ISSOCK(socket_stat.st_mode):
         raise RuntimeError("Confidential Space launcher path is not a socket")
 
-    # The launcher creates this root-owned socket as 0755, but Unix socket
-    # clients require write permission to connect. Restrict the path to the
-    # gateway principal before permanently dropping privileges.
-    os.chown(socket_path, GATEWAY_UID, GATEWAY_GID)
-    os.chmod(socket_path, 0o600)
+    # Confidential Space mounts this root-owned 0755 socket read-only. Unix
+    # socket clients require write permission to connect, so the measured TEE
+    # workload must retain UID 0 when on-demand attestation is required.
 
 
 def verify_gateway_identity() -> None:
@@ -54,14 +52,16 @@ def main() -> None:
     socket_path = os.getenv(
         "CONFIDENTIAL_SPACE_ATTESTATION_SOCKET", DEFAULT_SOCKET_PATH
     )
-    if os.geteuid() == 0:
-        prepare_launcher_socket(socket_path, required=required)
+    if required:
+        if os.geteuid() != 0:
+            raise RuntimeError(
+                "Confidential Space entrypoint requires root for launcher access"
+            )
+        prepare_launcher_socket(socket_path, required=True)
+    elif os.geteuid() == 0:
+        prepare_launcher_socket(socket_path, required=False)
         drop_gateway_privileges()
     else:
-        if required:
-            raise RuntimeError(
-                "Confidential Space entrypoint requires root for socket preparation"
-            )
         verify_gateway_identity()
     os.execvp(sys.argv[1], sys.argv[1:])
 
