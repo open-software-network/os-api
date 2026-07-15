@@ -58,6 +58,25 @@ def test_gateway_attestation_is_public_and_fails_closed_without_a_tee(
 
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "gateway_attestation_unavailable"
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["access-control-allow-origin"] == "*"
+
+
+def test_gateway_attestation_supports_browser_preflight(client: TestClient) -> None:
+    response = client.options(
+        "/v1/gateway/attestation",
+        headers={
+            "Origin": "https://june.opensoftware.co",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+
+    assert response.status_code == 204
+    assert response.headers["access-control-allow-origin"] == "*"
+    assert response.headers["access-control-allow-methods"] == "POST, OPTIONS"
+    assert response.headers["access-control-allow-headers"] == "content-type"
+    assert response.headers["cache-control"] == "no-store"
 
 
 def test_gateway_attestation_rejects_weak_nonce(client: TestClient) -> None:
@@ -65,6 +84,15 @@ def test_gateway_attestation_rejects_weak_nonce(client: TestClient) -> None:
 
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_nonce"
+    assert response.headers["access-control-allow-origin"] == "*"
+
+
+def test_gateway_attestation_rejects_non_object_json(client: TestClient) -> None:
+    response = client.post("/v1/gateway/attestation", json=["client-nonce-0001"])
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
+    assert response.headers["access-control-allow-origin"] == "*"
 
 
 @pytest.mark.parametrize("length", [9, 89])

@@ -91,6 +91,12 @@ REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 SITE_AUTH_EXEMPT_PATHS = frozenset({"/healthz", "/readyz", "/v1"})
 DEFAULT_ASR_MODELS = ("nvidia/parakeet-tdt-0.6b-v3",)
 DEFAULT_NON_TEXT_MAX_COMPLETION_TOKENS = 2_048
+GATEWAY_ATTESTATION_RESPONSE_HEADERS = {
+    "access-control-allow-headers": "content-type",
+    "access-control-allow-methods": "POST, OPTIONS",
+    "access-control-allow-origin": "*",
+    "cache-control": "no-store",
+}
 MODEL_ALIASES = {
     "zai-org-glm-5-2": "z-ai/glm-5.2",
     "kimi-k2-6": "moonshotai/kimi-k2.6",
@@ -131,6 +137,11 @@ def _enforce_non_text_output_cap(payload: dict[str, Any]) -> None:
 
 def _site_auth_protects_path(path: str) -> bool:
     return path not in SITE_AUTH_EXEMPT_PATHS and not path.startswith("/v1/")
+
+
+def _gateway_attestation_response(response: Response) -> Response:
+    response.headers.update(GATEWAY_ATTESTATION_RESPONSE_HEADERS)
+    return response
 
 
 def _compat_enabled() -> bool:
@@ -777,21 +788,33 @@ def create_app() -> FastAPI:
             }
         )
 
+    @app.options("/v1/gateway/attestation")
+    async def gateway_attestation_preflight() -> Response:
+        return Response(status_code=204, headers=GATEWAY_ATTESTATION_RESPONSE_HEADERS)
+
     @app.post("/v1/gateway/attestation")
     async def gateway_attestation(request: Request) -> Response:
         try:
             payload = json.loads(await request.body() or b"{}")
         except json.JSONDecodeError:
-            return openai_error(400, "Request body must be JSON", code="invalid_request")
+            return _gateway_attestation_response(
+                openai_error(400, "Request body must be JSON", code="invalid_request")
+            )
+        if not isinstance(payload, dict):
+            return _gateway_attestation_response(
+                openai_error(400, "Request body must be a JSON object", code="invalid_request")
+            )
         nonce = payload.get("nonce", "")
         # Confidential Space accepts up to 88 bytes per nonce. Keep the
         # public contract URL-safe so clients can generate and compare it
         # without ambiguous encoding rules.
         if not isinstance(nonce, str) or not re.fullmatch(r"[A-Za-z0-9_-]{10,88}", nonce):
-            return openai_error(
-                400,
-                "nonce must be 10-88 URL-safe characters",
-                code="invalid_nonce",
+            return _gateway_attestation_response(
+                openai_error(
+                    400,
+                    "nonce must be 10-88 URL-safe characters",
+                    code="invalid_nonce",
+                )
             )
         try:
             evidence = await request_gateway_attestation(nonce)
@@ -806,18 +829,16 @@ def create_app() -> FastAPI:
                     separators=(",", ":"),
                 )
             )
-            return openai_error(
-                503,
-                "Gateway attestation evidence is unavailable",
-                error_type="server_error",
-                code="gateway_attestation_unavailable",
+            return _gateway_attestation_response(
+                openai_error(
+                    503,
+                    "Gateway attestation evidence is unavailable",
+                    error_type="server_error",
+                    code="gateway_attestation_unavailable",
+                )
             )
-        return JSONResponse(
-            content=evidence.public_dict(),
-            headers={
-                "cache-control": "no-store",
-                "access-control-allow-origin": "*",
-            },
+        return _gateway_attestation_response(
+            JSONResponse(content=evidence.public_dict())
         )
 
     @app.post("/v1/audio/transcriptions")
