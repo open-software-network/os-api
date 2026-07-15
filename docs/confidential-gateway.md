@@ -64,11 +64,13 @@ development evidence. Responses use `Cache-Control: no-store`.
 Cloud Run remains the default until the switch is enabled. This change does not
 deploy production by itself.
 
-The measured container entrypoint starts as UID 0 only to take ownership of the
-root-owned launcher attestation socket. It restricts that socket to UID/GID
-10001, clears supplementary groups, drops its real, effective, and saved IDs to
-10001, verifies the drop, and only then executes the API server. Confidential
-Space records the entrypoint in the attestation claims, and this image's launch
-policy does not allow an operator to override the command. Standard Kubernetes
-deployments continue to enforce `runAsNonRoot`, UID 10001, dropped capabilities,
-and disabled privilege escalation.
+Confidential Space mounts its on-demand attestation socket read-only, owned by
+root, with mode `0755`. Connecting to a Unix socket requires write permission,
+so the measured Confidential Space API process retains UID 0. The launcher adds
+no privileged capabilities, records the entrypoint and command in the evidence,
+and this image's launch policy does not allow an operator to override the
+command. This is a deliberate TEE-specific tradeoff, not an end-to-end guarantee.
+Cloud Run drops its real, effective, and saved IDs to UID/GID 10001 before the
+server starts. Standard Kubernetes deployments continue to enforce
+`runAsNonRoot`, UID 10001, dropped capabilities, and disabled privilege
+escalation.

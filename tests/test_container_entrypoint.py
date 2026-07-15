@@ -16,28 +16,17 @@ from sovereign_gateway.container_entrypoint import (
 )
 
 
-def test_prepares_root_owned_launcher_socket_for_non_root_gateway(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_validates_root_owned_launcher_socket_without_mutating_it() -> None:
     with tempfile.TemporaryDirectory(dir="/tmp") as temp_dir:
         socket_path = Path(temp_dir) / "teeserver.sock"
         launcher = socket.socket(socket.AF_UNIX)
         try:
             launcher.bind(str(socket_path))
             socket_path.chmod(0o755)
-            chown_calls: list[tuple[str, int, int]] = []
-            monkeypatch.setattr(
-                container_entrypoint.os,
-                "chown",
-                lambda path, uid, gid: chown_calls.append((path, uid, gid)),
-            )
 
             prepare_launcher_socket(str(socket_path), required=True)
 
-            assert chown_calls == [(str(socket_path), GATEWAY_UID, GATEWAY_GID)]
-            mode = stat.S_IMODE(socket_path.stat().st_mode)
-            assert mode == 0o600
-            assert not mode & stat.S_IWOTH
+            assert stat.S_IMODE(socket_path.stat().st_mode) == 0o755
         finally:
             launcher.close()
 
@@ -113,3 +102,35 @@ def test_privilege_drop_fails_if_uid_remains_root(
 
     with pytest.raises(RuntimeError, match="drop to gateway uid"):
         drop_gateway_privileges()
+
+
+def test_confidential_entrypoint_retains_root_for_launcher_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setenv("REQUIRE_CONFIDENTIAL_SPACE", "true")
+    monkeypatch.setenv("CONFIDENTIAL_SPACE_ATTESTATION_SOCKET", "/launcher.sock")
+    monkeypatch.setattr(container_entrypoint.sys, "argv", ["entrypoint", "server"])
+    monkeypatch.setattr(container_entrypoint.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(
+        container_entrypoint,
+        "prepare_launcher_socket",
+        lambda path, required: calls.append(("prepare", (path, required))),
+    )
+    monkeypatch.setattr(
+        container_entrypoint,
+        "drop_gateway_privileges",
+        lambda: calls.append(("drop", None)),
+    )
+    monkeypatch.setattr(
+        container_entrypoint.os,
+        "execvp",
+        lambda command, argv: calls.append(("exec", (command, argv))),
+    )
+
+    container_entrypoint.main()
+
+    assert calls == [
+        ("prepare", ("/launcher.sock", True)),
+        ("exec", ("server", ["server"])),
+    ]
