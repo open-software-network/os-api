@@ -40,6 +40,19 @@ async def test_requests_nonce_bound_confidential_space_oidc_token() -> None:
 
 
 @pytest.mark.asyncio
+async def test_launcher_token_allows_http_body_whitespace() -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, content=b"header.payload.signature\r\n")
+    )
+
+    evidence = await request_gateway_attestation(
+        "client-nonce-0001", transport=transport
+    )
+
+    assert evidence.token == "header.payload.signature"
+
+
+@pytest.mark.asyncio
 async def test_missing_launcher_token_fails_closed() -> None:
     transport = httpx.MockTransport(lambda request: httpx.Response(200, text=""))
 
@@ -52,7 +65,6 @@ async def test_missing_launcher_token_fails_closed() -> None:
     "body",
     [
         '{"token":"header.payload.signature"}',
-        "header.payload.signature\n",
         "not-a-jwt",
         "é.payload.signature",
     ],

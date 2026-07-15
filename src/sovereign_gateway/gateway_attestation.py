@@ -70,17 +70,22 @@ async def request_gateway_attestation(
             # response body, not as a JSON object. Keep this strict so a
             # launcher error document can never be relayed as evidence.
             raw_token = response.content
+    except httpx.HTTPStatusError as exc:
+        raise GatewayAttestationUnavailable(
+            f"launcher_http_status_{exc.response.status_code}"
+        ) from exc
     except (httpx.HTTPError, OSError) as exc:
-        raise GatewayAttestationUnavailable from exc
+        raise GatewayAttestationUnavailable("launcher_transport_error") from exc
 
     if len(raw_token) == 0 or len(raw_token) > 128 * 1024:
-        raise GatewayAttestationUnavailable
+        raise GatewayAttestationUnavailable("launcher_body_size_invalid")
     try:
-        token = raw_token.decode("ascii")
+        token = raw_token.decode("ascii").strip()
     except UnicodeDecodeError as exc:
-        raise GatewayAttestationUnavailable from exc
-    if token != token.strip() or not re.fullmatch(
-        r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", token
-    ):
-        raise GatewayAttestationUnavailable
+        raise GatewayAttestationUnavailable("launcher_body_not_ascii") from exc
+    # The launcher returns a raw compact JWT and may terminate the body with
+    # HTTP whitespace. Validate the complete stripped value so an error
+    # document or any additional content still fails closed.
+    if not re.fullmatch(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", token):
+        raise GatewayAttestationUnavailable("launcher_body_not_compact_jwt")
     return GatewayAttestation(token=token, audience=resolved_audience, nonce=nonce)
