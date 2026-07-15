@@ -21,4 +21,4 @@ ENV PATH="/app/.venv/bin:$PATH"
 USER 10001:10001
 EXPOSE 8080
 
-CMD ["uvicorn", "sovereign_gateway.app:app", "--host", "0.0.0.0", "--port", "8080", "--no-access-log", "--no-server-header", "--proxy-headers", "--forwarded-allow-ips=*"]
+CMD ["uvicorn", "sovereign_gateway.app:app", "--host", "0.0.0.0", "--port", "8080", "--timeout-keep-alive", "620", "--no-access-log", "--no-server-header", "--proxy-headers", "--forwarded-allow-ips=*"]
