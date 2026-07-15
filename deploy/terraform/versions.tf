@@ -1,5 +1,5 @@
 terraform {
-  required_version = ">= 1.8.0"
+  required_version = ">= 1.9.0"
 
   backend "gcs" {
     bucket = "autonomous-lab-490610-sovereign-tfstate"

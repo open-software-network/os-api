@@ -56,7 +56,7 @@ resource "google_project_iam_member" "confidential_gateway_bootstrap" {
 resource "google_iam_workload_identity_pool" "confidential_gateway" {
   count                     = var.enable_confidential_gateway ? 1 : 0
   workload_identity_pool_id = "os-api-confidential"
-  display_name              = "Measured os-api gateway workloads"
+  display_name              = "Measured os-api gateways"
 }
 
 resource "google_iam_workload_identity_pool_provider" "confidential_gateway" {
