@@ -63,3 +63,12 @@ development evidence. Responses use `Cache-Control: no-store`.
 
 Cloud Run remains the default until the switch is enabled. This change does not
 deploy production by itself.
+
+The measured container entrypoint starts as UID 0 only to take ownership of the
+root-owned launcher attestation socket. It restricts that socket to UID/GID
+10001, clears supplementary groups, drops its real, effective, and saved IDs to
+10001, verifies the drop, and only then executes the API server. Confidential
+Space records the entrypoint in the attestation claims, and this image's launch
+policy does not allow an operator to override the command. Standard Kubernetes
+deployments continue to enforce `runAsNonRoot`, UID 10001, dropped capabilities,
+and disabled privilege escalation.
