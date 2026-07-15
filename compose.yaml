@@ -5,21 +5,19 @@ services:
       - "8080:8080"
     environment:
       API_KEY_HASHES: ${API_KEY_HASHES}
-      MODEL_CONFIG_PATH: /app/config/models.yaml
+      MODEL_CONFIG_PATH: /app/config/models.self-hosted.yaml
       REDIS_URL: redis://redis:6379/0
-      STANDARD_VLLM_API_KEY: ${STANDARD_VLLM_API_KEY:-internal-standard}
-      CONFIDENTIAL_VLLM_API_KEY: ${CONFIDENTIAL_VLLM_API_KEY:-internal-confidential}
     volumes:
-      - ./config/models.yaml:/app/config/models.yaml:ro
+      - ./config/models.self-hosted.yaml:/app/config/models.self-hosted.yaml:ro
     depends_on:
       redis:
         condition: service_healthy
 
   redis:
-    image: redis:7.4.2-alpine
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    image: valkey/valkey:8.1.8-alpine@sha256:94365b275456ae14621001c03556c732b1d93a0cdeacc317d1bdd52eba680885
+    command: ["valkey-server", "--save", "", "--appendonly", "no"]
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "valkey-cli", "ping"]
       interval: 2s
       timeout: 2s
       retries: 10
@@ -32,10 +30,11 @@ services:
     image: vllm/vllm-openai@sha256:6d8429e38e3747723ca07ee1b17972e09bb9c51c4032b266f24fb1cc3b22ed8f
     ipc: host
     environment:
-      HF_TOKEN: ${HF_TOKEN}
+      HF_TOKEN: ${HF_TOKEN:-}
     command:
-      - meta-llama/Llama-3.1-8B-Instruct
-      - --served-model-name=meta-llama/Llama-3.1-8B-Instruct
+      - Qwen/Qwen2.5-0.5B-Instruct
+      - --served-model-name=Qwen/Qwen2.5-0.5B-Instruct
+      - --max-model-len=8192
       - --enable-prefix-caching
     deploy:
       resources:

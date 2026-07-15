@@ -6,7 +6,11 @@ from pathlib import Path
 import httpx
 import pytest
 
-from sovereign_gateway.catalog import CatalogRefreshError, ProviderCatalog
+from sovereign_gateway.catalog import (
+    MAX_PROVIDER_CATALOG_BYTES,
+    CatalogRefreshError,
+    ProviderCatalog,
+)
 from sovereign_gateway.config import GatewayConfig
 
 CONFIG = """
@@ -177,3 +181,17 @@ async def test_empty_catalog_cannot_replace_last_good_models(tmp_path: Path) -> 
 
     assert "kept-venice-id" in config.models
     assert "phala/kept-id" in config.models
+
+
+@pytest.mark.anyio
+async def test_provider_catalog_response_is_size_limited(tmp_path: Path) -> None:
+    def upstream(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"x" * (MAX_PROVIDER_CATALOG_BYTES + 1))
+
+    config = _config(tmp_path)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as http:
+        catalog = ProviderCatalog(config, http)
+        with pytest.raises(CatalogRefreshError, match="size limit"):
+            await catalog.refresh(force=True)
+
+    assert set(config.models) == {"reviewed/auto-model"}

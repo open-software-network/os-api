@@ -8,15 +8,19 @@ locals {
     ? var.multi_region_firestore_database_id
     : "(default)"
   )
-  active_firestore_backup_bucket = (
+  active_firestore_backup_bucket = var.enable_firestore_backups ? one(
     var.enable_multi_region_control_plane
-    ? google_storage_bucket.firestore_global_backups[0].name
-    : google_storage_bucket.firestore_backups[0].name
+    ? google_storage_bucket.firestore_global_backups[*].name
+    : google_storage_bucket.firestore_backups[*].name
+  ) : null
+  provision_primary_firestore_database = (
+    !var.enable_multi_region_control_plane &&
+    (var.enable_public_api || var.enable_firestore_backups)
   )
 }
 
 resource "google_firestore_database" "primary" {
-  count = var.enable_firestore_backups ? 1 : 0
+  count = local.provision_primary_firestore_database ? 1 : 0
 
   project                           = var.project_id
   name                              = "(default)"
@@ -82,7 +86,7 @@ resource "google_storage_bucket" "firestore_backups" {
 }
 
 resource "google_storage_bucket" "firestore_global_backups" {
-  count = var.enable_multi_region_control_plane ? 1 : 0
+  count = var.enable_firestore_backups && var.enable_multi_region_control_plane ? 1 : 0
 
   project                     = var.project_id
   name                        = "${var.project_id}-os-api-global-backups"
@@ -140,7 +144,7 @@ resource "google_storage_bucket_iam_member" "firestore_service_agent_backup" {
 }
 
 resource "google_storage_bucket_iam_member" "firestore_service_agent_global_backup" {
-  count = var.enable_multi_region_control_plane ? 1 : 0
+  count = var.enable_firestore_backups && var.enable_multi_region_control_plane ? 1 : 0
 
   bucket = google_storage_bucket.firestore_global_backups[0].name
   role   = "roles/storage.admin"
@@ -172,9 +176,10 @@ resource "google_cloud_scheduler_job" "firestore_export" {
     body = base64encode(jsonencode({
       outputUriPrefix = "gs://${local.active_firestore_backup_bucket}"
       collectionIds = [
-        "sovereign_api_keys",
-        "sovereign_audit_events",
-        "sovereign_usage",
+        "${var.firestore_collection_prefix}_api_keys",
+        "${var.firestore_collection_prefix}_audit_events",
+        "${var.firestore_collection_prefix}_privacy_receipts",
+        "${var.firestore_collection_prefix}_usage",
       ]
     }))
 

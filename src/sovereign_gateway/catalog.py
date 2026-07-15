@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import time
 from typing import Any
 
 import httpx
 
 from .config import Endpoint, EndpointPrivacy, GatewayConfig, ModelRoute
+
+MAX_PROVIDER_CATALOG_BYTES = 4 * 1024 * 1024
 
 
 class CatalogRefreshError(RuntimeError):
@@ -68,11 +71,35 @@ class ProviderCatalog:
         headers = {"accept": "application/json"}
         if provider.api_key:
             headers["authorization"] = f"Bearer {provider.api_key}"
-        response = await self.http.get(
-            f"{provider.base_url}/v1/models", headers=headers, timeout=20
+        request = self.http.build_request(
+            "GET", f"{provider.base_url}/v1/models", headers=headers, timeout=20
         )
-        response.raise_for_status()
-        payload = response.json()
+        response = await self.http.send(request, stream=True)
+        try:
+            response.raise_for_status()
+            declared = response.headers.get("content-length")
+            if declared is not None:
+                try:
+                    declared_length = int(declared)
+                    if declared_length < 0:
+                        raise ValueError
+                    if declared_length > MAX_PROVIDER_CATALOG_BYTES:
+                        raise CatalogRefreshError("provider catalog exceeds the size limit")
+                except ValueError as exc:
+                    raise CatalogRefreshError("provider returned invalid Content-Length") from exc
+            chunks: list[bytes] = []
+            received = 0
+            async for chunk in response.aiter_bytes():
+                received += len(chunk)
+                if received > MAX_PROVIDER_CATALOG_BYTES:
+                    raise CatalogRefreshError("provider catalog exceeds the size limit")
+                chunks.append(chunk)
+        finally:
+            await response.aclose()
+        try:
+            payload = json.loads(b"".join(chunks))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise CatalogRefreshError("provider returned invalid catalog JSON") from exc
         data = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(data, list) or not data:
             raise CatalogRefreshError("provider returned an empty or invalid catalog")

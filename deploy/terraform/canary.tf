@@ -65,7 +65,7 @@ resource "google_cloud_run_v2_service" "api_canary" {
 
       env {
         name  = "FIRESTORE_COLLECTION_PREFIX"
-        value = "sovereign"
+        value = var.firestore_collection_prefix
       }
 
       env {
@@ -100,7 +100,7 @@ resource "google_cloud_run_v2_service" "api_canary" {
 
       env {
         name  = "SITE_BASIC_AUTH_USERNAME"
-        value = "alongside"
+        value = var.site_basic_auth_username
       }
 
       env {
@@ -212,25 +212,8 @@ resource "google_cloud_run_v2_service" "api_canary" {
       }
 
       volume_mounts {
-        name       = "models"
-        mount_path = "/etc/sovereign"
-      }
-
-      volume_mounts {
         name       = "redis-ca"
         mount_path = "/etc/redis"
-      }
-    }
-
-    volumes {
-      name = "models"
-      secret {
-        secret       = google_secret_manager_secret.runtime["cloudrun-model-config"].secret_id
-        default_mode = 292
-        items {
-          version = "latest"
-          path    = "models.yaml"
-        }
       }
     }
 
@@ -258,6 +241,8 @@ resource "google_cloud_run_v2_service" "api_canary" {
 
   depends_on = [
     google_project_service.required["run.googleapis.com"],
+    google_firestore_database.primary,
+    google_firestore_database.global,
     google_project_iam_member.api_runtime_firestore,
     google_secret_manager_secret_iam_member.api_runtime,
   ]

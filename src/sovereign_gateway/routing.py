@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 import json
+import threading
 import time
 from collections import defaultdict, deque
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -110,7 +111,15 @@ def select_auto_models(
         if model.max_output_length is not None and model.max_output_length < output_tokens:
             continue
         try:
-            endpoints = route_endpoints(config, model_id, policy, health)
+            # Scoring is read-only. The selected model's real routing pass is
+            # responsible for claiming any half-open circuit probe.
+            endpoints = _route_endpoints(
+                config,
+                model_id,
+                policy,
+                health,
+                claim_half_open=False,
+            )
         except RoutingError:
             continue
         # route_endpoints has already applied the caller's requested provider
@@ -155,12 +164,13 @@ class EndpointStats:
     successes: int = 0
     consecutive_failures: int = 0
     circuit_open_until: float = 0
+    half_open_probe_until: float = 0
     latencies: deque[float] = field(default_factory=lambda: deque(maxlen=256))
     throughputs: deque[float] = field(default_factory=lambda: deque(maxlen=256))
 
     @property
     def healthy(self) -> bool:
-        return time.monotonic() >= self.circuit_open_until
+        return self.circuit_open_until == 0
 
     @property
     def success_rate(self) -> float:
@@ -184,35 +194,88 @@ class EndpointHealth:
     changing routing semantics.
     """
 
-    def __init__(self, failure_threshold: int = 3, cooldown_seconds: int = 30) -> None:
+    def __init__(
+        self,
+        failure_threshold: int = 3,
+        cooldown_seconds: float = 30,
+        half_open_probe_seconds: float = 10,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if failure_threshold < 1:
+            raise ValueError("failure_threshold must be positive")
+        if cooldown_seconds < 0:
+            raise ValueError("cooldown_seconds cannot be negative")
+        if half_open_probe_seconds <= 0:
+            raise ValueError("half_open_probe_seconds must be positive")
         self.failure_threshold = failure_threshold
         self.cooldown_seconds = cooldown_seconds
+        self.half_open_probe_seconds = half_open_probe_seconds
+        self._clock = clock
         self._stats: dict[str, EndpointStats] = defaultdict(EndpointStats)
-        self._lock = asyncio.Lock()
+        # route_endpoints is synchronous while success/failure are async. A
+        # process-local mutex keeps half-open claims atomic across event-loop
+        # tasks and worker threads without requiring an await in the router.
+        self._lock = threading.Lock()
 
     def get(self, endpoint_id: str) -> EndpointStats:
-        return self._stats[endpoint_id]
+        with self._lock:
+            stats = self._stats[endpoint_id]
+            return EndpointStats(
+                attempts=stats.attempts,
+                successes=stats.successes,
+                consecutive_failures=stats.consecutive_failures,
+                circuit_open_until=stats.circuit_open_until,
+                half_open_probe_until=stats.half_open_probe_until,
+                latencies=deque(stats.latencies, maxlen=stats.latencies.maxlen),
+                throughputs=deque(stats.throughputs, maxlen=stats.throughputs.maxlen),
+            )
+
+    def available_endpoint_ids(
+        self,
+        endpoint_ids: Iterable[str],
+        *,
+        claim_half_open: bool,
+    ) -> set[str]:
+        """Return closed endpoints and at most one leased probe per open circuit."""
+        now = self._clock()
+        available: set[str] = set()
+        with self._lock:
+            for endpoint_id in endpoint_ids:
+                stats = self._stats[endpoint_id]
+                if stats.circuit_open_until == 0:
+                    available.add(endpoint_id)
+                    continue
+                if now < stats.circuit_open_until:
+                    continue
+                if stats.half_open_probe_until > now:
+                    continue
+                if claim_half_open:
+                    stats.half_open_probe_until = now + self.half_open_probe_seconds
+                available.add(endpoint_id)
+        return available
 
     async def success(
         self, endpoint_id: str, latency_seconds: float, output_tokens: int | None = None
     ) -> None:
-        async with self._lock:
+        with self._lock:
             stats = self._stats[endpoint_id]
             stats.attempts += 1
             stats.successes += 1
             stats.consecutive_failures = 0
             stats.circuit_open_until = 0
+            stats.half_open_probe_until = 0
             stats.latencies.append(latency_seconds)
             if output_tokens and latency_seconds > 0:
                 stats.throughputs.append(output_tokens / latency_seconds)
 
     async def failure(self, endpoint_id: str) -> None:
-        async with self._lock:
+        with self._lock:
             stats = self._stats[endpoint_id]
             stats.attempts += 1
             stats.consecutive_failures += 1
             if stats.consecutive_failures >= self.failure_threshold:
-                stats.circuit_open_until = time.monotonic() + self.cooldown_seconds
+                stats.circuit_open_until = self._clock() + self.cooldown_seconds
+                stats.half_open_probe_until = 0
 
 
 def parse_routing_policy(
@@ -244,7 +307,12 @@ def parse_routing_policy(
     # A caller must explicitly authorize routing below its requested privacy
     # floor. "preferred" selects the product default; it is not consent to
     # abandon zero retention when those routes are unavailable.
-    allow_downgrade = bool(privacy_raw.get("allow_downgrade", False))
+    allow_downgrade = _policy_boolean(
+        privacy_raw,
+        "allow_downgrade",
+        default=False,
+        section="privacy",
+    )
     # "required" is an unconditional fail-closed override.
     if header == "required":
         allow_downgrade = False
@@ -270,8 +338,18 @@ def parse_routing_policy(
     return RoutingPolicy(
         privacy=PrivacyPolicy(
             minimum=minimum,
-            require_zero_retention=bool(privacy_raw.get("require_zero_retention", False)),
-            require_response_proof=bool(privacy_raw.get("require_response_proof", False)),
+            require_zero_retention=_policy_boolean(
+                privacy_raw,
+                "require_zero_retention",
+                default=False,
+                section="privacy",
+            ),
+            require_response_proof=_policy_boolean(
+                privacy_raw,
+                "require_response_proof",
+                default=False,
+                section="privacy",
+            ),
             allow_downgrade=allow_downgrade,
             confidential_disabled=header == "disabled",
         ),
@@ -279,8 +357,18 @@ def parse_routing_policy(
             order=_strings(provider_raw.get("order", []), "provider.order"),
             only=_strings(provider_raw.get("only", []), "provider.only"),
             ignore=_strings(provider_raw.get("ignore", []), "provider.ignore"),
-            allow_fallbacks=bool(provider_raw.get("allow_fallbacks", True)),
-            require_parameters=bool(provider_raw.get("require_parameters", True)),
+            allow_fallbacks=_policy_boolean(
+                provider_raw,
+                "allow_fallbacks",
+                default=True,
+                section="provider",
+            ),
+            require_parameters=_policy_boolean(
+                provider_raw,
+                "require_parameters",
+                default=True,
+                section="provider",
+            ),
             sort=sort_by,
             max_input_price_microusd_per_million=_usd_price(max_price.get("input")),
             max_output_price_microusd_per_million=_usd_price(max_price.get("output")),
@@ -297,6 +385,23 @@ def route_endpoints(
     model_id: str,
     policy: RoutingPolicy,
     health: EndpointHealth,
+) -> list[Endpoint]:
+    return _route_endpoints(
+        config,
+        model_id,
+        policy,
+        health,
+        claim_half_open=True,
+    )
+
+
+def _route_endpoints(
+    config: GatewayConfig,
+    model_id: str,
+    policy: RoutingPolicy,
+    health: EndpointHealth,
+    *,
+    claim_half_open: bool,
 ) -> list[Endpoint]:
     candidates = config.endpoints_for(model_id)
     candidates = [
@@ -383,7 +488,15 @@ def route_endpoints(
             automatic=policy.automatic,
         )
         try:
-            downgrade = route_endpoints(config, model_id, downgrade_policy, health)
+            # The outer routing pass claims probes once after merging the
+            # normal and explicitly authorized downgrade candidates.
+            downgrade = _route_endpoints(
+                config,
+                model_id,
+                downgrade_policy,
+                health,
+                claim_half_open=False,
+            )
         except RoutingError:
             downgrade = []
         seen = {endpoint.id for endpoint in candidates}
@@ -394,11 +507,21 @@ def route_endpoints(
             f"Model {model_id!r} has no endpoint satisfying the request policy",
         )
 
+    available_ids = health.available_endpoint_ids(
+        (endpoint.id for endpoint in candidates),
+        claim_half_open=claim_half_open,
+    )
+    candidates = [endpoint for endpoint in candidates if endpoint.id in available_ids]
+    if not candidates:
+        raise RoutingError(
+            "all_endpoints_unavailable",
+            f"All eligible endpoints for model {model_id!r} have open circuits",
+        )
+
     order_index = {provider: index for index, provider in enumerate(provider_policy.order)}
 
     def key(endpoint: Endpoint) -> tuple[Any, ...]:
         stats = health.get(endpoint.id)
-        healthy_rank = 0 if stats.healthy else 1
         explicit_rank = order_index.get(endpoint.provider, len(order_index))
         if provider_policy.sort == "price":
             metric: float = (
@@ -411,7 +534,7 @@ def route_endpoints(
             metric = -stats.throughput
         else:
             metric = endpoint.priority
-        return healthy_rank, explicit_rank, metric, -stats.success_rate, endpoint.id
+        return explicit_rank, metric, -stats.success_rate, endpoint.id
 
     candidates.sort(key=key)
     return candidates if provider_policy.allow_fallbacks else candidates[:1]
@@ -566,6 +689,24 @@ def _strings(value: Any, name: str) -> tuple[str, ...]:
     if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
         raise RoutingError("invalid_provider_policy", f"{name} must be a list of strings")
     return tuple(value)
+
+
+def _policy_boolean(
+    policy: dict[str, Any],
+    field: str,
+    *,
+    default: bool,
+    section: Literal["privacy", "provider"],
+) -> bool:
+    if field not in policy:
+        return default
+    value = policy[field]
+    if not isinstance(value, bool):
+        raise RoutingError(
+            f"invalid_{section}_policy",
+            f"{section}.{field} must be a boolean",
+        )
+    return value
 
 
 def _usd_price(value: Any) -> int | None:

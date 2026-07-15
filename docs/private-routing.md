@@ -1,6 +1,6 @@
 # Private provider routing
 
-OpenSoftware API is an OpenAI-compatible router for verifiably private inference. It does not
+OpenSoftware API is an OpenAI-compatible router for policy-enforced private inference. It does not
 operate a GPU fleet in the hosted-provider deployment. Public model IDs map to one or more provider
 endpoints and routing filters privacy and feature requirements before considering price or health.
 
@@ -103,15 +103,15 @@ against the larger of the full raw request byte size and the selected model's en
 capacity whenever non-text input is present. This covers both large inline data URLs and short
 remote URLs whose visual token usage is not knowable before inference. Fallback candidates are
 compared using this bound. Metered non-text requests fail closed if an eligible model has no
-configured context capacity. When a non-text request omits both output-limit fields, the gateway
-adds `max_completion_tokens: 2048` to the effective upstream request and reserves against that
-enforced cap. A valid explicit limit is forwarded unchanged and the reservation is capped at the
-model's configured maximum. If both `max_completion_tokens` and `max_tokens` are set, the gateway
-uses the larger positive integer as the canonical `max_completion_tokens` value and removes
-`max_tokens` before routing, billing, and forwarding. Every supplied non-text output limit must be a
-positive, non-boolean integer; explicit `null` values are removed and treated as omitted. Invalid
-single or dual values fail with a 400 response before any upstream call. This prevents an upstream
-provider from honoring a value that the gateway's billing estimate parsed or clamped differently.
+configured context capacity. Every chat or legacy-completions request has an enforced output bound:
+omitting both output-limit fields adds a 2,048-token default. A valid explicit limit is forwarded
+and the reservation is capped at the model's configured maximum. If both `max_completion_tokens`
+and `max_tokens` are set, the gateway uses the larger positive integer and forwards one canonical
+field (`max_completion_tokens` for chat, `max_tokens` for the legacy completions endpoint). Every
+supplied output limit must be a positive, non-boolean integer; explicit `null` values are removed
+and treated as omitted. Invalid single or dual values fail with a 400 response before any upstream
+call. Embedding requests are not given a generation limit. This prevents an upstream provider from
+honoring a value that the gateway's billing estimate parsed or clamped differently.
 Nested media content is never rewritten. Settlement uses
 billable prompt/completion usage reported by the upstream provider. Missing usage, `total_tokens`
 alone, or zero-only token fields emit a warning and fall back to the bounded structural estimate
@@ -232,8 +232,8 @@ messages are forbidden in production.
 
 ## Venice compatibility for June
 
-The dormant compatibility surface implements Venice endpoints consumed by June API: typed model
-catalogs, audio transcription, augment search/scrape, and JSON image generation. It is enabled only with
-`VENICE_COMPAT_ENABLED=true` and only static service API keys may call it. These responses declare
+The production compatibility surface implements Venice endpoints consumed by June API: typed model
+catalogs, audio transcription, augment search/scrape, and JSON image generation. It is guarded by
+`VENICE_COMPAT_ENABLED=true`, and only static service API keys may call it. These responses declare
 `X-OS-Billing-Owner: caller`, so June remains the single billing authority during a reversible
-canary. See `docs/os-june-venice-migration.md` for the no-cutover procedure.
+migration. See `docs/os-june-venice-migration.md` for the completed sequence and rollback boundary.

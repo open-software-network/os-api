@@ -19,19 +19,19 @@ locals {
     VENICE_API_KEY           = "venice-api-key"
   })
   confidential_secret_files_primary = jsonencode({
-    "/tmp/os-api-secrets/models.yaml"  = "cloudrun-model-config"
     "/tmp/os-api-secrets/redis-ca.pem" = "gateway-redis-ca"
   })
   confidential_secret_files_secondary = jsonencode({
-    "/tmp/os-api-secrets/models.yaml"  = "cloudrun-model-config-secondary"
     "/tmp/os-api-secrets/redis-ca.pem" = "gateway-redis-ca-secondary"
   })
 }
 
-check "confidential_gateway_image_is_pinned" {
+check "gateway_image_is_pinned" {
   assert {
-    condition     = !var.enable_confidential_gateway || local.confidential_gateway_digest != ""
-    error_message = "Confidential Space requires gateway_image to be pinned by a sha256 digest."
+    condition = !(var.enable_public_api || var.enable_confidential_gateway) || (
+      local.confidential_gateway_digest != ""
+    )
+    error_message = "Public and Confidential Space gateways require gateway_image to be pinned by a sha256 digest."
   }
 }
 
@@ -101,16 +101,16 @@ locals {
     "tee-env-CONFIDENTIAL_SPACE_WIP_PROVIDER"                = google_iam_workload_identity_pool_provider.confidential_gateway[0].name
     "tee-env-CONFIDENTIAL_SPACE_IMPERSONATE_SERVICE_ACCOUNT" = google_service_account.api_runtime.email
     "tee-env-CONFIDENTIAL_SPACE_SECRET_ENV"                  = local.confidential_secret_environment
-    "tee-env-MODEL_CONFIG_PATH"                              = "/tmp/os-api-secrets/models.yaml"
+    "tee-env-MODEL_CONFIG_PATH"                              = "/app/config/models.yaml"
     "tee-env-REDIS_CA_CERT_PATH"                             = "/tmp/os-api-secrets/redis-ca.pem"
     "tee-env-ENABLE_MANAGED_KEYS"                            = "true"
-    "tee-env-FIRESTORE_COLLECTION_PREFIX"                    = "sovereign"
+    "tee-env-FIRESTORE_COLLECTION_PREFIX"                    = var.firestore_collection_prefix
     "tee-env-FIRESTORE_DATABASE_ID"                          = local.active_firestore_database_id
     "tee-env-VENICE_COMPAT_ENABLED"                          = "true"
     "tee-env-APP_ORIGIN"                                     = "https://${var.public_api_domain}"
     "tee-env-OS_ACCOUNTS_URL"                                = "https://accounts.opensoftware.co"
     "tee-env-OS_ACCOUNTS_API_URL"                            = "https://accounts-api.opensoftware.co"
-    "tee-env-SITE_BASIC_AUTH_USERNAME"                       = "alongside"
+    "tee-env-SITE_BASIC_AUTH_USERNAME"                       = var.site_basic_auth_username
     "tee-env-GATEWAY_ATTESTATION_AUDIENCE"                   = "https://june-api.opensoftware.co/os-api-gateway"
   } : {}
 }

@@ -1,26 +1,43 @@
-project_id             = "autonomous-lab-490610"
+project_id             = "example-project-id"
 region                 = "us-central1"
 secondary_region       = "us-east4"
 system_node_zone       = "us-central1-a"
 standard_gpu_zones     = ["us-central1-a", "us-central1-b", "us-central1-c"]
 master_authorized_cidr = "203.0.113.10/32"
 
+# Build and push this image before enabling a public gateway. Mutable tags are
+# intentionally rejected by the deployment checks.
+gateway_image = "us-central1-docker.pkg.dev/example-project-id/sovereign-inference/gateway@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
 # Enable only after confirming current zone availability and preemptible H100 quota.
 enable_confidential_gpu_pool = false
 enable_confidential_cpu_pool = false
 confidential_gpu_zone        = "us-central1-a"
 
-# Enable only after populating the Cloud Run model, API-key, and Redis secrets.
+# Enable only after populating the API-key, provider, and Redis secrets. Terraform
+# creates the selected Firestore database; import it first if it already exists.
 enable_public_api = false
 
-# Production control-plane defaults. Leave the legacy mapping enabled until the
-# Certificate Manager DNS authorization has issued and the edge IP is live.
-enable_production_edge       = false
-restrict_cloud_run_ingress   = false
-enable_legacy_domain_mapping = true
-enable_monitoring            = true
-enable_firestore_backups     = false
+# Production control-plane defaults. Changing firestore_collection_prefix
+# selects a different logical dataset; migrate existing collections first.
+# Leave the legacy mapping enabled until the Certificate Manager DNS
+# authorization has issued and the edge IP is live.
+enable_production_edge             = false
+restrict_cloud_run_ingress         = false
+enable_legacy_domain_mapping       = true
+enable_monitoring                  = true
+enable_firestore_backups           = false
+firestore_collection_prefix        = "sovereign"
 enable_multi_region_control_plane = false
 enable_binary_authorization       = false
-enable_github_deployments    = false
-alert_email                  = "alerts@example.com"
+enable_github_deployments          = false
+alert_email                        = "alerts@example.com"
+
+# Required only when enable_github_deployments is true. Find these immutable
+# numeric IDs through the GitHub API; do not substitute names.
+github_repository_id       = ""
+github_repository_owner_id = ""
+
+# Set both this and the site-basic-auth-password secret to protect only the
+# dashboard and docs. The OpenAI-compatible API continues to use Bearer keys.
+site_basic_auth_username = ""

@@ -1,8 +1,8 @@
 # Second-region model plane: a zonal GKE cluster in us-east4-a running the
 # same digest-pinned confidential CPU vLLM workload behind its own internal
-# load balancer. Each region's gateway talks to its regional model backend
-# (per-region cloudrun-model-config secrets), so a us-central1 loss no longer
-# takes down inference everywhere. TDX C3 machines are available in
+# load balancer. The signed gateway image carries the reviewed provider catalog,
+# so a us-central1 loss no longer depends on mutable runtime configuration. TDX
+# C3 machines are available in
 # us-east4-a and us-east4-c.
 #
 # Approximate steady cost while enabled: one c3-standard-4 node (~$140/mo)

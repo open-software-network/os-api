@@ -26,8 +26,8 @@ spec:
           type: RuntimeDefault
       containers:
         - name: gateway
-          # Replace with the digest-pinned image from your Artifact Registry.
-          image: us-central1-docker.pkg.dev/PROJECT_ID/sovereign-inference/gateway:0.1.0
+          # Replace with the digest-pinned image from your registry.
+          image: example.invalid/os-api/gateway@sha256:0000000000000000000000000000000000000000000000000000000000000000
           imagePullPolicy: IfNotPresent
           ports:
             - name: http

@@ -1,17 +1,19 @@
 # Live GCP test record
 
+This is a historical validation record, not a description of the current hosted service. Account identifiers, direct service URLs, and credential names have been omitted because they are not needed to reproduce the test.
+
 ## Environment
 
 - Date: July 9, 2026
-- Project: `autonomous-lab-490610`
+- Project: dedicated test project (identifier omitted)
 - Region/zone: `us-central1` / `us-central1-a`
-- Billing account: `014271-346F7E-5C47CB` (`Alongside + GCP Credits`)
+- Billing: project-scoped test budget with alert thresholds
 - GKE: regional private-node Standard cluster, `1.36.0-gke.4447000`
 - Model backend: vLLM `0.23.0`, Qwen2.5 0.5B Instruct
 - Compute tested: one NVIDIA L4 and one `c3-standard-4` Intel TDX node
 - Edge exposure: local `kubectl port-forward` only; no public load balancer
 
-Terraform state is in the versioned, uniform-access bucket `gs://autonomous-lab-490610-sovereign-tfstate/platform`. A gross-spend budget of $100/month is scoped to the project, with thresholds at 50%, 80%, and 100%.
+Terraform state was stored in a private, versioned, uniform-access bucket. A gross-spend budget of $100/month was scoped to the project, with thresholds at 50%, 80%, and 100%.
 
 ## Results
 
@@ -60,7 +62,7 @@ At public list prices, the persistent core is approximately $0.30/hour or $220/m
 
 ## Public HTTPS test
 
-Cloud Run now exposes `https://sovereign-api-4axxohm2tq-uc.a.run.app/v1` with a dedicated app key stored in Secret Manager. The edge connects to Redis and the model only over the private VPC. External verification returned:
+A temporary managed Cloud Run endpoint was exercised with a dedicated test key stored in Secret Manager. The endpoint was later replaced by the production edge and its direct URL is intentionally omitted. The edge connected to Redis and the model only over the private VPC. External verification returned:
 
 | Check | Result |
 | --- | --- |
@@ -81,7 +83,7 @@ L4 allocations were retried in `us-central1-a`, `us-central1-b`, and `us-central
 ```bash
 gcloud container clusters get-credentials sovereign-inference \
   --region us-central1 \
-  --project autonomous-lab-490610
+  --project "$PROJECT_ID"
 
 kubectl -n inference scale deployment/standard-vllm --replicas=1
 kubectl -n inference rollout status deployment/standard-vllm --timeout=10m
@@ -92,8 +94,8 @@ In another terminal, retrieve the one-time smoke key without printing it and cal
 
 ```bash
 export API_KEY="$(gcloud secrets versions access latest \
-  --secret=smoke-client-api-key \
-  --project=autonomous-lab-490610)"
+  --secret="$SMOKE_SECRET" \
+  --project="$PROJECT_ID")"
 
 curl http://127.0.0.1:18080/v1/chat/completions \
   -H "Authorization: Bearer $API_KEY" \
@@ -110,7 +112,7 @@ gcloud container clusters resize sovereign-inference \
   --node-pool=standard-l4 \
   --num-nodes=0 \
   --region=us-central1 \
-  --project=autonomous-lab-490610 \
+  --project="$PROJECT_ID" \
   --quiet
 ```
 

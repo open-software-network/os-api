@@ -1,3 +1,23 @@
+check "github_deployment_identity_is_scoped" {
+  assert {
+    condition = !var.enable_github_deployments || (
+      var.github_repository_id != "" && var.github_repository_owner_id != ""
+    )
+    error_message = "GitHub deployments require immutable github_repository_id and github_repository_owner_id values."
+  }
+}
+
+check "github_deployment_prerequisites_are_enabled" {
+  assert {
+    condition = !var.enable_github_deployments || (
+      var.enable_public_api &&
+      var.enable_binary_authorization &&
+      var.enable_multi_region_control_plane
+    )
+    error_message = "The production GitHub workflow requires the public API, Binary Authorization, and multi-region control plane."
+  }
+}
+
 resource "google_service_account" "github_deployer" {
   count = var.enable_github_deployments ? 1 : 0
 
@@ -56,6 +76,14 @@ resource "google_project_iam_member" "github_run_developer" {
 
   project = var.project_id
   role    = "roles/run.developer"
+  member  = "serviceAccount:${google_service_account.github_deployer[0].email}"
+}
+
+resource "google_project_iam_member" "github_compute_viewer" {
+  count = var.enable_github_deployments ? 1 : 0
+
+  project = var.project_id
+  role    = "roles/compute.viewer"
   member  = "serviceAccount:${google_service_account.github_deployer[0].email}"
 }
 

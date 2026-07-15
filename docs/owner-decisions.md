@@ -1,17 +1,15 @@
-# Remaining parity items requiring owner decisions
+# Owner decisions and remaining production boundaries
 
-These are the production-parity items that are not purely engineering: they need a budget commitment, an org-level change, or external procurement. Each is scoped so the decision is concrete.
+These are production-parity decisions that need a budget commitment, an organization-level change, or external procurement. Resolved decisions remain recorded when their ongoing release gate is important.
 
-## Hosted private-inference credentials
+## Hosted private-inference credentials (resolved July 11, 2026)
 
-- **Status**: the provider router, catalog, deployment wiring, price validation, and fail-closed
-  readiness checks are implemented. Secret Manager resources are declared for Phala and Venice,
-  but production has no enabled provider-key versions yet.
-- **Decision needed**: fund the Phala and Venice accounts, create least-privilege production keys,
-  and add them as enabled versions of `phala-api-key` and `venice-api-key`.
-- **Launch gate**: do not publish the hosted catalog secret or promote a router revision until both
-  provider keys pass a private canary request and evidence-header check. The service intentionally
-  returns not-ready when an enabled catalog provider lacks its credential.
+- **Status**: least-privilege provider credentials are configured in Secret Manager and the hosted
+  router passed its private canary. Credential values and version history are intentionally kept
+  outside this repository.
+- **Ongoing release gate**: do not promote a router revision unless every enabled provider passes
+  credential readiness, a private canary request, and its expected evidence-header check. The
+  service intentionally returns not-ready when an enabled provider lacks its credential.
 
 ## Hosted-provider attestation policy
 
@@ -44,7 +42,7 @@ These are the production-parity items that are not purely engineering: they need
 
 ## Attestation hardening (partially owner, partially engineering)
 
-The attestation endpoint returns a real, client-verifiable TDX quote today (see `recovery-drills/2026-07-10-attestation.md`). Two follow-ons remain, both engineering but worth an explicit priority call:
+The attestation endpoint returns a real, client-verifiable TDX quote today. Two follow-ons remain, both engineering but worth an explicit priority call:
 
 - Server-side quote verification / attestation PKI (verify against Intel PCS in-platform, not only client-side).
 - Binding a measured-boot model image digest into report-data rather than gateway-asserted configuration, and gating confidential key release on a passing attestation (fail-closed key release).

@@ -44,9 +44,7 @@ async def request_gateway_attestation(
     instead of manufacturing substitute evidence.
     """
 
-    resolved_audience = audience or os.getenv(
-        "GATEWAY_ATTESTATION_AUDIENCE", DEFAULT_AUDIENCE
-    )
+    resolved_audience = audience or os.getenv("GATEWAY_ATTESTATION_AUDIENCE", DEFAULT_AUDIENCE)
     resolved_socket = socket_path or os.getenv(
         "CONFIDENTIAL_SPACE_ATTESTATION_SOCKET", DEFAULT_SOCKET_PATH
     )

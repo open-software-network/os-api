@@ -25,6 +25,29 @@ models:
         GatewayConfig.load(path)
 
 
+def test_legacy_confidential_backend_does_not_claim_independent_verification(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy.yaml"
+    path.write_text(
+        """
+backends:
+  confidential:
+    base_url: http://confidential.internal
+    privacy: confidential
+models:
+  private/model:
+    confidential_backend: confidential
+"""
+    )
+
+    config = GatewayConfig.load(path)
+    endpoint = config.endpoints["confidential:private/model"]
+
+    assert endpoint.privacy.level == "tee"
+    assert endpoint.privacy.attestation == "gateway"
+
+
 def test_rejects_non_string_backend_revision(tmp_path: Path) -> None:
     path = tmp_path / "invalid.yaml"
     path.write_text(

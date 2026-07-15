@@ -1,1 +1,6 @@
-* @junhohong
+* @open-software-network/engineering
+
+# Security-sensitive release and infrastructure surfaces.
+/.github/ @open-software-network/engineering
+/deploy/ @open-software-network/engineering
+/SECURITY.md @open-software-network/engineering

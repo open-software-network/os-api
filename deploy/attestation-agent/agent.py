@@ -66,7 +66,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.path != "/quote":
             self._respond(404, {"error": "not_found"})
             return
-        length = int(self.headers.get("content-length", "0"))
+        try:
+            length = int(self.headers.get("content-length", "0"))
+        except ValueError:
+            self._respond(400, {"error": "invalid_body_length"})
+            return
         if length <= 0 or length > MAX_BODY_BYTES:
             self._respond(400, {"error": "invalid_body_length"})
             return
@@ -74,7 +78,7 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length))
             report_data = bytes.fromhex(payload["report_data"])
             result = generate_quote(report_data)
-        except (KeyError, ValueError, TypeError):
+        except (json.JSONDecodeError, UnicodeDecodeError, KeyError, ValueError, TypeError):
             self._respond(400, {"error": "report_data must be 128 hex characters"})
             return
         except OSError:
@@ -87,4 +91,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    ThreadingHTTPServer(("0.0.0.0", 8100), Handler).serve_forever()
+    # The pod is reached through an internal load balancer and constrained by
+    # the inference namespace network policy; listening on the pod interface
+    # is required for that service path.
+    ThreadingHTTPServer(("0.0.0.0", 8100), Handler).serve_forever()  # nosec B104

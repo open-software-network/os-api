@@ -15,6 +15,7 @@ spec:
       labels:
         app: confidential-vllm
         compute-privacy: confidential
+        sovereign.network/model: "true"
     spec:
       automountServiceAccountToken: false
       securityContext:

@@ -9,7 +9,7 @@
   <article>
     <div class="eyebrow">OpenSoftware API</div>
     <h1>Developer docs</h1>
-    <p class="lede">OpenAI-compatible inference for open models hosted on OpenSoftware infrastructure.</p>
+    <p class="lede">OpenAI-compatible inference routed through reviewed private providers.</p>
 
     <h2 id="quickstart">Quickstart</h2>
     <p>Create a key in the <a href="/dashboard">dashboard</a>, then use the standard OpenAI client.</p>
@@ -22,7 +22,7 @@ client = OpenAI(
 )
 
 completion = client.chat.completions.create(
-    model="qwen2.5-0.5b-instruct",
+    model="openai/gpt-oss-20b",
     messages=[{"role": "user", "content": "Say hello"}],
 )
 print(completion.choices[0].message.content)</code></pre>
@@ -30,7 +30,7 @@ print(completion.choices[0].message.content)</code></pre>
     <pre><code>curl https://api.opensoftware.co/v1/chat/completions \
   -H "Authorization: Bearer $OPENSOFTWARE_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"qwen2.5-0.5b-instruct","messages":[{"role":"user","content":"Hello"}]}'</code></pre>
+  -d '{"model":"openai/gpt-oss-20b","messages":[{"role":"user","content":"Hello"}]}'</code></pre>
 
     <h2 id="models">Models</h2>
     <div class="model-list">

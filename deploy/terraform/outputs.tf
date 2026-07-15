@@ -86,6 +86,16 @@ output "github_deployer_service_account" {
   value = try(google_service_account.github_deployer[0].email, null)
 }
 
+output "github_artifact_image" {
+  description = "Set the production environment variable GCP_ARTIFACT_IMAGE to this untagged image path."
+  value       = "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.containers.repository_id}/gateway"
+}
+
+output "public_ready_url" {
+  description = "Set the production environment variable PUBLIC_READY_URL to this endpoint."
+  value       = "https://${var.public_api_domain}/readyz"
+}
+
 output "firestore_backup_bucket" {
   value = try(google_storage_bucket.firestore_backups[0].name, null)
 }

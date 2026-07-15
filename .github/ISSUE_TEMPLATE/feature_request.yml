@@ -1,0 +1,26 @@
+name: Feature request
+description: Propose an improvement to the gateway or its deployment tooling.
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user or operator problem would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Include alternatives and privacy or security tradeoffs where relevant.
+    validations:
+      required: true
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Safety check
+      options:
+        - label: I did not include secrets, credentials, prompts, completions, or customer data.
+          required: true

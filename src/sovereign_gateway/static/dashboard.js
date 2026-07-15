@@ -1,5 +1,8 @@
 const $ = (selector) => document.querySelector(selector);
 const dialog = $("#create-dialog");
+let loadedKeys = [];
+let nextKeyCursor = null;
+let loadingKeys = false;
 
 function money(microusd) {
   if (microusd === null || microusd === undefined) return "No limit";
@@ -24,14 +27,40 @@ async function request(path, options = {}) {
   return body;
 }
 
-async function loadKeys() {
-  const { data } = await request("/api/keys");
-  $("#keys").innerHTML = data.length ? `<table><thead><tr><th>Name</th><th>Key</th><th>Expires</th><th>Spend</th><th>Status</th><th></th></tr></thead><tbody>${data.map((key) => `<tr><td><strong>${escapeHtml(key.name)}</strong></td><td><code>${escapeHtml(key.prefix)}</code></td><td>${date(key.expires_at)}</td><td>${money(key.spend_used_microusd)} / ${money(key.spend_limit_microusd)}</td><td><span class="pill ${key.status}">${escapeHtml(key.status.replaceAll("_", " "))}</span></td><td>${key.status === "active" ? `<button class="text-button revoke" data-id="${escapeHtml(key.id)}">Revoke</button>` : ""}</td></tr>`).join("")}</tbody></table>` : `<div class="empty"><strong>No API keys yet</strong><span>Create a key to connect your first app.</span></div>`;
+function renderKeys() {
+  const rows = loadedKeys.map((key) => `<tr><td><strong>${escapeHtml(key.name)}</strong></td><td><code>${escapeHtml(key.prefix)}</code></td><td>${date(key.expires_at)}</td><td>${money(key.spend_used_microusd)} / ${money(key.spend_limit_microusd)}</td><td><span class="pill ${key.status}">${escapeHtml(key.status.replaceAll("_", " "))}</span></td><td>${key.status === "active" ? `<button class="text-button revoke" data-id="${escapeHtml(key.id)}">Revoke</button>` : ""}</td></tr>`).join("");
+  const pagination = nextKeyCursor ? `<div class="loading"><button class="button secondary small" id="load-more-keys">Load more keys</button></div>` : "";
+  $("#keys").innerHTML = loadedKeys.length ? `<table><thead><tr><th>Name</th><th>Key</th><th>Expires</th><th>Spend</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table>${pagination}` : `<div class="empty"><strong>No API keys yet</strong><span>Create a key to connect your first app.</span></div>`;
   document.querySelectorAll(".revoke").forEach((button) => button.addEventListener("click", async () => {
     if (!confirm("Revoke this API key? Requests using it will stop immediately.")) return;
     await request(`/api/keys/${encodeURIComponent(button.dataset.id)}`, { method: "DELETE" });
     await loadKeys();
   }));
+  $("#load-more-keys")?.addEventListener("click", async (event) => {
+    event.currentTarget.disabled = true;
+    try {
+      await loadKeys({ append: true });
+    } catch (error) {
+      event.currentTarget.disabled = false;
+      event.currentTarget.textContent = "Try again";
+      event.currentTarget.title = error.message;
+    }
+  });
+}
+
+async function loadKeys({ append = false } = {}) {
+  if (loadingKeys || (append && !nextKeyCursor)) return;
+  loadingKeys = true;
+  try {
+    const query = new URLSearchParams({ limit: "100" });
+    if (append) query.set("cursor", nextKeyCursor);
+    const { data, next_cursor: nextCursor } = await request(`/api/keys?${query}`);
+    loadedKeys = append ? [...loadedKeys, ...data] : data;
+    nextKeyCursor = nextCursor;
+    renderKeys();
+  } finally {
+    loadingKeys = false;
+  }
 }
 
 async function loadUsage() {

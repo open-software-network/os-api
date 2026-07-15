@@ -1,7 +1,7 @@
 locals {
   alert_notification_channels = concat(
     var.alert_notification_channels,
-    var.alert_email != "" ? [google_monitoring_notification_channel.email[0].name] : [],
+    google_monitoring_notification_channel.email[*].name,
   )
 }
 

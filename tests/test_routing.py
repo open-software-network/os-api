@@ -51,6 +51,18 @@ class DelayedAsyncByteStream(httpx.AsyncByteStream):
         yield self.content
 
 
+class TrackingAsyncByteStream(httpx.AsyncByteStream):
+    def __init__(self, content: bytes) -> None:
+        self.content = content
+        self.closed = False
+
+    async def __aiter__(self):
+        yield self.content
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
 API_KEY = "sk-routing-test"
 
 CONFIG = """
@@ -131,6 +143,7 @@ def routed_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[T
     monkeypatch.delenv("REDIS_URL", raising=False)
     calls: list[str] = []
     payloads: list[dict[str, object]] = []
+    response_streams: list[TrackingAsyncByteStream] = []
 
     async def upstream(request: httpx.Request) -> httpx.Response:
         calls.append(str(request.url))
@@ -176,8 +189,36 @@ def routed_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[T
             assert b"nvidia/parakeet-tdt-0.6b-v3" in request.content
             assert b'filename="audio.wav"' in request.content
             assert b"private-name.wav" not in request.content
+            if b"oversized-response" in request.content:
+                stream = TrackingAsyncByteStream(json.dumps({"text": "x" * 128}).encode())
+                response_streams.append(stream)
+                return httpx.Response(200, stream=stream)
+            if b"\r\n\r\ntext\r\n" in request.content:
+                return httpx.Response(
+                    200,
+                    content=b"hello world\n",
+                    headers={"content-type": "text/html"},
+                )
+            if b"\r\n\r\nsrt\r\n" in request.content:
+                return httpx.Response(
+                    200,
+                    content=b"1\n00:00:00,000 --> 00:00:01,000\nhello\n",
+                    headers={"content-type": "text/html"},
+                )
+            if b"\r\n\r\nvtt\r\n" in request.content:
+                return httpx.Response(
+                    200,
+                    content=b"WEBVTT\n\n00:00.000 --> 00:01.000\nhello\n",
+                    headers={"content-type": "text/html"},
+                )
             return httpx.Response(200, json={"text": "hello", "language": "en"})
         if "/augment/" in request.url.path:
+            if b"oversized-response" in request.content:
+                stream = TrackingAsyncByteStream(
+                    json.dumps({"results": [{"content": "x" * 128}]}).encode()
+                )
+                response_streams.append(stream)
+                return httpx.Response(200, stream=stream)
             if b"invalid-content-type" in request.content:
                 return httpx.Response(
                     200, text="<script>alert(1)</script>", headers={"content-type": "text/html"}
@@ -198,7 +239,11 @@ def routed_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[T
         if "/image/" in request.url.path:
             assert request.headers["authorization"] == "Bearer venice-secret"
             payload = json.loads(request.content)
-            expected_read_timeout = 0.001 if payload["prompt"] == "force total timeout" else 360.0
+            expected_read_timeout = (
+                0.001
+                if payload["prompt"] in {"force total timeout", "force body timeout"}
+                else 360.0
+            )
             assert request.extensions["timeout"] == {
                 "connect": 10,
                 "read": expected_read_timeout,
@@ -211,6 +256,15 @@ def routed_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[T
                 raise AssertionError("total timeout did not cancel the upstream request")
             if payload["prompt"] == "force timeout":
                 raise httpx.ReadTimeout("image generation timed out", request=request)
+            if payload["prompt"] == "force body timeout":
+                return httpx.Response(
+                    200,
+                    stream=DelayedAsyncByteStream(b'{"images":[]}', 0.02),
+                )
+            if payload["prompt"] == "oversized response":
+                stream = TrackingAsyncByteStream(json.dumps({"images": ["x" * 128]}).encode())
+                response_streams.append(stream)
+                return httpx.Response(200, stream=stream)
             if payload["prompt"] == "reject as text":
                 return httpx.Response(400, text="bad model")
             if payload["prompt"] == "fail as text":
@@ -283,6 +337,39 @@ def routed_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[T
             )
         payload = json.loads(request.content)
         payloads.append(payload)
+        oversized_status = payload.get("metadata", {}).get("oversized_upstream_status")
+        if oversized_status:
+            stream = TrackingAsyncByteStream(
+                json.dumps(
+                    {
+                        "error" if oversized_status >= 400 else "id": "oversized",
+                        "padding": "x" * 1_024,
+                    }
+                ).encode()
+            )
+            response_streams.append(stream)
+            return httpx.Response(
+                oversized_status,
+                headers={
+                    "content-type": "application/json",
+                    "x-receipt-id": "receipt-oversized",
+                    "x-aci-identity": "workload-1",
+                    "x-aci-keyset-digest": "digest-1",
+                },
+                stream=stream,
+            )
+        forced_status = payload.get("metadata", {}).get("force_primary_status")
+        if forced_status and payload["model"] != "backup/private-model":
+            return httpx.Response(
+                forced_status,
+                json={
+                    "error": {
+                        "message": "request rejected by provider",
+                        "type": "invalid_request_error",
+                        "code": f"forced_{forced_status}",
+                    }
+                },
+            )
         if payload.get("metadata", {}).get("force_primary_400") and payload["model"] != (
             "backup/private-model"
         ):
@@ -312,6 +399,7 @@ def routed_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[T
         client.headers["Authorization"] = f"Bearer {API_KEY}"
         client.app.state.test_calls = calls
         client.app.state.test_payloads = payloads
+        client.app.state.test_response_streams = response_streams
         yield client
         anyio.run(old_client.aclose)
 
@@ -333,6 +421,110 @@ def test_endpoint_config_and_price_sorting(tmp_path: Path) -> None:
 
     assert [endpoint.provider for endpoint in endpoints] == ["phala", "venice"]
     assert endpoints[0].input_price_microusd_per_million == 40_000
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_excludes_open_endpoint_and_bounds_half_open_probe(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(CONFIG)
+    config = GatewayConfig.load(path)
+    policy = parse_routing_policy(
+        {"model": "openai/gpt-oss-20b", "privacy": {"minimum": "tee"}},
+        None,
+    )
+    now = [100.0]
+    health = EndpointHealth(
+        failure_threshold=1,
+        cooldown_seconds=10,
+        half_open_probe_seconds=2,
+        clock=lambda: now[0],
+    )
+
+    await health.failure("phala-gpt-oss-20b")
+    assert [
+        endpoint.id for endpoint in route_endpoints(config, "openai/gpt-oss-20b", policy, health)
+    ] == ["venice-gpt-oss-20b"]
+
+    now[0] += 10
+    first_probe = route_endpoints(config, "openai/gpt-oss-20b", policy, health)
+    concurrent_route = route_endpoints(config, "openai/gpt-oss-20b", policy, health)
+    assert [endpoint.id for endpoint in first_probe] == [
+        "phala-gpt-oss-20b",
+        "venice-gpt-oss-20b",
+    ]
+    assert [endpoint.id for endpoint in concurrent_route] == ["venice-gpt-oss-20b"]
+
+    now[0] += 2
+    retried_probe = route_endpoints(config, "openai/gpt-oss-20b", policy, health)
+    assert [endpoint.id for endpoint in retried_probe] == [
+        "phala-gpt-oss-20b",
+        "venice-gpt-oss-20b",
+    ]
+
+    await health.failure("phala-gpt-oss-20b")
+    assert [
+        endpoint.id for endpoint in route_endpoints(config, "openai/gpt-oss-20b", policy, health)
+    ] == ["venice-gpt-oss-20b"]
+
+    now[0] += 10
+    recovered_probe = route_endpoints(config, "openai/gpt-oss-20b", policy, health)
+    assert recovered_probe[0].id == "phala-gpt-oss-20b"
+    await health.success("phala-gpt-oss-20b", 0.1)
+    recovered_route = route_endpoints(config, "openai/gpt-oss-20b", policy, health)
+    assert recovered_route[0].id == "phala-gpt-oss-20b"
+
+
+def test_routed_request_skips_endpoint_while_circuit_is_open(
+    routed_client: TestClient,
+) -> None:
+    routed_client.app.state.endpoint_health = EndpointHealth(
+        failure_threshold=1,
+        cooldown_seconds=60,
+    )
+
+    first = routed_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "openai/gpt-oss-20b",
+            "messages": [{"role": "user", "content": "first"}],
+        },
+    )
+    second = routed_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "openai/gpt-oss-20b",
+            "messages": [{"role": "user", "content": "second"}],
+        },
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    inference_urls = [
+        url for url in routed_client.app.state.test_calls if url.endswith("/v1/chat/completions")
+    ]
+    assert sum("phala.test" in url for url in inference_urls) == 1
+    assert sum("venice.test" in url for url in inference_urls) == 2
+
+
+@pytest.mark.asyncio
+async def test_routing_fails_when_every_eligible_circuit_is_open(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(CONFIG)
+    config = GatewayConfig.load(path)
+    policy = parse_routing_policy(
+        {"model": "openai/gpt-oss-20b", "privacy": {"minimum": "tee"}},
+        None,
+    )
+    health = EndpointHealth(failure_threshold=1, cooldown_seconds=60)
+    await health.failure("phala-gpt-oss-20b")
+    await health.failure("venice-gpt-oss-20b")
+
+    with pytest.raises(RoutingError) as raised:
+        route_endpoints(config, "openai/gpt-oss-20b", policy, health)
+
+    assert raised.value.code == "all_endpoints_unavailable"
 
 
 def test_auto_cost_slider_selects_cheapest_eligible_model(routed_client: TestClient) -> None:
@@ -555,6 +747,95 @@ def test_non_text_output_cap_is_forwarded_without_rewriting_media(
     assert forwarded["messages"] == messages
 
 
+def test_text_request_without_output_limit_gets_enforced_default(
+    routed_client: TestClient,
+) -> None:
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "openai/gpt-oss-20b",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert response.status_code == 200
+    forwarded = routed_client.app.state.test_payloads[-1]
+    assert forwarded["max_completion_tokens"] == DEFAULT_NON_TEXT_MAX_COMPLETION_TOKENS
+
+
+def test_text_dual_output_limits_forward_only_the_larger_bound(
+    routed_client: TestClient,
+) -> None:
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "openai/gpt-oss-20b",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_completion_tokens": 1,
+            "max_tokens": 4_000,
+        },
+    )
+
+    assert response.status_code == 200
+    forwarded = routed_client.app.state.test_payloads[-1]
+    assert forwarded["max_completion_tokens"] == 4_000
+    assert "max_tokens" not in forwarded
+
+
+def test_legacy_completions_default_is_forwarded_as_max_tokens(
+    routed_client: TestClient,
+) -> None:
+    response = routed_client.post(
+        "/v1/completions",
+        json={"model": "openai/gpt-oss-20b", "prompt": "hello"},
+    )
+
+    assert response.status_code == 200
+    forwarded = routed_client.app.state.test_payloads[-1]
+    assert forwarded["max_tokens"] == DEFAULT_NON_TEXT_MAX_COMPLETION_TOKENS
+    assert "max_completion_tokens" not in forwarded
+
+
+def test_legacy_completions_dual_limits_forward_larger_as_max_tokens(
+    routed_client: TestClient,
+) -> None:
+    response = routed_client.post(
+        "/v1/completions",
+        json={
+            "model": "openai/gpt-oss-20b",
+            "prompt": "hello",
+            "max_completion_tokens": 4_000,
+            "max_tokens": 1,
+        },
+    )
+
+    assert response.status_code == 200
+    forwarded = routed_client.app.state.test_payloads[-1]
+    assert forwarded["max_tokens"] == 4_000
+    assert "max_completion_tokens" not in forwarded
+
+
+@pytest.mark.parametrize("field", ["max_completion_tokens", "max_tokens"])
+def test_text_output_limit_rejects_non_positive_or_non_integer_values(
+    routed_client: TestClient,
+    field: str,
+) -> None:
+    payload_count = len(routed_client.app.state.test_payloads)
+
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "openai/gpt-oss-20b",
+            "messages": [{"role": "user", "content": "hello"}],
+            field: "2048",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_output_limit"
+    assert len(routed_client.app.state.test_payloads) == payload_count
+
+
 def test_non_text_dual_output_limits_use_larger_bound_everywhere(
     routed_client: TestClient,
 ) -> None:
@@ -679,9 +960,7 @@ def test_non_text_invalid_single_output_limit_fails_without_forwarding(
 
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_output_limit"
-    assert response.json()["error"]["message"] == (
-        f"{name} must be a positive integer for non-text input"
-    )
+    assert response.json()["error"]["message"] == f"{name} must be a positive integer"
     assert len(routed_client.app.state.test_payloads) == forwarded_before
 
 
@@ -691,7 +970,7 @@ def test_non_text_invalid_single_output_limit_fails_without_forwarding(
         ({"max_tokens": None}, {"max_completion_tokens": 2_048}),
         (
             {"max_completion_tokens": None, "max_tokens": 100},
-            {"max_tokens": 100},
+            {"max_completion_tokens": 100},
         ),
         (
             {"max_completion_tokens": 100, "max_tokens": None},
@@ -921,13 +1200,14 @@ def test_non_text_billing_hold_clamps_explicit_output_limit() -> None:
     )
 
     assert reservation == configured_maximum_cost
-    assert payload["max_tokens"] == model.max_output_length * 2
-    assert "max_completion_tokens" not in payload
+    assert payload["max_completion_tokens"] == model.max_output_length * 2
+    assert "max_tokens" not in payload
 
 
 class _CapturingSettlementRepository:
     def __init__(self) -> None:
         self.actual_microusd: int | None = None
+        self.releases: list[tuple[str, str, str]] = []
 
     async def settle(
         self,
@@ -937,6 +1217,9 @@ class _CapturingSettlementRepository:
         event: dict[str, object],
     ) -> None:
         self.actual_microusd = actual_microusd
+
+    async def release(self, key_id: str, billing_id: str, reason: str) -> None:
+        self.releases.append((key_id, billing_id, reason))
 
 
 class _AcceptingSettlementAccounts:
@@ -1049,6 +1332,7 @@ async def test_stream_without_usage_charges_fallback_not_reservation() -> None:
     accounts = _AcceptingSettlementAccounts()
     request = _settlement_request(repository, accounts)
     billing = BillingContext("key-1", "bill-1", 100_000, 5_000, None)
+    health = EndpointHealth()
     upstream = httpx.Response(
         200,
         content=b'data: {"choices":[]}\n\ndata: [DONE]\n\n',
@@ -1064,12 +1348,154 @@ async def test_stream_without_usage_charges_fallback_not_reservation() -> None:
             route.model_id,
             "no-retention",
             route.id,
+            endpoint_health=health,
+            latency=0.1,
         )
     ]
 
     assert chunks
     assert repository.actual_microusd == billing.fallback_charge_microusd
     assert accounts.charged_microusd == billing.fallback_charge_microusd
+    assert repository.releases == []
+    stats = health.get(route.id)
+    assert stats.attempts == 1
+    assert stats.consecutive_failures == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("environment", "maximum", "content", "message"),
+    [
+        (
+            "MAX_SSE_LINE_BYTES",
+            32,
+            b"data: " + b"x" * 64,
+            "SSE line exceeds the size limit",
+        ),
+        (
+            "MAX_SSE_RESPONSE_BYTES",
+            32,
+            b"data: {}\n" * 8,
+            "SSE response exceeds the size limit",
+        ),
+    ],
+)
+async def test_metered_stream_bounds_line_and_total_size_and_closes_upstream(
+    monkeypatch: pytest.MonkeyPatch,
+    environment: str,
+    maximum: int,
+    content: bytes,
+    message: str,
+) -> None:
+    monkeypatch.setenv("MAX_SSE_LINE_BYTES", "1024")
+    monkeypatch.setenv("MAX_SSE_RESPONSE_BYTES", "1024")
+    monkeypatch.setenv(environment, str(maximum))
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    route = config.endpoints["venice-kimi-k2.6-private"]
+    repository = _CapturingSettlementRepository()
+    accounts = _AcceptingSettlementAccounts()
+    request = _settlement_request(repository, accounts)
+    billing = BillingContext("key-1", "bill-1", 100_000, 5_000, None)
+    health = EndpointHealth()
+    stream = TrackingAsyncByteStream(content)
+    upstream = httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        stream=stream,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        _ = [
+            chunk
+            async for chunk in _metered_stream(
+                request,
+                upstream,
+                billing,
+                route,
+                route.model_id,
+                "no-retention",
+                route.id,
+                endpoint_health=health,
+                latency=0.1,
+            )
+        ]
+
+    assert stream.closed is True
+    assert repository.actual_microusd is None
+    assert repository.releases == [("key-1", "bill-1", "upstream_stream_too_large")]
+    stats = health.get(route.id)
+    assert stats.attempts == 1
+    assert stats.consecutive_failures == 1
+
+
+@pytest.mark.anyio
+async def test_metered_stream_releases_billing_and_marks_truncated_upstream_failed() -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    route = config.endpoints["venice-kimi-k2.6-private"]
+    repository = _CapturingSettlementRepository()
+    accounts = _AcceptingSettlementAccounts()
+    request = _settlement_request(repository, accounts)
+    billing = BillingContext("key-1", "bill-1", 100_000, 5_000, None)
+    health = EndpointHealth()
+    stream = TrackingAsyncByteStream(b'data: {"choices":[]}\n\n')
+    upstream = httpx.Response(200, stream=stream)
+
+    with pytest.raises(httpx.RemoteProtocolError, match=r"before \[DONE\]"):
+        _ = [
+            chunk
+            async for chunk in _metered_stream(
+                request,
+                upstream,
+                billing,
+                route,
+                route.model_id,
+                "no-retention",
+                route.id,
+                endpoint_health=health,
+                latency=0.1,
+            )
+        ]
+
+    assert stream.closed is True
+    assert repository.actual_microusd is None
+    assert repository.releases == [("key-1", "bill-1", "upstream_stream_invalid")]
+    stats = health.get(route.id)
+    assert stats.attempts == 1
+    assert stats.consecutive_failures == 1
+
+
+@pytest.mark.anyio
+async def test_client_disconnect_settles_without_health_penalty() -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    route = config.endpoints["venice-kimi-k2.6-private"]
+    repository = _CapturingSettlementRepository()
+    accounts = _AcceptingSettlementAccounts()
+    request = _settlement_request(repository, accounts)
+    billing = BillingContext("key-1", "bill-1", 100_000, 5_000, None)
+    health = EndpointHealth()
+    stream = TrackingAsyncByteStream(b'data: {"choices":[]}\n\ndata: [DONE]\n\n')
+    upstream = httpx.Response(200, stream=stream)
+    metered = _metered_stream(
+        request,
+        upstream,
+        billing,
+        route,
+        route.model_id,
+        "no-retention",
+        route.id,
+        endpoint_health=health,
+        latency=0.1,
+    )
+
+    assert await anext(metered)
+    await metered.aclose()
+
+    assert stream.closed is True
+    assert repository.actual_microusd == billing.fallback_charge_microusd
+    assert repository.releases == []
+    stats = health.get(route.id)
+    assert stats.attempts == 0
+    assert stats.consecutive_failures == 0
 
 
 def test_text_missing_usage_fallback_preserves_reservation_estimate() -> None:
@@ -1280,20 +1706,57 @@ def test_auto_forwards_hermes_shape_with_selected_model(routed_client: TestClien
     assert response.headers["x-os-auto-selected-model"] == "openai/gpt-oss-20b"
 
 
-def test_auto_falls_back_to_next_model_after_provider_400(routed_client: TestClient) -> None:
+@pytest.mark.parametrize("status_code", [400, 401, 403, 413, 422])
+def test_auto_preserves_customer_error_without_retry_or_health_penalty(
+    routed_client: TestClient,
+    status_code: int,
+) -> None:
+    payload_count = len(routed_client.app.state.test_payloads)
     response = routed_client.post(
         "/v1/chat/completions",
         json={
             "model": "open-software/auto",
             "auto": {"cost_quality": 1},
             "messages": [{"role": "user", "content": "hello"}],
-            "metadata": {"force_primary_400": True},
+            "metadata": {"force_primary_status": status_code},
         },
     )
 
-    assert response.status_code == 200
-    assert response.headers["x-os-auto-selected-model"] == "backup/private-model"
-    assert response.json()["model"] == "backup/private-model"
+    assert response.status_code == status_code
+    assert response.json() == {
+        "error": {
+            "message": "request rejected by provider",
+            "type": "invalid_request_error",
+            "code": f"forced_{status_code}",
+        }
+    }
+    assert len(routed_client.app.state.test_payloads) == payload_count + 1
+    stats = routed_client.app.state.endpoint_health.get("phala-gpt-oss-20b")
+    assert stats.attempts == 0
+    assert stats.consecutive_failures == 0
+
+
+@pytest.mark.parametrize("status_code", [200, 400])
+def test_routed_inference_bounds_non_stream_upstream_body(
+    routed_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+) -> None:
+    monkeypatch.setenv("MAX_UPSTREAM_JSON_RESPONSE_BYTES", "64")
+    monkeypatch.setenv("MAX_UPSTREAM_ERROR_RESPONSE_BYTES", "64")
+
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "openai/gpt-oss-20b",
+            "messages": [{"role": "user", "content": "hello"}],
+            "metadata": {"oversized_upstream_status": status_code},
+        },
+    )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "upstream_response_too_large"
+    assert routed_client.app.state.test_response_streams[-1].closed is True
 
 
 def test_explicit_model_preserves_provider_400(routed_client: TestClient) -> None:
@@ -1512,6 +1975,33 @@ def test_default_privacy_requires_zero_retention_but_not_tee() -> None:
     assert required.privacy.allow_downgrade is False
 
 
+@pytest.mark.parametrize(
+    ("section", "field", "error_code"),
+    [
+        ("privacy", "allow_downgrade", "invalid_privacy_policy"),
+        ("privacy", "require_zero_retention", "invalid_privacy_policy"),
+        ("privacy", "require_response_proof", "invalid_privacy_policy"),
+        ("provider", "allow_fallbacks", "invalid_provider_policy"),
+        ("provider", "require_parameters", "invalid_provider_policy"),
+    ],
+)
+@pytest.mark.parametrize("value", ["false", 0, None])
+def test_policy_boolean_fields_reject_non_booleans(
+    section: str,
+    field: str,
+    error_code: str,
+    value: object,
+) -> None:
+    with pytest.raises(RoutingError) as raised:
+        parse_routing_policy(
+            {"model": "openai/gpt-oss-20b", section: {field: value}},
+            None,
+        )
+
+    assert raised.value.code == error_code
+    assert str(raised.value) == f"{section}.{field} must be a boolean"
+
+
 def test_venice_private_response_headers_report_non_tee_privacy() -> None:
     config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
     endpoint = config.endpoints["venice-glm-5.2-private"]
@@ -1559,6 +2049,28 @@ def test_provider_controls_can_disable_fallback(routed_client: TestClient) -> No
 
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "all_endpoints_unavailable"
+
+
+def test_preopened_endpoint_circuit_returns_service_unavailable(
+    routed_client: TestClient,
+) -> None:
+    health = routed_client.app.state.endpoint_health
+    for _ in range(health.failure_threshold):
+        anyio.run(health.failure, "phala-gpt-oss-20b")
+    payload_count = len(routed_client.app.state.test_payloads)
+
+    response = routed_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "openai/gpt-oss-20b",
+            "messages": [],
+            "provider": {"only": ["phala"], "allow_fallbacks": False},
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "all_endpoints_unavailable"
+    assert len(routed_client.app.state.test_payloads) == payload_count
 
 
 def test_explicit_model_fallback_preserves_policy(routed_client: TestClient) -> None:
@@ -1635,6 +2147,63 @@ def test_audio_transcription_matches_venice_upstream_contract(routed_client: Tes
     assert response.json() == {"text": "hello", "language": "en"}
     assert response.headers["x-os-billing-owner"] == "caller"
     assert response.headers["x-os-provider"] == "venice"
+
+
+@pytest.mark.parametrize(
+    ("response_format", "expected_body", "expected_content_type"),
+    [
+        ("text", b"hello world\n", "text/plain"),
+        (
+            "srt",
+            b"1\n00:00:00,000 --> 00:00:01,000\nhello\n",
+            "application/x-subrip",
+        ),
+        (
+            "vtt",
+            b"WEBVTT\n\n00:00.000 --> 00:01.000\nhello\n",
+            "text/vtt",
+        ),
+    ],
+)
+def test_audio_transcription_supports_bounded_text_formats_with_safe_media_types(
+    routed_client: TestClient,
+    response_format: str,
+    expected_body: bytes,
+    expected_content_type: str,
+) -> None:
+    response = routed_client.post(
+        "/v1/audio/transcriptions",
+        data={
+            "model": "nvidia/parakeet-tdt-0.6b-v3",
+            "response_format": response_format,
+        },
+        files={"file": ("audio.wav", b"RIFF-audio", "audio/wav")},
+    )
+
+    assert response.status_code == 200
+    assert response.content == expected_body
+    assert response.headers["content-type"].startswith(expected_content_type)
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["x-os-provider"] == "venice"
+
+
+def test_audio_transcription_rejects_unknown_response_format(
+    routed_client: TestClient,
+) -> None:
+    call_count = len(routed_client.app.state.test_calls)
+
+    response = routed_client.post(
+        "/v1/audio/transcriptions",
+        data={
+            "model": "nvidia/parakeet-tdt-0.6b-v3",
+            "response_format": "html",
+        },
+        files={"file": ("audio.wav", b"RIFF-audio", "audio/wav")},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_response_format"
+    assert len(routed_client.app.state.test_calls) == call_count
 
 
 def test_audio_transcription_rejects_unpriced_model(routed_client: TestClient) -> None:
@@ -1772,6 +2341,47 @@ def test_image_generation_matches_venice_upstream_contract(
     assert response.headers["x-os-provider"] == "venice"
 
 
+@pytest.mark.parametrize(
+    ("path", "request_kwargs"),
+    [
+        (
+            "/v1/audio/transcriptions",
+            {
+                "data": {
+                    "model": "nvidia/parakeet-tdt-0.6b-v3",
+                    "response_format": "text",
+                    "prompt": "oversized-response",
+                },
+                "files": {"file": ("audio.wav", b"RIFF-audio", "audio/wav")},
+            },
+        ),
+        (
+            "/v1/augment/search",
+            {"json": {"query": "oversized-response"}},
+        ),
+        (
+            "/v1/image/generate",
+            {"json": {"model": "chroma", "prompt": "oversized response"}},
+        ),
+    ],
+)
+def test_compat_json_responses_are_bounded_and_closed(
+    routed_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    request_kwargs: dict[str, object],
+) -> None:
+    monkeypatch.setenv("MAX_UPSTREAM_JSON_RESPONSE_BYTES", "32")
+
+    response = routed_client.post(path, **request_kwargs)
+
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "upstream_response_too_large"
+    assert response.headers["x-os-provider"] == "venice"
+    assert "xxxxxxxx" not in response.text
+    assert routed_client.app.state.test_response_streams[-1].closed is True
+
+
 def test_image_rejects_oversized_body_before_parsing(
     routed_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -1820,6 +2430,21 @@ def test_image_generation_bounds_total_elapsed_time(
     response = routed_client.post(
         "/v1/image/generate",
         json={"model": "chroma", "prompt": "force total timeout"},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["message"] == "Image provider failed"
+
+
+def test_image_generation_timeout_covers_streamed_response_body(
+    routed_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("IMAGE_GENERATE_TIMEOUT_SECONDS", "0.001")
+
+    response = routed_client.post(
+        "/v1/image/generate",
+        json={"model": "chroma", "prompt": "force body timeout"},
     )
 
     assert response.status_code == 502
@@ -2119,6 +2744,55 @@ async def test_venice_e2ee_key_binding_fails_closed_on_nonce_mismatch() -> None:
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(stale_attestation)) as http:
+        assert not await _validate_client_encryption_key(
+            http,
+            "https://venice.test/api",
+            "secret",
+            endpoint,
+            {"x-venice-tee-model-pub-key": "04" + "ab" * 64},
+        )
+
+
+async def test_venice_e2ee_key_binding_caps_and_closes_attestation_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    endpoint = config.endpoints["venice-gpt-oss-20b-e2ee"]
+    public_key = "ab" * 64
+    monkeypatch.setenv("MAX_UPSTREAM_JSON_RESPONSE_BYTES", "32")
+    stream = TrackingAsyncByteStream(
+        json.dumps(
+            {
+                "verified": True,
+                "nonce": "will-be-replaced",
+                "signing_key": public_key,
+            }
+        ).encode()
+    )
+
+    def attestation(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=stream)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(attestation)) as http:
+        assert not await _validate_client_encryption_key(
+            http,
+            "https://venice.test/api",
+            "secret",
+            endpoint,
+            {"x-venice-tee-model-pub-key": "04" + public_key},
+        )
+
+    assert stream.closed is True
+
+
+async def test_venice_e2ee_key_binding_fails_closed_on_non_object_json() -> None:
+    config = GatewayConfig.load(Path(__file__).parents[1] / "config/models.yaml")
+    endpoint = config.endpoints["venice-gpt-oss-20b-e2ee"]
+
+    def attestation(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[])
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(attestation)) as http:
         assert not await _validate_client_encryption_key(
             http,
             "https://venice.test/api",

@@ -373,7 +373,10 @@ def _load_legacy_config(raw: dict[str, Any]) -> GatewayConfig:
                 provider=backend_name,
                 upstream_model=str(item.get("upstream_model", model_id)),
                 privacy=EndpointPrivacy(
-                    level="verified-tee" if confidential_mode else "standard",
+                    # The legacy schema declares only that execution is
+                    # confidential. It has no independent measurement-policy
+                    # verifier, so it must not claim verified-tee.
+                    level="tee" if confidential_mode else "standard",
                     execution="gpu-tee" if confidential_mode else "standard",
                     retention="zero" if confidential_mode else "unknown",
                     attestation="gateway" if confidential_mode else "none",

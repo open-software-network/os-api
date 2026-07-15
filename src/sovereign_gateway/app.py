@@ -7,6 +7,7 @@ import hashlib
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -86,17 +87,68 @@ class BillingContext:
 
 PrivacyPreference = Literal["required", "preferred", "disabled"]
 PROXY_PATHS = {"chat/completions", "completions", "embeddings"}
+GENERATION_PROXY_PATHS = frozenset({"chat/completions", "completions"})
+NON_RETRYABLE_UPSTREAM_STATUSES = frozenset({400, 401, 403, 413, 422})
 PACKAGE_DIR = Path(__file__).resolve().parent
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 SITE_AUTH_EXEMPT_PATHS = frozenset({"/healthz", "/readyz", "/v1"})
 DEFAULT_ASR_MODELS = ("nvidia/parakeet-tdt-0.6b-v3",)
-DEFAULT_NON_TEXT_MAX_COMPLETION_TOKENS = 2_048
+DEFAULT_MAX_COMPLETION_TOKENS = 2_048
+# Kept for callers that imported the original non-text-specific name.
+DEFAULT_NON_TEXT_MAX_COMPLETION_TOKENS = DEFAULT_MAX_COMPLETION_TOKENS
+DEFAULT_GATEWAY_ATTESTATION_REQUEST_BYTES = 4 * 1024
+DEFAULT_MAX_UPSTREAM_JSON_RESPONSE_BYTES = 16 * 1024 * 1024
+DEFAULT_MAX_UPSTREAM_ERROR_RESPONSE_BYTES = 1024 * 1024
+DEFAULT_MAX_SSE_LINE_BYTES = 1024 * 1024
+DEFAULT_MAX_SSE_RESPONSE_BYTES = 64 * 1024 * 1024
+AUDIO_JSON_RESPONSE_FORMATS = frozenset({"json", "verbose_json", "diarized_json"})
+AUDIO_TEXT_RESPONSE_MEDIA_TYPES = {
+    "text": "text/plain",
+    "srt": "application/x-subrip",
+    "vtt": "text/vtt",
+}
+AUDIO_RESPONSE_FORMATS = AUDIO_JSON_RESPONSE_FORMATS | frozenset(AUDIO_TEXT_RESPONSE_MEDIA_TYPES)
 GATEWAY_ATTESTATION_RESPONSE_HEADERS = {
     "access-control-allow-headers": "content-type",
     "access-control-allow-methods": "POST, OPTIONS",
     "access-control-allow-origin": "*",
     "cache-control": "no-store",
 }
+
+POSITIVE_INTEGER_ENV_DEFAULTS = {
+    "REQUESTS_PER_MINUTE": 60,
+    "VIDEO_QUEUE_MAX_CONCURRENCY": 4,
+    "PROVIDER_CATALOG_TTL_SECONDS": 300,
+    "ENDPOINT_FAILURE_THRESHOLD": 3,
+    "ENDPOINT_CIRCUIT_COOLDOWN_SECONDS": 30,
+    "PRIVACY_RECEIPT_CACHE_SIZE": 10_000,
+    "MAX_AUDIO_BYTES": 25 * 1024 * 1024,
+    "MAX_AUGMENT_REQUEST_BYTES": 16 * 1024,
+    "MAX_IMAGE_GENERATE_REQUEST_BYTES": 1024 * 1024,
+    "MAX_VIDEO_QUEUE_REQUEST_BYTES": 31 * 1024 * 1024,
+    "MAX_VIDEO_REQUEST_BYTES": 1024 * 1024,
+    "MAX_REQUEST_BYTES": 10 * 1024 * 1024,
+    "MAX_GATEWAY_ATTESTATION_REQUEST_BYTES": DEFAULT_GATEWAY_ATTESTATION_REQUEST_BYTES,
+    "MAX_UPSTREAM_JSON_RESPONSE_BYTES": DEFAULT_MAX_UPSTREAM_JSON_RESPONSE_BYTES,
+    "MAX_UPSTREAM_ERROR_RESPONSE_BYTES": DEFAULT_MAX_UPSTREAM_ERROR_RESPONSE_BYTES,
+    "MAX_SSE_LINE_BYTES": DEFAULT_MAX_SSE_LINE_BYTES,
+    "MAX_SSE_RESPONSE_BYTES": DEFAULT_MAX_SSE_RESPONSE_BYTES,
+    "MAX_VIDEO_JSON_RESPONSE_BYTES": 1024 * 1024,
+    "MAX_VIDEO_RESPONSE_BYTES": 101 * 1024 * 1024,
+}
+POSITIVE_FLOAT_ENV_DEFAULTS = {
+    "IMAGE_GENERATE_TIMEOUT_SECONDS": 360.0,
+    "VIDEO_REQUEST_TIMEOUT_SECONDS": 360.0,
+}
+NONNEGATIVE_FLOAT_ENV_DEFAULTS = {"ASR_PRICE_PER_SECOND_USD": 0.0001}
+BOOLEAN_ENV_DEFAULTS = {
+    "VENICE_COMPAT_ENABLED": False,
+    "LIVE_PROVIDER_CATALOG_ENABLED": True,
+    "ENABLE_MANAGED_KEYS": False,
+    "REQUIRE_CONFIDENTIAL_SPACE": False,
+}
+TRUE_ENV_VALUES = frozenset({"1", "true", "yes"})
+FALSE_ENV_VALUES = frozenset({"0", "false", "no"})
 MODEL_ALIASES = {
     "zai-org-glm-5-2": "z-ai/glm-5.2",
     "kimi-k2-6": "moonshotai/kimi-k2.6",
@@ -106,9 +158,10 @@ MODEL_ALIASES = {
 }
 
 
-def _enforce_non_text_output_cap(payload: dict[str, Any]) -> None:
-    if not has_non_text_input(payload):
-        return
+def _canonicalize_output_limit(
+    payload: dict[str, Any],
+    output_field: Literal["max_completion_tokens", "max_tokens"] = "max_completion_tokens",
+) -> None:
     for name in ("max_completion_tokens", "max_tokens"):
         if name in payload and payload[name] is None:
             payload.pop(name)
@@ -123,16 +176,58 @@ def _enforce_non_text_output_cap(payload: dict[str, Any]) -> None:
         ):
             raise RoutingError(
                 "invalid_output_limit",
-                f"{name} must be a positive integer for non-text input",
+                f"{name} must be a positive integer",
             )
-    if max_completion_tokens is None and max_tokens is None:
-        payload["max_completion_tokens"] = DEFAULT_NON_TEXT_MAX_COMPLETION_TOKENS
-        return
-    if max_completion_tokens is None or max_tokens is None:
-        return
-    limits = (max_completion_tokens, max_tokens)
-    payload["max_completion_tokens"] = max(limits)
-    payload.pop("max_tokens")
+    limits = [limit for limit in (max_completion_tokens, max_tokens) if limit is not None]
+    canonical_limit = max(limits) if limits else DEFAULT_MAX_COMPLETION_TOKENS
+    payload.pop("max_completion_tokens", None)
+    payload.pop("max_tokens", None)
+    payload[output_field] = canonical_limit
+
+
+def _enforce_non_text_output_cap(payload: dict[str, Any]) -> None:
+    """Backward-compatible alias for universal output-limit enforcement."""
+
+    _canonicalize_output_limit(payload)
+
+
+def _validate_environment() -> None:
+    for name, default in POSITIVE_INTEGER_ENV_DEFAULTS.items():
+        raw = os.getenv(name, str(default))
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError(f"{name} must be a positive integer") from exc
+        if value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+
+    for name, default in POSITIVE_FLOAT_ENV_DEFAULTS.items():
+        _validated_float_environment(name, default, positive=True)
+    for name, default in NONNEGATIVE_FLOAT_ENV_DEFAULTS.items():
+        _validated_float_environment(name, default, positive=False)
+
+    for name, default in BOOLEAN_ENV_DEFAULTS.items():
+        raw = os.getenv(name, str(default).lower()).strip().lower()
+        if raw not in TRUE_ENV_VALUES | FALSE_ENV_VALUES:
+            raise ValueError(f"{name} must be a boolean (true/false)")
+
+    if int(os.getenv("MAX_SSE_LINE_BYTES", str(DEFAULT_MAX_SSE_LINE_BYTES))) > int(
+        os.getenv("MAX_SSE_RESPONSE_BYTES", str(DEFAULT_MAX_SSE_RESPONSE_BYTES))
+    ):
+        raise ValueError("MAX_SSE_LINE_BYTES cannot exceed MAX_SSE_RESPONSE_BYTES")
+
+
+def _validated_float_environment(name: str, default: float, *, positive: bool) -> float:
+    raw = os.getenv(name, str(default))
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        qualifier = "positive" if positive else "non-negative"
+        raise ValueError(f"{name} must be a finite {qualifier} number") from exc
+    if not math.isfinite(value) or (value <= 0 if positive else value < 0):
+        qualifier = "positive" if positive else "non-negative"
+        raise ValueError(f"{name} must be a finite {qualifier} number")
+    return value
 
 
 def _site_auth_protects_path(path: str) -> bool:
@@ -283,7 +378,10 @@ def _settings() -> tuple[
     RateLimiter,
     Redis | None,
 ]:
-    config = GatewayConfig.load(os.getenv("MODEL_CONFIG_PATH", "config/models.yaml"))
+    default_config = PACKAGE_DIR / "data" / "models.yaml"
+    if not default_config.is_file():
+        default_config = PACKAGE_DIR.parents[1] / "config" / "models.yaml"
+    config = GatewayConfig.load(os.getenv("MODEL_CONFIG_PATH", str(default_config)))
     managed_keys = build_managed_repository()
     keys = ApiKeyStore.from_environment(allow_empty=managed_keys is not None)
     rpm = int(os.getenv("REQUESTS_PER_MINUTE", "60"))
@@ -309,6 +407,7 @@ def _settings() -> tuple[
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    _validate_environment()
     _initialize_confidential_runtime()
     config, keys, managed_keys, limiter, redis = _settings()
     app.state.config = config
@@ -718,10 +817,25 @@ def create_app() -> FastAPI:
                 error_type="server_error",
                 code="attestation_unavailable",
             )
+        maximum_request = int(
+            os.getenv(
+                "MAX_GATEWAY_ATTESTATION_REQUEST_BYTES",
+                str(DEFAULT_GATEWAY_ATTESTATION_REQUEST_BYTES),
+            )
+        )
+        body_error = _content_length_error(request, maximum_request)
+        if body_error:
+            return body_error
         try:
-            payload = json.loads(await request.body() or b"{}")
-        except json.JSONDecodeError:
+            raw = await _read_request_body_limited(request, maximum_request)
+        except RequestBodyTooLarge:
+            return openai_error(413, "Request body is too large", code="request_too_large")
+        try:
+            payload = json.loads(raw or b"{}")
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return openai_error(400, "Request body must be JSON", code="invalid_request")
+        if not isinstance(payload, dict):
+            return openai_error(400, "Request body must be a JSON object", code="invalid_request")
         nonce = payload.get("nonce", "")
         if not isinstance(nonce, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", nonce):
             return openai_error(
@@ -749,15 +863,30 @@ def create_app() -> FastAPI:
         }
         binding_canonical = json.dumps(binding, separators=(",", ":"), sort_keys=True)
         report_data = hashlib.sha512(binding_canonical.encode()).hexdigest()
+        upstream_request = request.app.state.http.build_request(
+            "POST",
+            f"{agent_url}/quote",
+            json={"report_data": report_data},
+            timeout=30,
+        )
+        evidence: dict[str, Any] | None = None
         try:
-            upstream = await request.app.state.http.post(
-                f"{agent_url}/quote",
-                json={"report_data": report_data},
-                timeout=30,
-            )
-        except httpx.HTTPError:
-            upstream = None
-        if upstream is None or upstream.status_code != 200:
+            upstream = await request.app.state.http.send(upstream_request, stream=True)
+            if upstream.status_code != 200:
+                await upstream.aclose()
+            else:
+                evidence_body = await _read_compat_response_limited(upstream)
+                parsed_evidence = json.loads(evidence_body)
+                if isinstance(parsed_evidence, dict):
+                    evidence = parsed_evidence
+        except (
+            UpstreamResponseTooLarge,
+            httpx.HTTPError,
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+        ):
+            evidence = None
+        if evidence is None:
             # Fail closed: never substitute unverifiable evidence.
             logger.error(
                 json.dumps(
@@ -775,7 +904,6 @@ def create_app() -> FastAPI:
                 error_type="server_error",
                 code="attestation_unavailable",
             )
-        evidence = upstream.json()
         return JSONResponse(
             content={
                 "object": "attestation",
@@ -794,8 +922,23 @@ def create_app() -> FastAPI:
 
     @app.post("/v1/gateway/attestation")
     async def gateway_attestation(request: Request) -> Response:
+        maximum = int(
+            os.getenv(
+                "MAX_GATEWAY_ATTESTATION_REQUEST_BYTES",
+                str(DEFAULT_GATEWAY_ATTESTATION_REQUEST_BYTES),
+            )
+        )
+        body_error = _content_length_error(request, maximum)
+        if body_error:
+            return _gateway_attestation_response(body_error)
         try:
-            payload = json.loads(await request.body() or b"{}")
+            raw = await _read_request_body_limited(request, maximum)
+        except RequestBodyTooLarge:
+            return _gateway_attestation_response(
+                openai_error(413, "Request body is too large", code="request_too_large")
+            )
+        try:
+            payload = json.loads(raw or b"{}")
         except json.JSONDecodeError:
             return _gateway_attestation_response(
                 openai_error(400, "Request body must be JSON", code="invalid_request")
@@ -837,9 +980,7 @@ def create_app() -> FastAPI:
                     code="gateway_attestation_unavailable",
                 )
             )
-        return _gateway_attestation_response(
-            JSONResponse(content=evidence.public_dict())
-        )
+        return _gateway_attestation_response(JSONResponse(content=evidence.public_dict()))
 
     @app.post("/v1/audio/transcriptions")
     async def audio_transcriptions(request: Request) -> Response:
@@ -868,6 +1009,13 @@ def create_app() -> FastAPI:
             return openai_error(404, f"Model {model!r} does not exist", code="model_not_found")
         if not isinstance(upload, UploadFile):
             return openai_error(400, "file is required", code="invalid_request")
+        response_format = form.get("response_format", "json")
+        if not isinstance(response_format, str) or response_format not in AUDIO_RESPONSE_FORMATS:
+            return openai_error(
+                400,
+                "response_format must be json, text, srt, verbose_json, vtt, or diarized_json",
+                code="invalid_response_format",
+            )
         audio = await upload.read(max_audio_bytes + 1)
         if len(audio) > max_audio_bytes:
             return openai_error(413, "Audio file is too large", code="request_too_large")
@@ -876,29 +1024,45 @@ def create_app() -> FastAPI:
         provider = request.app.state.config.providers.get("venice")
         if not provider or not provider.enabled or not provider.api_key:
             return openai_error(503, "Audio transcription provider is unavailable")
-        data = {"model": model, "response_format": str(form.get("response_format", "json"))}
+        data = {"model": model, "response_format": response_format}
         for optional in ("language", "prompt", "temperature"):
             value = form.get(optional)
             if isinstance(value, str) and value:
                 data[optional] = value
+        response_headers = {"x-os-provider": "venice", "x-os-billing-owner": "caller"}
+        upstream_request = request.app.state.http.build_request(
+            "POST",
+            f"{provider.base_url}/v1/audio/transcriptions",
+            headers={"authorization": f"Bearer {provider.api_key}"},
+            data=data,
+            files={
+                "file": (
+                    "audio.wav",
+                    audio,
+                    upload.content_type or "application/octet-stream",
+                )
+            },
+        )
         try:
-            upstream = await request.app.state.http.post(
-                f"{provider.base_url}/v1/audio/transcriptions",
-                headers={"authorization": f"Bearer {provider.api_key}"},
-                data=data,
-                files={
-                    "file": (
-                        "audio.wav",
-                        audio,
-                        upload.content_type or "application/octet-stream",
-                    )
-                },
-            )
+            upstream = await request.app.state.http.send(upstream_request, stream=True)
+            status_code = upstream.status_code
+            body = await _read_compat_response_limited(upstream)
+        except UpstreamResponseTooLarge:
+            return _compat_response_too_large(response_headers)
         except httpx.HTTPError:
             return openai_error(502, "Audio transcription provider failed")
-        return _compat_json_response(
-            upstream,
-            headers={"x-os-provider": "venice", "x-os-billing-owner": "caller"},
+        if not 200 <= status_code < 300 or response_format in AUDIO_JSON_RESPONSE_FORMATS:
+            return _compat_json_response(
+                status_code,
+                body,
+                headers=response_headers,
+            )
+        response_headers["x-content-type-options"] = "nosniff"
+        return Response(
+            content=body,
+            status_code=status_code,
+            media_type=AUDIO_TEXT_RESPONSE_MEDIA_TYPES[response_format],
+            headers=response_headers,
         )
 
     @app.post("/v1/augment/{operation}")
@@ -944,17 +1108,25 @@ def create_app() -> FastAPI:
         provider = request.app.state.config.providers.get("venice")
         if not provider or not provider.enabled or not provider.api_key:
             return openai_error(503, "Web augmentation provider is unavailable")
+        response_headers = {"x-os-provider": "venice", "x-os-billing-owner": "caller"}
+        upstream_request = request.app.state.http.build_request(
+            "POST",
+            f"{provider.base_url}/v1/augment/{operation}",
+            headers={"authorization": f"Bearer {provider.api_key}"},
+            json=payload,
+        )
         try:
-            upstream = await request.app.state.http.post(
-                f"{provider.base_url}/v1/augment/{operation}",
-                headers={"authorization": f"Bearer {provider.api_key}"},
-                json=payload,
-            )
+            upstream = await request.app.state.http.send(upstream_request, stream=True)
+            status_code = upstream.status_code
+            body = await _read_compat_response_limited(upstream)
+        except UpstreamResponseTooLarge:
+            return _compat_response_too_large(response_headers)
         except httpx.HTTPError:
             return openai_error(502, "Web augmentation provider failed")
         return _compat_json_response(
-            upstream,
-            headers={"x-os-provider": "venice", "x-os-billing-owner": "caller"},
+            status_code,
+            body,
+            headers=response_headers,
         )
 
     @app.post("/v1/image/generate")
@@ -986,26 +1158,32 @@ def create_app() -> FastAPI:
         if not provider or not provider.enabled or not provider.api_key:
             return openai_error(503, "Image provider is unavailable")
         timeout_seconds = float(os.getenv("IMAGE_GENERATE_TIMEOUT_SECONDS", "360"))
+        response_headers = {"x-os-provider": "venice", "x-os-billing-owner": "caller"}
+        upstream_request = request.app.state.http.build_request(
+            "POST",
+            f"{provider.base_url}/v1/image/generate",
+            content=raw,
+            headers={
+                "authorization": f"Bearer {provider.api_key}",
+                "content-type": "application/json",
+            },
+            timeout=httpx.Timeout(
+                connect=10,
+                read=timeout_seconds,
+                write=30,
+                pool=10,
+            ),
+        )
         try:
             async with asyncio.timeout(timeout_seconds):
-                upstream = await request.app.state.http.post(
-                    f"{provider.base_url}/v1/image/generate",
-                    content=raw,
-                    headers={
-                        "authorization": f"Bearer {provider.api_key}",
-                        "content-type": "application/json",
-                    },
-                    timeout=httpx.Timeout(
-                        connect=10,
-                        read=timeout_seconds,
-                        write=30,
-                        pool=10,
-                    ),
-                )
+                upstream = await request.app.state.http.send(upstream_request, stream=True)
+                status_code = upstream.status_code
+                body = await _read_compat_response_limited(upstream)
+        except UpstreamResponseTooLarge:
+            return _compat_response_too_large(response_headers)
         except (TimeoutError, httpx.HTTPError):
             return openai_error(502, "Image provider failed")
-        response_headers = {"x-os-provider": "venice", "x-os-billing-owner": "caller"}
-        return _compat_image_generation_response(upstream, headers=response_headers)
+        return _compat_image_generation_response(status_code, body, headers=response_headers)
 
     @app.post("/v1/video/{operation}")
     async def video(operation: str, request: Request) -> Response:
@@ -1047,17 +1225,12 @@ def create_app() -> FastAPI:
         if auth_error:
             return auth_error
         max_request_bytes = int(os.getenv("MAX_REQUEST_BYTES", "10485760"))
-        content_length = request.headers.get("content-length")
-        if content_length:
-            try:
-                if int(content_length) > max_request_bytes:
-                    return openai_error(413, "Request body is too large", code="request_too_large")
-            except ValueError:
-                return openai_error(
-                    400, "Content-Length must be an integer", code="invalid_request"
-                )
-        raw = await request.body()
-        if len(raw) > max_request_bytes:
+        body_error = _content_length_error(request, max_request_bytes)
+        if body_error:
+            return body_error
+        try:
+            raw = await _read_request_body_limited(request, max_request_bytes)
+        except RequestBodyTooLarge:
             return openai_error(413, "Request body is too large", code="request_too_large")
         try:
             payload = json.loads(raw)
@@ -1069,12 +1242,15 @@ def create_app() -> FastAPI:
                     and isinstance(fallback_models[0], str)
                 ):
                     payload["model"] = fallback_models[0]
-            if isinstance(payload, dict):
-                _enforce_non_text_output_cap(payload)
+            if isinstance(payload, dict) and proxy_path in GENERATION_PROXY_PATHS:
+                _canonicalize_output_limit(
+                    payload,
+                    "max_tokens" if proxy_path == "completions" else "max_completion_tokens",
+                )
             parsed = InferenceRequest.model_validate(payload)
         except RoutingError as exc:
             return openai_error(400, str(exc), code=exc.code)
-        except (json.JSONDecodeError, ValidationError):
+        except (json.JSONDecodeError, UnicodeDecodeError, ValidationError):
             return openai_error(400, "Request body must include a valid model")
 
         config: GatewayConfig = request.app.state.config
@@ -1162,7 +1338,10 @@ def create_app() -> FastAPI:
             if not candidates:
                 raise routing_errors[0]
         except RoutingError as exc:
-            status = 409 if "unavailable" in exc.code else 400
+            if exc.code == "all_endpoints_unavailable":
+                status = 503
+            else:
+                status = 409 if "unavailable" in exc.code else 400
             # Preserve the original public error for old clients.
             code = (
                 "confidential_compute_unavailable"
@@ -1200,6 +1379,18 @@ def create_app() -> FastAPI:
         if isinstance(billing, Response):
             return billing
 
+        maximum_json_response = int(
+            os.getenv(
+                "MAX_UPSTREAM_JSON_RESPONSE_BYTES",
+                str(DEFAULT_MAX_UPSTREAM_JSON_RESPONSE_BYTES),
+            )
+        )
+        maximum_error_response = int(
+            os.getenv(
+                "MAX_UPSTREAM_ERROR_RESPONSE_BYTES",
+                str(DEFAULT_MAX_UPSTREAM_ERROR_RESPONSE_BYTES),
+            )
+        )
         failures: list[dict[str, Any]] = []
         for endpoint in candidates:
             provider = config.providers[endpoint.provider]
@@ -1273,7 +1464,7 @@ def create_app() -> FastAPI:
             )
             started = time.monotonic()
             try:
-                upstream = await request.app.state.http.send(upstream_request, stream=parsed.stream)
+                upstream = await request.app.state.http.send(upstream_request, stream=True)
             except (httpx.TimeoutException, httpx.HTTPError) as exc:
                 await free_capacity()
                 await request.app.state.endpoint_health.failure(endpoint.id)
@@ -1282,29 +1473,60 @@ def create_app() -> FastAPI:
 
             latency = time.monotonic() - started
             if upstream.status_code in {408, 409, 425, 429} or upstream.status_code >= 500:
-                content = await upstream.aread()
-                await upstream.aclose()
+                try:
+                    content = await _read_upstream_response_limited(
+                        upstream,
+                        maximum_error_response,
+                    )
+                except (UpstreamResponseTooLarge, httpx.HTTPError) as exc:
+                    failures.append(
+                        {
+                            "endpoint": endpoint.id,
+                            "status": upstream.status_code,
+                            "error": type(exc).__name__,
+                        }
+                    )
+                else:
+                    failures.append(
+                        {
+                            "endpoint": endpoint.id,
+                            "status": upstream.status_code,
+                            "body_bytes": len(content),
+                        }
+                    )
                 await free_capacity()
                 await request.app.state.endpoint_health.failure(endpoint.id)
-                failures.append(
-                    {
-                        "endpoint": endpoint.id,
-                        "status": upstream.status_code,
-                        "body_bytes": len(content),
-                    }
-                )
                 continue
             if upstream.status_code >= 400:
-                content = await upstream.aread()
-                await upstream.aclose()
+                try:
+                    content = await _read_upstream_response_limited(
+                        upstream,
+                        maximum_error_response,
+                    )
+                except (UpstreamResponseTooLarge, httpx.HTTPError) as exc:
+                    await free_capacity()
+                    await request.app.state.endpoint_health.failure(endpoint.id)
+                    await _release_billing(
+                        request,
+                        billing,
+                        "upstream_response_too_large"
+                        if isinstance(exc, UpstreamResponseTooLarge)
+                        else "upstream_response_invalid",
+                    )
+                    return _upstream_read_error(endpoint, exc)
                 await free_capacity()
-                # A provider can reject a request for model-specific reasons
-                # (unsupported schema details, temporary model deployment
-                # drift, or a stale catalog entry). Auto promises a working
-                # route, not a particular model, so continue across the ranked
-                # model frontier. Explicit model requests retain the provider's
-                # original 4xx response for OpenAI-compatible semantics.
-                if auto_requested and policy.provider.allow_fallbacks:
+                # Ordinary request, authentication, and schema errors describe
+                # the caller's request. Retrying them against another model can
+                # change semantics, poison endpoint health, and eventually hide
+                # the original error behind a generic 503. Other 4xx responses
+                # may still indicate model-specific catalog drift, so Auto may
+                # continue across its ranked model frontier for those statuses.
+                retry_model_specific_error = (
+                    auto_requested
+                    and policy.provider.allow_fallbacks
+                    and upstream.status_code not in NON_RETRYABLE_UPSTREAM_STATUSES
+                )
+                if retry_model_specific_error:
                     await request.app.state.endpoint_health.failure(endpoint.id)
                     failures.append(
                         {
@@ -1344,7 +1566,6 @@ def create_app() -> FastAPI:
             generation_id = request.state.request_id
             await _store_privacy_receipt(request, generation_id, endpoint, evidence)
             if parsed.stream:
-                await request.app.state.endpoint_health.success(endpoint.id, latency)
                 return StreamingResponse(
                     _metered_stream(
                         request,
@@ -1355,14 +1576,30 @@ def create_app() -> FastAPI:
                         endpoint.privacy.level,
                         endpoint.id,
                         on_close=free_capacity,
+                        endpoint_health=request.app.state.endpoint_health,
+                        latency=latency,
                     ),
                     status_code=upstream.status_code,
                     media_type=content_type,
                     headers=response_headers,
                 )
 
-            content = await upstream.aread()
-            await upstream.aclose()
+            try:
+                content = await _read_upstream_response_limited(
+                    upstream,
+                    maximum_json_response,
+                )
+            except (UpstreamResponseTooLarge, httpx.HTTPError) as exc:
+                await free_capacity()
+                await request.app.state.endpoint_health.failure(endpoint.id)
+                await _release_billing(
+                    request,
+                    billing,
+                    "upstream_response_too_large"
+                    if isinstance(exc, UpstreamResponseTooLarge)
+                    else "upstream_response_invalid",
+                )
+                return _upstream_read_error(endpoint, exc)
             await free_capacity()
             usage = _usage_from_json(content)
             output_tokens = int((usage or {}).get("completion_tokens", 0)) or None
@@ -1420,250 +1657,6 @@ def create_app() -> FastAPI:
             headers={"retry-after": "10"},
         )
 
-    async def inference(proxy_path: str, request: Request) -> Response:
-        if proxy_path not in PROXY_PATHS:
-            return openai_error(404, "Unknown API endpoint", code="not_found")
-        auth_error = await _authorize(request)
-        if auth_error:
-            return auth_error
-
-        max_request_bytes = int(os.getenv("MAX_REQUEST_BYTES", "10485760"))
-        content_length = request.headers.get("content-length")
-        if content_length:
-            try:
-                declared_length = int(content_length)
-            except ValueError:
-                return openai_error(
-                    400,
-                    "Content-Length must be an integer",
-                    code="invalid_request",
-                )
-            if declared_length < 0:
-                return openai_error(
-                    400,
-                    "Content-Length cannot be negative",
-                    code="invalid_request",
-                )
-            if declared_length > max_request_bytes:
-                return openai_error(413, "Request body is too large", code="request_too_large")
-        raw = await request.body()
-        if len(raw) > max_request_bytes:
-            return openai_error(413, "Request body is too large", code="request_too_large")
-        try:
-            payload = json.loads(raw)
-            if isinstance(payload, dict):
-                _enforce_non_text_output_cap(payload)
-            parsed = InferenceRequest.model_validate(payload)
-        except RoutingError as exc:
-            return openai_error(400, str(exc), code=exc.code)
-        except (json.JSONDecodeError, ValidationError):
-            return openai_error(400, "Request body must include a valid model")
-
-        config: GatewayConfig = request.app.state.config
-        route = config.models.get(parsed.model)
-        if not route:
-            return openai_error(
-                404,
-                f"Model {parsed.model!r} does not exist",
-                code="model_not_found",
-            )
-
-        preference = request.headers.get("x-confidential-compute", "preferred").lower()
-        if preference not in {"required", "preferred", "disabled"}:
-            return openai_error(
-                400,
-                "X-Confidential-Compute must be required, preferred, or disabled",
-                code="invalid_privacy_preference",
-            )
-        selected = _select_backend(config, route, preference)  # type: ignore[arg-type]
-        if isinstance(selected, Response):
-            return selected
-        backend, privacy = selected
-
-        capacity_held = False
-        if backend.max_concurrency:
-            try:
-                admitted = await request.app.state.concurrency.acquire(
-                    backend.name, backend.max_concurrency
-                )
-                capacity_held = admitted
-            except Exception:
-                # Fail open: losing admission control degrades to upstream
-                # queueing, which beats rejecting all inference in the region.
-                logger.exception(
-                    json.dumps(
-                        {
-                            "severity": "WARNING",
-                            "event": "redis_degraded",
-                            "check": "concurrency",
-                            "request_id": request.state.request_id,
-                            "backend": backend.name,
-                        },
-                        separators=(",", ":"),
-                    )
-                )
-                admitted = True
-            if not admitted:
-                logger.warning(
-                    json.dumps(
-                        {
-                            "severity": "WARNING",
-                            "event": "model_overloaded",
-                            "request_id": request.state.request_id,
-                            "backend": backend.name,
-                            "max_concurrency": backend.max_concurrency,
-                        },
-                        separators=(",", ":"),
-                    )
-                )
-                return openai_error(
-                    503,
-                    "The model is at capacity; retry after a short delay",
-                    error_type="server_error",
-                    code="model_overloaded",
-                    headers={"retry-after": "10"},
-                )
-
-        async def _free_capacity() -> None:
-            nonlocal capacity_held
-            if capacity_held:
-                capacity_held = False
-                try:
-                    await request.app.state.concurrency.release(backend.name)
-                except Exception:
-                    # The counter's expiry self-heals a missed release.
-                    logger.exception(
-                        json.dumps(
-                            {
-                                "severity": "WARNING",
-                                "event": "redis_degraded",
-                                "check": "concurrency_release",
-                                "request_id": request.state.request_id,
-                                "backend": backend.name,
-                            },
-                            separators=(",", ":"),
-                        )
-                    )
-
-        billing = await _prepare_billing(request, route, payload, len(raw))
-        if isinstance(billing, Response):
-            await _free_capacity()
-            return billing
-
-        payload["model"] = route.upstream_model
-        if parsed.stream:
-            stream_options = payload.get("stream_options")
-            if not isinstance(stream_options, dict):
-                stream_options = {}
-            payload["stream_options"] = {**stream_options, "include_usage": True}
-        headers = {
-            "content-type": "application/json",
-            "x-request-id": request.state.request_id,
-        }
-        if backend.api_key:
-            headers["authorization"] = f"Bearer {backend.api_key}"
-
-        upstream_request = request.app.state.http.build_request(
-            "POST",
-            f"{backend.base_url}/v1/{proxy_path}",
-            headers=headers,
-            content=json.dumps(payload, separators=(",", ":")),
-        )
-        try:
-            upstream = await request.app.state.http.send(upstream_request, stream=parsed.stream)
-        except httpx.TimeoutException:
-            await _free_capacity()
-            await _release_billing(request, billing, "backend_timeout")
-            logger.exception(
-                json.dumps(
-                    {
-                        "severity": "ERROR",
-                        "event": "upstream_timeout",
-                        "request_id": request.state.request_id,
-                        "backend": backend.name,
-                    }
-                )
-            )
-            return openai_error(
-                504,
-                "The selected inference backend timed out",
-                error_type="server_error",
-                code="backend_timeout",
-            )
-        except httpx.HTTPError:
-            await _free_capacity()
-            await _release_billing(request, billing, "backend_unavailable")
-            logger.exception(
-                json.dumps(
-                    {
-                        "severity": "ERROR",
-                        "event": "upstream_unavailable",
-                        "request_id": request.state.request_id,
-                        "backend": backend.name,
-                    }
-                )
-            )
-            return openai_error(
-                503,
-                "The selected inference backend is unavailable",
-                error_type="server_error",
-                code="backend_unavailable",
-            )
-
-        response_headers = {
-            "x-compute-privacy": privacy,
-            "x-model-backend": backend.name,
-        }
-        if backend.revision:
-            response_headers["x-model-revision"] = backend.revision
-        content_type = upstream.headers.get("content-type", "application/json")
-        if upstream.status_code >= 400:
-            content = await upstream.aread()
-            await upstream.aclose()
-            await _free_capacity()
-            await _release_billing(request, billing, f"upstream_{upstream.status_code}")
-            return Response(
-                content=content,
-                status_code=upstream.status_code,
-                media_type=content_type,
-                headers=response_headers,
-            )
-        if parsed.stream:
-            return StreamingResponse(
-                _metered_stream(
-                    request,
-                    upstream,
-                    billing,
-                    route,
-                    parsed.model,
-                    privacy,
-                    backend.name,
-                    on_close=_free_capacity,
-                ),
-                status_code=upstream.status_code,
-                media_type=content_type,
-                headers=response_headers,
-            )
-        content = await upstream.aread()
-        await upstream.aclose()
-        await _free_capacity()
-        usage = _usage_from_json(content)
-        await _settle_billing(
-            request,
-            billing,
-            route,
-            parsed.model,
-            privacy,
-            backend.name,
-            usage,
-        )
-        return Response(
-            content=content,
-            status_code=upstream.status_code,
-            media_type=content_type,
-            headers=response_headers,
-        )
-
     app.include_router(web_router)
     return app
 
@@ -1690,6 +1683,22 @@ def _endpoint_headers(
     return headers
 
 
+def _upstream_read_error(endpoint: Endpoint, error: Exception) -> Response:
+    too_large = isinstance(error, UpstreamResponseTooLarge)
+    response = openai_error(
+        502,
+        (
+            "Inference provider response is too large"
+            if too_large
+            else "Inference provider returned an invalid response"
+        ),
+        error_type="server_error",
+        code="upstream_response_too_large" if too_large else "upstream_response_invalid",
+    )
+    response.headers.update(_endpoint_headers(endpoint, None))
+    return response
+
+
 async def _validate_client_encryption_key(
     http: httpx.AsyncClient,
     provider_base_url: str,
@@ -1706,17 +1715,22 @@ async def _validate_client_encryption_key(
         return False
     nonce = secrets.token_hex(32)
     headers = {"authorization": f"Bearer {provider_api_key}"} if provider_api_key else {}
+    upstream_request = http.build_request(
+        "GET",
+        f"{provider_base_url}/v1/tee/attestation",
+        params={"model": endpoint.upstream_model, "nonce": nonce},
+        headers=headers,
+        timeout=30,
+    )
     try:
-        response = await http.get(
-            f"{provider_base_url}/v1/tee/attestation",
-            params={"model": endpoint.upstream_model, "nonce": nonce},
-            headers=headers,
-            timeout=30,
-        )
+        response = await http.send(upstream_request, stream=True)
         if response.status_code != 200:
+            await response.aclose()
             return False
-        evidence = response.json()
-    except (httpx.HTTPError, ValueError):
+        evidence = json.loads(await _read_compat_response_limited(response))
+    except (httpx.HTTPError, ValueError, UnicodeDecodeError):
+        return False
+    if not isinstance(evidence, dict):
         return False
     if evidence.get("verified") is not True or evidence.get("nonce") != nonce:
         return False
@@ -1882,14 +1896,21 @@ def _content_length_error(request: Request, maximum: int) -> Response | None:
     if raw is None:
         return None
     try:
-        if int(raw) > maximum:
-            return openai_error(413, "Request body is too large", code="request_too_large")
+        declared = int(raw)
     except ValueError:
         return openai_error(400, "Content-Length must be an integer", code="invalid_request")
+    if declared < 0:
+        return openai_error(400, "Content-Length cannot be negative", code="invalid_request")
+    if declared > maximum:
+        return openai_error(413, "Request body is too large", code="request_too_large")
     return None
 
 
 class RequestBodyTooLarge(ValueError):
+    pass
+
+
+class UpstreamResponseTooLarge(ValueError):
     pass
 
 
@@ -1907,21 +1928,50 @@ async def _read_request_body_limited(request: Request, maximum: int) -> bytes:
     return b"".join(chunks)
 
 
-def _compat_json_response(upstream: httpx.Response, headers: dict[str, str]) -> Response:
+async def _read_compat_response_limited(upstream: httpx.Response) -> bytes:
+    maximum = int(
+        os.getenv(
+            "MAX_UPSTREAM_JSON_RESPONSE_BYTES",
+            str(DEFAULT_MAX_UPSTREAM_JSON_RESPONSE_BYTES),
+        )
+    )
+    return await _read_upstream_response_limited(upstream, maximum)
+
+
+def _compat_response_too_large(headers: dict[str, str]) -> Response:
+    response = openai_error(
+        502,
+        "Compatibility provider response is too large",
+        error_type="server_error",
+        code="upstream_response_too_large",
+    )
+    response.headers.update(headers)
+    return response
+
+
+def _compat_json_response(
+    status_code: int,
+    body: bytes,
+    headers: dict[str, str],
+) -> Response:
     try:
-        content = upstream.json()
+        content = json.loads(body)
     except (json.JSONDecodeError, UnicodeDecodeError):
-        return openai_error(502, "Compatibility provider returned invalid JSON")
-    return JSONResponse(content=content, status_code=upstream.status_code, headers=headers)
+        response = openai_error(502, "Compatibility provider returned invalid JSON")
+        response.headers.update(headers)
+        return response
+    return JSONResponse(content=content, status_code=status_code, headers=headers)
 
 
 def _compat_image_generation_response(
-    upstream: httpx.Response, headers: dict[str, str]
+    status_code: int,
+    body: bytes,
+    headers: dict[str, str],
 ) -> Response:
     try:
-        content = upstream.json()
+        content = json.loads(body)
     except (json.JSONDecodeError, UnicodeDecodeError):
-        if upstream.status_code == 400:
+        if status_code == 400:
             response = openai_error(
                 400,
                 "Image generation was rejected",
@@ -1932,7 +1982,7 @@ def _compat_image_generation_response(
         response = openai_error(502, "Image provider returned invalid JSON")
         response.headers.update(headers)
         return response
-    return JSONResponse(content=content, status_code=upstream.status_code, headers=headers)
+    return JSONResponse(content=content, status_code=status_code, headers=headers)
 
 
 async def _proxy_video_compat(
@@ -1986,7 +2036,7 @@ async def _proxy_video_compat(
         maximum_json = int(os.getenv("MAX_VIDEO_JSON_RESPONSE_BYTES", "1048576"))
         try:
             body = await _read_upstream_response_limited(upstream, maximum_json, deadline)
-        except RequestBodyTooLarge:
+        except UpstreamResponseTooLarge:
             response = openai_error(502, "Video provider response is too large")
             response.headers.update(response_headers)
             return response
@@ -2054,30 +2104,37 @@ def _compat_video_json_response(status_code: int, body: bytes, headers: dict[str
 
 
 async def _read_upstream_response_limited(
-    upstream: httpx.Response, maximum: int, deadline: float
+    upstream: httpx.Response,
+    maximum: int,
+    deadline: float | None = None,
 ) -> bytes:
-    content_length = upstream.headers.get("content-length")
-    if content_length:
-        try:
-            declared_length = int(content_length)
-        except ValueError as error:
-            await upstream.aclose()
-            raise httpx.ProtocolError("Invalid Content-Length") from error
-        if declared_length < 0:
-            await upstream.aclose()
-            raise httpx.ProtocolError("Invalid Content-Length")
-        if declared_length > maximum:
-            await upstream.aclose()
-            raise RequestBodyTooLarge("Upstream response is too large")
     chunks: list[bytes] = []
     received = 0
+
+    async def read_chunks() -> None:
+        nonlocal received
+        async for chunk in upstream.aiter_bytes(chunk_size=65_536):
+            received += len(chunk)
+            if received > maximum:
+                raise UpstreamResponseTooLarge("Upstream response exceeds the size limit")
+            chunks.append(chunk)
+
     try:
-        async with asyncio.timeout_at(deadline):
-            async for chunk in upstream.aiter_bytes(chunk_size=65_536):
-                received += len(chunk)
-                if received > maximum:
-                    raise RequestBodyTooLarge("Upstream response is too large")
-                chunks.append(chunk)
+        content_length = upstream.headers.get("content-length")
+        if content_length:
+            try:
+                declared_length = int(content_length)
+            except ValueError as error:
+                raise httpx.ProtocolError("Invalid Content-Length") from error
+            if declared_length < 0:
+                raise httpx.ProtocolError("Invalid Content-Length")
+            if declared_length > maximum:
+                raise UpstreamResponseTooLarge("Upstream response exceeds the size limit")
+        if deadline is None:
+            await read_chunks()
+        else:
+            async with asyncio.timeout_at(deadline):
+                await read_chunks()
     finally:
         await upstream.aclose()
     return b"".join(chunks)
@@ -2092,7 +2149,7 @@ async def _stream_video_response(
             async for chunk in upstream.aiter_bytes(chunk_size=65_536):
                 received += len(chunk)
                 if received > maximum:
-                    raise RequestBodyTooLarge("Video response is too large")
+                    raise UpstreamResponseTooLarge("Video response is too large")
                 yield chunk
     finally:
         await upstream.aclose()
@@ -2339,31 +2396,111 @@ async def _metered_stream(
     privacy: str,
     backend: str,
     on_close: Callable[[], Awaitable[None]] | None = None,
+    endpoint_health: EndpointHealth | None = None,
+    latency: float = 0.0,
 ) -> AsyncIterator[bytes]:
     pending = b""
+    received = 0
     usage: dict[str, Any] | None = None
+    done_seen = False
+    completed = False
+    stream_error: Exception | None = None
+    maximum_line = int(os.getenv("MAX_SSE_LINE_BYTES", str(DEFAULT_MAX_SSE_LINE_BYTES)))
+    maximum_response = int(os.getenv("MAX_SSE_RESPONSE_BYTES", str(DEFAULT_MAX_SSE_RESPONSE_BYTES)))
     try:
+        content_length = upstream.headers.get("content-length")
+        if content_length:
+            try:
+                declared_length = int(content_length)
+            except ValueError as exc:
+                raise httpx.ProtocolError("Invalid Content-Length") from exc
+            if declared_length < 0:
+                raise httpx.ProtocolError("Invalid Content-Length")
+            if declared_length > maximum_response:
+                raise UpstreamResponseTooLarge("SSE response exceeds the size limit")
         # Providers such as Venice may gzip SSE even when the downstream
         # response should remain a normal event stream. Iterate decoded bytes;
         # forwarding raw compressed chunks without Content-Encoding produces
         # an unreadable stream and also prevents usage settlement.
-        async for chunk in upstream.aiter_bytes():
+        async for chunk in upstream.aiter_bytes(chunk_size=65_536):
+            received += len(chunk)
+            if received > maximum_response:
+                raise UpstreamResponseTooLarge("SSE response exceeds the size limit")
             pending += chunk
             lines = pending.split(b"\n")
             pending = lines.pop()
+            if len(pending) > maximum_line:
+                raise UpstreamResponseTooLarge("SSE line exceeds the size limit")
             for line in lines:
+                if len(line) > maximum_line:
+                    raise UpstreamResponseTooLarge("SSE line exceeds the size limit")
+                if line.startswith(b"data:") and line[5:].strip() == b"[DONE]":
+                    done_seen = True
+                    completed = True
                 parsed = _usage_from_sse_line(line)
                 if parsed is not None:
                     usage = parsed
                 yield _normalize_sse_line(line, model) + b"\n"
         if pending:
+            if pending.startswith(b"data:") and pending[5:].strip() == b"[DONE]":
+                done_seen = True
+                completed = True
             usage = _usage_from_sse_line(pending) or usage
             yield _normalize_sse_line(pending, model)
+        if not done_seen:
+            raise httpx.RemoteProtocolError("SSE stream ended before [DONE]")
+    except Exception as exc:
+        stream_error = exc
+        raise
     finally:
-        await upstream.aclose()
-        if on_close is not None:
-            await on_close()
-        await _settle_billing(request, billing, route, model, privacy, backend, usage)
+        try:
+            try:
+                await upstream.aclose()
+            except httpx.HTTPError as exc:
+                if stream_error is None:
+                    stream_error = exc
+                    completed = False
+                    raise
+        finally:
+            try:
+                if on_close is not None:
+                    await on_close()
+            finally:
+                if stream_error is not None:
+                    if endpoint_health is not None:
+                        await endpoint_health.failure(backend)
+                    await _release_billing(
+                        request,
+                        billing,
+                        (
+                            "upstream_stream_too_large"
+                            if isinstance(stream_error, UpstreamResponseTooLarge)
+                            else "upstream_stream_invalid"
+                        ),
+                    )
+                else:
+                    if completed and endpoint_health is not None:
+                        completion_tokens = (usage or {}).get("completion_tokens")
+                        output_tokens = (
+                            completion_tokens
+                            if isinstance(completion_tokens, int)
+                            and not isinstance(completion_tokens, bool)
+                            and completion_tokens > 0
+                            else None
+                        )
+                        await endpoint_health.success(backend, latency, output_tokens)
+                    # A downstream disconnect is not an upstream health failure.
+                    # Preserve the existing fallback settlement so callers cannot
+                    # avoid charges by closing a successful inference early.
+                    await _settle_billing(
+                        request,
+                        billing,
+                        route,
+                        model,
+                        privacy,
+                        backend,
+                        usage,
+                    )
 
 
 def _estimate_reservation_cost(
@@ -2572,7 +2709,12 @@ def _select_backend(
         return config.backends[route.standard_backend], "standard"
     if route.confidential_backend:
         return config.backends[route.confidential_backend], "confidential"
-    assert route.standard_backend
+    if not route.standard_backend:
+        return openai_error(
+            409,
+            f"Model {route.id!r} has no available compute backend",
+            code="model_backend_unavailable",
+        )
     return config.backends[route.standard_backend], "standard-fallback"
 
 

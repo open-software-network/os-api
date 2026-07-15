@@ -2,9 +2,9 @@
 {% block title %}OpenSoftware API — Private model infrastructure{% endblock %}
 {% block content %}
 <section class="hero shell">
-  <div class="eyebrow"><span class="status-dot"></span> Live on OpenSoftware infrastructure</div>
+  <div class="eyebrow"><span class="status-dot"></span> Live private-provider routing</div>
   <h1>Open models.<br><span>One private API.</span></h1>
-  <p class="lede">Run OpenAI-compatible inference against models hosted by OpenSoftware on GCP, with confidential-compute routing when privacy has to be enforced.</p>
+  <p class="lede">Run OpenAI-compatible inference through reviewed private providers, with fail-closed confidential-compute routing when a TEE is required.</p>
   <div class="actions">
     <a class="button primary" href="/auth/start">Login with OpenSoftware</a>
     <a class="button secondary" href="/docs">Read the docs</a>
@@ -45,7 +45,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="qwen2.5-0.5b-instruct",
+    model="openai/gpt-oss-20b",
     messages=[{"role": "user", "content": "Hello"}],
 )</code></pre>
 </section>

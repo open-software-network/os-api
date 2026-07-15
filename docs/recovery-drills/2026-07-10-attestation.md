@@ -2,32 +2,30 @@
 
 ## Result
 
-Passed. `POST /v1/attestation` returns a genuine Intel TDX quote generated on the confidential node, bound to a client nonce and the deployed workload, and fails closed when evidence is unavailable. Verified on the private canary and on the public endpoint in both regions.
+Passed. The attestation endpoint returned a genuine Intel TDX quote produced by a confidential
+node, bound it to a client nonce and the configured workload identity, and failed closed when
+evidence was unavailable.
 
-## How it works
+## Control tested
 
-1. A privileged DaemonSet (`tdx-quote-agent`) runs on every confidential node. It mounts `configfs`, writes a 64-byte report-data value to `/sys/kernel/config/tsm/report/<id>/inblob`, and reads the resulting raw TDX quote from `outblob`. It handles no prompts, keys, or customer data.
-2. The gateway builds a canonical binding — client nonce, gateway version, gateway region, and each confidential backend with its pinned model revision — and sets report-data to its SHA-512.
-3. The response returns the quote (base64), the canonical binding, and the report-data hash.
+1. A node-local quote agent obtains a TDX quote without handling prompts, credentials, or customer
+   data.
+2. The gateway creates a canonical binding containing the client nonce and expected workload
+   attributes, then places its SHA-512 digest in the quote's report data.
+3. The response includes the quote, canonical binding, and reported digest for client verification.
 
-## Client verification (documented contract)
+The client must generate a fresh nonce, recompute the binding digest, confirm the nonce and
+expected workload attributes, locate the digest in the quote, and validate the quote against the
+platform certificate chain.
 
-A client:
-1. Sends a fresh random `nonce`.
-2. Recomputes `SHA-512(binding_canonical)` and confirms it equals `report_data_sha512` and appears at bytes 568–632 of the decoded quote.
-3. Confirms `binding.nonce` is its own nonce (freshness) and that `gateway_version` / `confidential_backends[].revision` match the expected release (workload identity).
-4. Validates the quote against Intel's PCS certificate chain (standard TDX quote verification).
+## Scope and follow-up
 
-## Evidence
+- Quote verification remains a client responsibility; the gateway does not provide an independent
+  attestation PKI.
+- The binding describes gateway-configured workload identity. It is not a measured-boot proof of
+  the model image.
+- Confidential key release is not yet gated on attestation.
 
-- Canary: `provider tdx_guest`, 8000-byte quote, header `0400020081000000`, `binding_hash_matches_reported: True`, `report_data_in_quote: True`, backends `[{confidential-vllm-cpu, vllm-openai-cpu@89e1fbe82903}]`.
-- Public endpoint: returned a valid bound quote stamped `region: us-east4`, and the us-central1 canary returned `region: us-central1` — each region attests its own confidential node.
-- Fail-closed: unit tests confirm `503 attestation_unavailable` when the agent URL is unset or the agent errors; the gateway never returns a substitute.
-
-## Honest scope
-
-- The quote is verified **by the client**; the gateway does not yet run server-side quote verification or a full attestation PKI.
-- report-data binds gateway-asserted configuration (version, region, configured model revision), not a measured-boot hash of the running model image. Binding a measured model image digest is the next hardening step.
-- No confidential key release is gated on attestation yet; that is the eventual fail-closed-key-release goal.
-
-Rerun after changes to the quote agent, the binding contents, or the confidential node pool.
+Repeat after changes to the quote agent, binding schema, confidential node configuration, or
+client-verification contract. Test valid evidence, nonce mismatch, malformed evidence, and agent
+unavailability without recording raw production evidence in this repository.

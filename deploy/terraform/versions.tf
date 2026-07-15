@@ -1,10 +1,7 @@
 terraform {
   required_version = ">= 1.9.0"
 
-  backend "gcs" {
-    bucket = "autonomous-lab-490610-sovereign-tfstate"
-    prefix = "platform"
-  }
+  backend "gcs" {}
 
   required_providers {
     google = {

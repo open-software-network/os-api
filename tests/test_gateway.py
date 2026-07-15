@@ -5,7 +5,11 @@ import json
 import time
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
+
+from sovereign_gateway import app as app_module
+from sovereign_gateway.app import create_app
 
 
 def test_authentication_is_required(client: TestClient) -> None:
@@ -13,6 +17,17 @@ def test_authentication_is_required(client: TestClient) -> None:
 
     assert response.status_code == 401
     assert response.json()["error"]["code"] == "invalid_api_key"
+
+
+def test_inference_rejects_malformed_utf8_json(client: TestClient) -> None:
+    response = client.post(
+        "/v1/chat/completions",
+        content=b'{"model":"dual-model","messages":["\xff"]}',
+        headers={"content-type": "application/json"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == "Request body must include a valid model"
 
 
 def test_public_home_and_docs_render(client: TestClient) -> None:
@@ -32,17 +47,17 @@ def test_responses_identify_gateway_region(client: TestClient) -> None:
 
 
 def test_site_basic_auth_does_not_replace_api_key_auth(client: TestClient, monkeypatch) -> None:
-    monkeypatch.setenv("SITE_BASIC_AUTH_USERNAME", "alongside")
+    monkeypatch.setenv("SITE_BASIC_AUTH_USERNAME", "operator")
     monkeypatch.setenv("SITE_BASIC_AUTH_PASSWORD", "test-password")
 
     missing = client.get("/", headers={"Authorization": ""})
     wrong = client.get(
         "/docs",
-        headers={"Authorization": _basic_auth("alongside", "wrong")},
+        headers={"Authorization": _basic_auth("operator", "wrong")},
     )
     allowed = client.get(
         "/dashboard",
-        headers={"Authorization": _basic_auth("alongside", "test-password")},
+        headers={"Authorization": _basic_auth("operator", "test-password")},
         follow_redirects=False,
     )
     api = client.get("/v1/models")
@@ -205,6 +220,22 @@ def test_unknown_model_uses_openai_error_shape(client: TestClient) -> None:
     }
 
 
+def test_embeddings_do_not_receive_generation_output_limits(
+    client: TestClient,
+    upstream_requests: list[httpx.Request],
+) -> None:
+    response = client.post(
+        "/v1/embeddings",
+        headers={"X-Confidential-Compute": "disabled"},
+        json={"model": "dual-model", "input": "hello"},
+    )
+
+    assert response.status_code == 200
+    forwarded = json.loads(upstream_requests[-1].content)
+    assert "max_completion_tokens" not in forwarded
+    assert "max_tokens" not in forwarded
+
+
 def test_venice_compatibility_surface_is_dormant_by_default(client: TestClient) -> None:
     response = client.post(
         "/v1/audio/transcriptions",
@@ -328,3 +359,56 @@ def test_rejects_oversized_body_before_proxying(
     assert response.status_code == 413
     assert response.json()["error"]["code"] == "request_too_large"
     assert not upstream_requests
+
+
+def test_routed_inference_uses_limited_reader_for_chunked_body(
+    client: TestClient,
+    upstream_requests: list[httpx.Request],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MAX_REQUEST_BYTES", "32")
+    original = app_module._read_request_body_limited
+    used_limited_reader = False
+
+    async def tracking_reader(request, maximum):
+        nonlocal used_limited_reader
+        used_limited_reader = True
+        return await original(request, maximum)
+
+    monkeypatch.setattr(app_module, "_read_request_body_limited", tracking_reader)
+    body = b'{"model":"dual-model","padding":"' + b"x" * 64 + b'"}'
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Content-Type": "application/json"},
+        content=(chunk for chunk in (body[:16], body[16:])),
+    )
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "request_too_large"
+    assert used_limited_reader is True
+    assert not upstream_requests
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("MAX_IMAGE_GENERATE_REQUEST_BYTES", "not-an-integer"),
+        ("IMAGE_GENERATE_TIMEOUT_SECONDS", "nan"),
+        ("VENICE_COMPAT_ENABLED", "sometimes"),
+        ("ENABLE_MANAGED_KEYS", "sometimes"),
+        ("REQUIRE_CONFIDENTIAL_SPACE", "sometimes"),
+    ],
+)
+def test_invalid_environment_fails_application_startup(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    value: str,
+) -> None:
+    monkeypatch.setenv("API_KEY_HASHES", f"test={'0' * 64}")
+    monkeypatch.setenv("LIVE_PROVIDER_CATALOG_ENABLED", "false")
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=name):
+        with TestClient(create_app()):
+            pass

@@ -17,10 +17,8 @@ metadata:
   namespace: inference
 spec:
   podSelector:
-    matchExpressions:
-      - key: app
-        operator: In
-        values: [confidential-vllm, standard-vllm]
+    matchLabels:
+      sovereign.network/model: "true"
   policyTypes: [Egress]
   egress:
     # DNS resolution.
@@ -46,10 +44,8 @@ metadata:
   namespace: inference
 spec:
   podSelector:
-    matchExpressions:
-      - key: app
-        operator: In
-        values: [confidential-vllm, standard-vllm]
+    matchLabels:
+      sovereign.network/model: "true"
   egress:
     - matches:
         - name: huggingface.co

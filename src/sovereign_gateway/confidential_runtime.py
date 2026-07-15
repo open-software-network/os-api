@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 
 from google.cloud import secretmanager
 
 DEFAULT_TOKEN_FILE = "/run/container_launcher/attestation_verifier_claims_token"
-DEFAULT_CREDENTIAL_FILE = "/tmp/os-api-confidential-space-credentials.json"
+DEFAULT_CREDENTIAL_FILE = str(
+    Path(tempfile.gettempdir()) / "os-api-confidential-space-credentials.json"
+)
 
 
 class ConfidentialRuntimeError(RuntimeError):
@@ -26,9 +29,7 @@ def configure_confidential_runtime() -> None:
     if not token_file.is_file():
         raise ConfidentialRuntimeError("Confidential Space attestation token is unavailable")
 
-    credential_file = Path(
-        os.getenv("CONFIDENTIAL_SPACE_CREDENTIAL_FILE", DEFAULT_CREDENTIAL_FILE)
-    )
+    credential_file = Path(os.getenv("CONFIDENTIAL_SPACE_CREDENTIAL_FILE", DEFAULT_CREDENTIAL_FILE))
     _write_private(
         credential_file,
         json.dumps(
@@ -68,8 +69,7 @@ def _mapping(name: str) -> dict[str, str]:
     except json.JSONDecodeError as exc:
         raise ConfidentialRuntimeError(f"{name} must be a JSON object") from exc
     if not isinstance(value, dict) or any(
-        not isinstance(key, str) or not isinstance(secret, str)
-        for key, secret in value.items()
+        not isinstance(key, str) or not isinstance(secret, str) for key, secret in value.items()
     ):
         raise ConfidentialRuntimeError(f"{name} must map strings to strings")
     return value
@@ -105,7 +105,20 @@ def _release_secret_files(mapping: Mapping[str, str]) -> None:
 
 
 def _write_private(path: Path, data: bytes) -> None:
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    os.fchmod(descriptor, 0o600)
-    with os.fdopen(descriptor, "wb") as stream:
-        stream.write(data)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        stream = os.fdopen(descriptor, "wb")
+        descriptor = -1
+        with stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+        raise

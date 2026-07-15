@@ -1,6 +1,11 @@
 variable "project_id" {
   description = "GCP project that will own the inference platform."
   type        = string
+
+  validation {
+    condition     = can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", var.project_id))
+    error_message = "project_id must be a valid Google Cloud project ID."
+  }
 }
 
 variable "region" {
@@ -148,9 +153,20 @@ variable "enable_monitoring" {
 }
 
 variable "enable_firestore_backups" {
-  description = "Enable Firestore PITR plus scheduled managed exports to a retention-protected bucket. Existing databases must be imported into Terraform state before apply."
+  description = "Schedule managed Firestore exports to a retention-protected bucket. The active public database always has PITR enabled and existing databases must be imported before apply."
   type        = bool
   default     = false
+}
+
+variable "firestore_collection_prefix" {
+  description = "Prefix shared by every runtime Firestore collection, composite index, and scheduled export. Changing it points the gateway at a different logical dataset."
+  type        = string
+  default     = "sovereign"
+
+  validation {
+    condition     = can(regex("^[a-z][a-z0-9_-]{0,62}$", var.firestore_collection_prefix))
+    error_message = "firestore_collection_prefix must start with a lowercase letter and contain at most 63 lowercase letters, digits, underscores, or hyphens."
+  }
 }
 
 variable "enable_multi_region_control_plane" {
@@ -171,6 +187,12 @@ variable "operator_email" {
   default     = ""
 }
 
+variable "site_basic_auth_username" {
+  description = "Optional HTTP Basic username for the human-facing site. Leave empty to disable the site gate."
+  type        = string
+  default     = ""
+}
+
 variable "attestation_agent_url" {
   description = "Internal URL of the TDX quote agent (deploy/kubernetes/attestation). Empty disables /v1/attestation, which then fails closed. If the agent's internal LB IP changes, update this value."
   type        = string
@@ -184,7 +206,7 @@ variable "attestation_agent_url_secondary" {
 }
 
 variable "enable_binary_authorization" {
-  description = "Enforce the project Binary Authorization allowlist on the inference cluster and the gateway Cloud Run services."
+  description = "Require release attestations for non-system images on the inference cluster and gateway Cloud Run services."
   type        = bool
   default     = false
 }
@@ -244,19 +266,29 @@ variable "enable_github_deployments" {
 variable "github_repository_id" {
   description = "Immutable numeric GitHub repository ID allowed to deploy."
   type        = string
-  default     = "1296538310"
+  default     = ""
+
+  validation {
+    condition     = var.github_repository_id == "" || can(regex("^[0-9]+$", var.github_repository_id))
+    error_message = "github_repository_id must be an immutable numeric GitHub repository ID."
+  }
 }
 
 variable "github_repository_owner_id" {
   description = "Immutable numeric GitHub organization ID allowed to deploy."
   type        = string
-  default     = "278133536"
+  default     = ""
+
+  validation {
+    condition     = var.github_repository_owner_id == "" || can(regex("^[0-9]+$", var.github_repository_owner_id))
+    error_message = "github_repository_owner_id must be an immutable numeric GitHub organization ID."
+  }
 }
 
 variable "gateway_image" {
   description = "Digest-pinned gateway container deployed to Cloud Run."
   type        = string
-  default     = "us-central1-docker.pkg.dev/autonomous-lab-490610/sovereign-inference/gateway@sha256:47b4bf42a464f9ae12c37be569eebdc58e5f2f449ff40347567acbaf4f0464f6"
+  default     = ""
 }
 
 variable "deletion_protection" {

@@ -64,6 +64,7 @@ are rejected from these routes, preventing an accidental second billing path.
 | `MAX_AUDIO_BYTES` | Hard multipart audio cap; defaults to 25 MiB. |
 | `MAX_IMAGE_GENERATE_REQUEST_BYTES` | Hard image-generation JSON cap; defaults to 1 MiB. |
 | `IMAGE_GENERATE_TIMEOUT_SECONDS` | Venice image-generation timeout; defaults to 360 seconds so June can cancel before its provider-leg budget expires. |
+| `MAX_UPSTREAM_JSON_RESPONSE_BYTES` | Hard JSON response cap shared by inference, audio, augmentation, image, and attestation paths; defaults to 16 MiB. |
 | `MAX_VIDEO_REQUEST_BYTES` | Hard quote and retrieve JSON cap; defaults to 1 MiB. |
 | `MAX_VIDEO_QUEUE_REQUEST_BYTES` | Hard queue JSON cap; defaults to 31 MiB, below Cloud Run's HTTP/1 ingress ceiling. |
 | `VIDEO_QUEUE_MAX_CONCURRENCY` | Per-instance queue-body concurrency cap; defaults to 4 to bound base64 memory residency. |

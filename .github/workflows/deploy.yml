@@ -7,41 +7,107 @@ concurrency:
   group: os-api-production
   cancel-in-progress: false
 
-permissions:
-  contents: read
-  id-token: write
+permissions: {}
 
 env:
-  PROJECT_ID: autonomous-lab-490610
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
   REGION: us-central1
   SERVICE: sovereign-api
   CANARY_SERVICE: sovereign-api-canary
   SECONDARY_SERVICE: sovereign-api-secondary
   SECONDARY_REGION: us-east4
-  IMAGE: us-central1-docker.pkg.dev/autonomous-lab-490610/sovereign-inference/gateway
+  IMAGE: ${{ vars.GCP_ARTIFACT_IMAGE }}
+  PUBLIC_READY_URL: ${{ vars.PUBLIC_READY_URL }}
+  GCP_DEPLOY_SERVICE_ACCOUNT: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+  GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
 
 jobs:
   deploy:
+    name: Deploy signed production image
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     environment: production
+    permissions:
+      contents: read
+      id-token: write # Required only for the Google Cloud workload-identity exchange.
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Validate production configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in \
+            PROJECT_ID \
+            IMAGE \
+            PUBLIC_READY_URL \
+            GCP_DEPLOY_SERVICE_ACCOUNT \
+            GCP_WORKLOAD_IDENTITY_PROVIDER; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing required production environment variable: ${name}"
+              exit 1
+            fi
+          done
+
+          if [[ ! "${PROJECT_ID}" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]]; then
+            echo "::error::GCP_PROJECT_ID is not a valid Google Cloud project ID"
+            exit 1
+          fi
+          expected_deployer="os-api-github-deployer@${PROJECT_ID}.iam.gserviceaccount.com"
+          if [[ "${GCP_DEPLOY_SERVICE_ACCOUNT}" != "${expected_deployer}" ]]; then
+            echo "::error::GCP_DEPLOY_SERVICE_ACCOUNT must match the Terraform-managed deployer: ${expected_deployer}"
+            exit 1
+          fi
+          expected_registry="${REGION}-docker.pkg.dev/${PROJECT_ID}/"
+          if [[ "${IMAGE}" != "${expected_registry}"* ]]; then
+            echo "::error::GCP_ARTIFACT_IMAGE must name an Artifact Registry image under ${expected_registry}"
+            exit 1
+          fi
+          if [[ "${IMAGE}" == *":"* || "${IMAGE}" == *"@"* ]]; then
+            echo "::error::GCP_ARTIFACT_IMAGE must be an untagged image path; the workflow supplies the immutable tag and digest"
+            exit 1
+          fi
+          if [[ ! "${PUBLIC_READY_URL}" =~ ^https:// ]]; then
+            echo "::error::PUBLIC_READY_URL must be an HTTPS URL"
+            exit 1
+          fi
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
         with:
           project_id: ${{ env.PROJECT_ID }}
-          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_DEPLOY_SERVICE_ACCOUNT }}
 
-      - uses: google-github-actions/setup-gcloud@v3
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
         with:
           install_components: beta
 
-      - uses: docker/setup-buildx-action@v3
+      - name: Refuse Cloud Run deploy when Confidential Space serves production
+        shell: bash
+        run: |
+          set -euo pipefail
+          edge_backends="$(gcloud compute backend-services list \
+            --project "${PROJECT_ID}" \
+            --global \
+            --filter='name=os-api-edge' \
+            --format=json)"
+          if jq -e '
+            any(
+              .[]? | .backends[]?;
+              ((.group // "") | contains("/instanceGroups/"))
+            )
+          ' <<<"${edge_backends}" >/dev/null; then
+            echo "::error::The active production edge uses Confidential Space managed instance groups. Roll out gateway_image through Terraform and the attested-gateway procedure; this workflow updates only Cloud Run."
+            exit 1
+          fi
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
 
       - name: Validate hosted provider catalog and pricing
         run: |
@@ -67,13 +133,15 @@ jobs:
 
       - name: Sign image for Binary Authorization
         shell: bash
+        env:
+          IMAGE_REFERENCE: ${{ steps.image.outputs.reference }}
         run: |
           set -euo pipefail
           # Cloud Run evaluates the resolved platform manifest while GKE
           # evaluates the reference as written, so sign the buildx index
           # digest and every platform manifest digest beneath it.
           keyversion="projects/${PROJECT_ID}/locations/${REGION}/keyRings/os-api-binauthz/cryptoKeys/release-signing/cryptoKeyVersions/1"
-          index_ref="${{ steps.image.outputs.reference }}"
+          index_ref="${IMAGE_REFERENCE}"
           platform_refs="$(docker buildx imagetools inspect "${index_ref}" --raw \
             | jq -r '.manifests[] | select(.platform.os != "unknown") | .digest' \
             | sed "s|^|${IMAGE}@|")"
@@ -89,6 +157,8 @@ jobs:
       - name: Deploy private canary
         id: canary
         shell: bash
+        env:
+          IMAGE_REFERENCE: ${{ steps.image.outputs.reference }}
         run: |
           set -euo pipefail
           # Binary Authorization occurrences are eventually consistent. Cloud
@@ -97,22 +167,24 @@ jobs:
           # Retry only that transient denial; all other deploy failures remain
           # immediate and fail closed.
           for attempt in {1..6}; do
-            suffix="gh-${GITHUB_RUN_ID}-${attempt}"
+            suffix="gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${attempt}"
             if output=$(gcloud run deploy "${CANARY_SERVICE}" \
               --project "${PROJECT_ID}" \
               --region "${REGION}" \
-              --image "${{ steps.image.outputs.reference }}" \
+              --image "${IMAGE_REFERENCE}" \
               --revision-suffix "${suffix}" \
               --update-env-vars "MODEL_CONFIG_PATH=/app/config/models.yaml,VENICE_COMPAT_ENABLED=true" \
               --quiet 2>&1); then
               printf '%s\n' "${output}"
               break
             fi
-            if [[ "${output}" != *"not authorized by policy"* || "${attempt}" == "6" ]]; then
+            normalized_output="${output,,}"
+            if [[ "${normalized_output}" != *"no attestations found that were valid and signed by a key trusted by the attestor"* || "${attempt}" == "6" ]]; then
               printf '%s\n' "${output}" >&2
               exit 1
             fi
-            echo "Binary Authorization signature is not visible yet; retrying canary deploy (${attempt}/6)."
+            printf '%s\n' "${output}" >&2
+            echo "Binary Authorization has not observed the new attestation yet; retrying canary deploy (${attempt}/6)."
             sleep 10
           done
           canary_url="$(gcloud run services describe "${CANARY_SERVICE}" \
@@ -122,13 +194,27 @@ jobs:
           test -n "${canary_url}"
           echo "url=${canary_url}" >> "${GITHUB_OUTPUT}"
 
+      - name: Fetch canary smoke credential
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke_key="$(gcloud secrets versions access latest \
+            --project "${PROJECT_ID}" \
+            --secret smoke-client-api-key)"
+          test -n "${smoke_key}"
+          echo "::add-mask::${smoke_key}"
+          umask 077
+          printf '%s' "${smoke_key}" > "${RUNNER_TEMP}/os-api-smoke-key"
+
       - name: Mint canary identity token
         id: canary-auth
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
         with:
           project_id: ${{ env.PROJECT_ID }}
-          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          create_credentials_file: false
+          export_environment_variables: false
           token_format: id_token
           id_token_audience: ${{ steps.canary.outputs.url }}
 
@@ -139,9 +225,8 @@ jobs:
           CANARY_ID_TOKEN: ${{ steps.canary-auth.outputs.id_token }}
         run: |
           set -euo pipefail
-          smoke_key="$(gcloud secrets versions access latest \
-            --project "${PROJECT_ID}" \
-            --secret smoke-client-api-key)"
+          smoke_key="$(<"${RUNNER_TEMP}/os-api-smoke-key")"
+          rm -f "${RUNNER_TEMP}/os-api-smoke-key"
           echo "::add-mask::${smoke_key}"
           echo "::add-mask::${CANARY_ID_TOKEN}"
           for attempt in {1..12}; do
@@ -221,14 +306,16 @@ jobs:
       - name: Deploy production revision without traffic
         id: production
         shell: bash
+        env:
+          IMAGE_REFERENCE: ${{ steps.image.outputs.reference }}
         run: |
           set -euo pipefail
-          suffix="gh-${GITHUB_RUN_ID}"
+          suffix="gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           revision="${SERVICE}-${suffix}"
           gcloud run deploy "${SERVICE}" \
             --project "${PROJECT_ID}" \
             --region "${REGION}" \
-            --image "${{ steps.image.outputs.reference }}" \
+            --image "${IMAGE_REFERENCE}" \
             --revision-suffix "${suffix}" \
             --no-traffic \
             --update-env-vars "MODEL_CONFIG_PATH=/app/config/models.yaml,VENICE_COMPAT_ENABLED=true" \
@@ -238,43 +325,115 @@ jobs:
       - name: Deploy secondary-region revision without traffic
         id: secondary
         shell: bash
+        env:
+          IMAGE_REFERENCE: ${{ steps.image.outputs.reference }}
         run: |
           set -euo pipefail
-          suffix="gh-${GITHUB_RUN_ID}"
+          suffix="gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           revision="${SECONDARY_SERVICE}-${suffix}"
           gcloud run deploy "${SECONDARY_SERVICE}" \
             --project "${PROJECT_ID}" \
             --region "${SECONDARY_REGION}" \
-            --image "${{ steps.image.outputs.reference }}" \
+            --image "${IMAGE_REFERENCE}" \
             --revision-suffix "${suffix}" \
             --no-traffic \
             --update-env-vars "MODEL_CONFIG_PATH=/app/config/models.yaml,VENICE_COMPAT_ENABLED=true" \
             --quiet
           echo "revision=${revision}" >> "${GITHUB_OUTPUT}"
 
-      - name: Promote production revision
+      - name: Capture current production traffic
+        id: previous-traffic
         shell: bash
+        run: |
+          set -euo pipefail
+
+          traffic_assignments() {
+            local service="$1"
+            local region="$2"
+            gcloud run services describe "${service}" \
+              --project "${PROJECT_ID}" \
+              --region "${region}" \
+              --format=json \
+              | jq -er '
+                  [.status.traffic[]
+                    | select((.percent // 0) > 0 and (.revisionName // "") != "")
+                    | "\(.revisionName)=\(.percent | floor)"]
+                  | if length == 0
+                    then error("service has no revision traffic to preserve")
+                    else join(",")
+                    end
+                '
+          }
+
+          primary="$(traffic_assignments "${SERVICE}" "${REGION}")"
+          secondary="$(traffic_assignments "${SECONDARY_SERVICE}" "${SECONDARY_REGION}")"
+          echo "primary=${primary}" >> "${GITHUB_OUTPUT}"
+          echo "secondary=${secondary}" >> "${GITHUB_OUTPUT}"
+
+      - name: Promote production revision
+        id: promote-production
+        shell: bash
+        env:
+          PRODUCTION_REVISION: ${{ steps.production.outputs.revision }}
         run: |
           set -euo pipefail
           gcloud run services update-traffic "${SERVICE}" \
             --project "${PROJECT_ID}" \
             --region "${REGION}" \
-            --to-revisions "${{ steps.production.outputs.revision }}=100" \
+            --to-revisions "${PRODUCTION_REVISION}=100" \
             --quiet
 
       - name: Promote secondary-region revision
+        id: promote-secondary
         shell: bash
+        env:
+          SECONDARY_REVISION: ${{ steps.secondary.outputs.revision }}
         run: |
           set -euo pipefail
           gcloud run services update-traffic "${SECONDARY_SERVICE}" \
             --project "${PROJECT_ID}" \
             --region "${SECONDARY_REGION}" \
-            --to-revisions "${{ steps.secondary.outputs.revision }}=100" \
+            --to-revisions "${SECONDARY_REVISION}=100" \
             --quiet
 
       - name: Verify public endpoint
         shell: bash
         run: |
           set -euo pipefail
-          curl --fail --silent --show-error --max-time 30 https://api.opensoftware.co/readyz \
+          curl --fail --silent --show-error --max-time 30 "${PUBLIC_READY_URL}" \
             | jq -e '.status == "ready"' >/dev/null
+
+      - name: Restore previous traffic after failed promotion
+        if: ${{ failure() && steps.previous-traffic.outcome == 'success' }}
+        shell: bash
+        env:
+          PRIMARY_TRAFFIC: ${{ steps.previous-traffic.outputs.primary }}
+          SECONDARY_TRAFFIC: ${{ steps.previous-traffic.outputs.secondary }}
+        run: |
+          set -u
+          rollback_failed=0
+
+          if ! gcloud run services update-traffic "${SERVICE}" \
+            --project "${PROJECT_ID}" \
+            --region "${REGION}" \
+            --to-revisions "${PRIMARY_TRAFFIC}" \
+            --quiet; then
+            echo "::error::Failed to restore primary-region traffic"
+            rollback_failed=1
+          fi
+
+          if ! gcloud run services update-traffic "${SECONDARY_SERVICE}" \
+            --project "${PROJECT_ID}" \
+            --region "${SECONDARY_REGION}" \
+            --to-revisions "${SECONDARY_TRAFFIC}" \
+            --quiet; then
+            echo "::error::Failed to restore secondary-region traffic"
+            rollback_failed=1
+          fi
+
+          exit "${rollback_failed}"
+
+      - name: Remove canary smoke credential
+        if: ${{ always() }}
+        shell: bash
+        run: rm -f "${RUNNER_TEMP}/os-api-smoke-key"

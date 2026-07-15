@@ -98,7 +98,7 @@ resource "google_cloud_run_v2_service" "public_api_secondary" {
 
       env {
         name  = "FIRESTORE_COLLECTION_PREFIX"
-        value = "sovereign"
+        value = var.firestore_collection_prefix
       }
 
       env {
@@ -133,7 +133,7 @@ resource "google_cloud_run_v2_service" "public_api_secondary" {
 
       env {
         name  = "SITE_BASIC_AUTH_USERNAME"
-        value = "alongside"
+        value = var.site_basic_auth_username
       }
 
       env {
@@ -245,25 +245,8 @@ resource "google_cloud_run_v2_service" "public_api_secondary" {
       }
 
       volume_mounts {
-        name       = "models"
-        mount_path = "/etc/sovereign"
-      }
-
-      volume_mounts {
         name       = "redis-ca"
         mount_path = "/etc/redis"
-      }
-    }
-
-    volumes {
-      name = "models"
-      secret {
-        secret       = google_secret_manager_secret.runtime["cloudrun-model-config-secondary"].secret_id
-        default_mode = 292
-        items {
-          version = "latest"
-          path    = "models.yaml"
-        }
       }
     }
 

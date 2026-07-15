@@ -2,35 +2,27 @@
 
 ## Result
 
-Passed. One good rollout and one deliberately broken rollout were exercised live against the serving confidential CPU model deployment using `scripts/model_rollout.sh`. A continuous public sampler sent a confidential inference request every 10 seconds throughout both drills: **82 of 82 requests returned HTTP 200** (window 19:43:10Z–19:57:23Z), which also spanned the 0.6.0 gateway promotion in both regions.
+Passed. A valid model release completed the canary and promotion gates. A deliberately invalid
+release failed readiness and triggered automatic rollback while the previous ready workload
+continued serving synthetic requests.
 
-## Good rollout (19:43:17Z → 19:51:32Z, ~8m15s)
+## Control tested
 
-- Phase 1: the exact artifact started as an off-service canary deployment (`confidential-vllm-cpu-rollout-canary`); no Service selects its pods, so it can receive no customer traffic. The surge pod triggered cluster-autoscaler scale-up (1→2 nodes), pulled the image, loaded the model, and passed the golden-prompt gate via direct port-forward.
-- Phase 2: promotion used `RollingUpdate` with `maxSurge: 1, maxUnavailable: 0`; the old model pod served until the replacement was ready.
-- Phase 3: the golden gate passed against the serving deployment. The drill used `--stamp` to force a new ReplicaSet with the unchanged pinned digest.
+1. Start the candidate as an off-service canary so it cannot receive customer traffic.
+2. Run a deterministic golden-prompt smoke test directly against the candidate.
+3. Promote with a strategy that preserves the ready workload until the replacement is ready.
+4. Run the same gate against the serving deployment.
+5. On timeout or failed readiness, undo the rollout and verify the prior pinned image is serving.
 
-## Broken rollout with automatic rollback (19:52:07Z → 19:57:10Z)
+Responses expose `x-model-revision`, `x-model-backend`, and `x-compute-privacy` so operators and
+clients can identify the configured serving path without relying on mutable tags.
 
-- A non-model image (`registry.k8s.io/pause:3.9`) was promoted with `--skip-canary` to force the failure into the promote path.
-- The broken pod never passed readiness; with `maxUnavailable: 0` the previous model pod was never removed, so serving capacity never dropped.
-- `rollout status` timed out after the configured 300s, the script automatically ran `rollout undo`, and the deployment reported the previous pinned vLLM digest serving again 2 seconds later.
-- Public sampler observed no non-200 response at any point.
+## Scope
 
-## Version visibility
+Golden prompts are smoke tests, not a scored quality evaluation. A single-replica deployment uses
+an off-service canary because traffic-weighted canaries would expose an unvalidated candidate to a
+large fraction of requests. Capacity-constrained accelerators may need a different strategy and an
+explicit maintenance objective.
 
-Gateway 0.6.0 stamps `x-model-revision` (the pinned image revision from `models.yaml`) on every inference response, alongside the existing `x-model-backend` and `x-compute-privacy`. Verified on the private canary and then on the public endpoint after promotion:
-
-```
-x-compute-privacy: confidential
-x-model-backend: confidential-vllm-cpu
-x-model-revision: vllm-openai-cpu@89e1fbe82903
-```
-
-## Scope notes
-
-- The canary phase uses synthetic golden prompts, not diverted customer traffic. At single-replica scale this is deliberate: replica-weighted canary traffic would send half of production requests to an unvalidated build. Revisit when model deployments run multiple replicas.
-- Golden prompts are smoke-level quality gates (valid completion, deterministic settings). A scored evaluation suite as a promotion gate remains future work.
-- The GPU deployment retains `Recreate` because it owns a single dedicated TDX GPU node; GPU rollouts are planned brief unavailability until capacity is diversified.
-
-Rerun this drill after changing the rollout script, deployment strategy, node-pool sizing, or probe configuration.
+Repeat after changes to rollout automation, probes, deployment strategy, model images, golden
+prompts, node-pool sizing, or rollback retention.

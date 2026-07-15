@@ -62,3 +62,49 @@ def test_audit_routes_are_tenant_isolated(client: TestClient, monkeypatch) -> No
     exported_events = [json.loads(line) for line in exported.text.splitlines()]
     assert [event["key_name"] for event in exported_events] == ["Tenant A"]
     assert all(secret not in response.text + exported.text for secret in secrets)
+
+
+def test_key_api_paginates_without_hiding_older_keys(client: TestClient, monkeypatch) -> None:
+    repository = InMemoryKeyRepository()
+    created = []
+
+    async def seed() -> None:
+        for index in range(3):
+            created.append(await repository.create_key("usr_a", f"Tenant A {index}", None, None))
+        created.append(await repository.create_key("usr_b", "Tenant B", None, None))
+
+    async def me(access_token: str):
+        assert access_token == "session-a"
+        return AccountUser("usr_a", "a", "a@example.com", "A", None), None
+
+    async def balance(access_token: str):
+        assert access_token == "session-a"
+        return {"available_credits": 10}
+
+    anyio.run(seed)
+    client.app.state.managed_keys = repository
+    monkeypatch.setattr(client.app.state.accounts, "me", me)
+    monkeypatch.setattr(client.app.state.accounts, "balance", balance)
+    client.cookies.set("osapi_access", "session-a")
+
+    first = client.get("/api/keys?limit=2", headers={"Authorization": ""})
+    first_body = first.json()
+    second = client.get(
+        "/api/keys",
+        params={"limit": 2, "cursor": first_body["next_cursor"]},
+        headers={"Authorization": ""},
+    )
+    cross_tenant = client.get(
+        "/api/keys",
+        params={"cursor": created[-1].record.id},
+        headers={"Authorization": ""},
+    )
+
+    assert first.status_code == 200
+    assert [record["name"] for record in first_body["data"]] == ["Tenant A 2", "Tenant A 1"]
+    assert first_body["next_cursor"] == first_body["data"][-1]["id"]
+    assert second.status_code == 200
+    assert [record["name"] for record in second.json()["data"]] == ["Tenant A 0"]
+    assert second.json()["next_cursor"] is None
+    assert cross_tenant.status_code == 400
+    assert cross_tenant.json() == {"error": "invalid_key_cursor"}

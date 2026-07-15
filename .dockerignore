@@ -1,10 +1,20 @@
-.git
-.github
-.pytest_cache
-.ruff_cache
-.venv
-deploy
-docs
-tests
-*.tfplan
-*.tfstate*
+# Send only files consumed by the Dockerfile. This keeps local credentials,
+# environment files, Terraform state, and workspace metadata out of remote
+# BuildKit contexts even if a future COPY instruction becomes broader.
+**
+!pyproject.toml
+!uv.lock
+!README.md
+!AUTHORS.md
+!LICENSE
+!NOTICE
+!THIRD_PARTY_NOTICES.md
+!src/
+!src/**
+!config/
+!config/models.yaml
+!config/models.self-hosted.yaml
+!deploy/
+!deploy/attestation-agent/
+!deploy/attestation-agent/Dockerfile
+!deploy/attestation-agent/agent.py

@@ -95,6 +95,20 @@ def test_gateway_attestation_rejects_non_object_json(client: TestClient) -> None
     assert response.headers["access-control-allow-origin"] == "*"
 
 
+def test_gateway_attestation_caps_chunked_request_body(client: TestClient) -> None:
+    body = b'{"nonce":"client-nonce-0001","padding":"' + b"x" * 5_000 + b'"}'
+
+    response = client.post(
+        "/v1/gateway/attestation",
+        headers={"content-type": "application/json"},
+        content=(chunk for chunk in (body[:2_048], body[2_048:])),
+    )
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "request_too_large"
+    assert response.headers["access-control-allow-origin"] == "*"
+
+
 @pytest.mark.parametrize("length", [9, 89])
 def test_gateway_attestation_rejects_nonce_outside_launcher_bounds(
     client: TestClient, length: int
@@ -122,9 +136,7 @@ def test_gateway_attestation_accepts_nonce_at_launcher_bounds(
 
 
 def test_gateway_attestation_fails_closed_outside_confidential_space(client: TestClient) -> None:
-    response = client.post(
-        "/v1/gateway/attestation", json={"nonce": "client-nonce-0001"}
-    )
+    response = client.post("/v1/gateway/attestation", json={"nonce": "client-nonce-0001"})
 
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "gateway_attestation_unavailable"

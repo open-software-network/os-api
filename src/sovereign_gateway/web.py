@@ -20,7 +20,7 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 from pydantic import BaseModel, ConfigDict, Field
 
 from .accounts import AccountsClient, AccountUser, TokenPair
-from .managed_keys import ManagedKeyRepository
+from .managed_keys import DEFAULT_KEY_PAGE_LIMIT, InvalidKeyCursor, ManagedKeyRepository
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 templates = Environment(
@@ -169,15 +169,27 @@ async def api_account(request: Request) -> Response:
 
 
 @router.get("/api/keys", include_in_schema=False)
-async def api_keys(request: Request) -> Response:
+async def api_keys(
+    request: Request,
+    limit: int = DEFAULT_KEY_PAGE_LIMIT,
+    cursor: str | None = None,
+) -> Response:
     session = await _session(request)
     repository = _repository(request)
     if not session:
         return JSONResponse({"error": "authentication_required"}, status_code=401)
     if not repository:
         return JSONResponse({"error": "key_management_unavailable"}, status_code=503)
-    records = await repository.list_keys(session.user.id)
-    response = JSONResponse({"data": [record.public_dict() for record in records]})
+    try:
+        page = await repository.list_keys(session.user.id, limit=limit, cursor=cursor)
+    except InvalidKeyCursor:
+        return JSONResponse({"error": "invalid_key_cursor"}, status_code=400)
+    response = JSONResponse(
+        {
+            "data": [record.public_dict() for record in page.records],
+            "next_cursor": page.next_cursor,
+        }
+    )
     if session.rotated:
         _set_session_cookies(response, session.rotated)
     return response

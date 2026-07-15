@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import heapq
 import hmac
 import os
 import re
@@ -14,7 +15,11 @@ from google.cloud import firestore
 
 from .auth import Principal
 
+KEY_ID_PATTERN = re.compile(r"^key_[A-Za-z0-9_-]{12,32}$")
 KEY_PATTERN = re.compile(r"^sk-os-(key_[A-Za-z0-9_-]{12,32})\.([A-Za-z0-9_-]{32,})$")
+DEFAULT_KEY_PAGE_LIMIT = 100
+MAX_KEY_PAGE_LIMIT = 100
+MAX_EVENT_LIST_LIMIT = 5000
 
 
 class SpendLimitExceeded(Exception):
@@ -22,6 +27,10 @@ class SpendLimitExceeded(Exception):
 
 
 class KeyUnavailable(Exception):
+    pass
+
+
+class InvalidKeyCursor(ValueError):
     pass
 
 
@@ -71,6 +80,12 @@ class CreatedApiKey:
     secret: str
 
 
+@dataclass(frozen=True)
+class ApiKeyPage:
+    records: tuple[ApiKeyRecord, ...]
+    next_cursor: str | None
+
+
 class ManagedKeyRepository(Protocol):
     async def healthcheck(self) -> None: ...
 
@@ -84,7 +99,12 @@ class ManagedKeyRepository(Protocol):
         spend_limit_microusd: int | None,
     ) -> CreatedApiKey: ...
 
-    async def list_keys(self, user_id: str) -> list[ApiKeyRecord]: ...
+    async def list_keys(
+        self,
+        user_id: str,
+        limit: int = DEFAULT_KEY_PAGE_LIMIT,
+        cursor: str | None = None,
+    ) -> ApiKeyPage: ...
 
     async def revoke_key(self, user_id: str, key_id: str) -> bool: ...
 
@@ -168,14 +188,37 @@ class InMemoryKeyRepository:
             self.audit[audit_id] = event
         return CreatedApiKey(_to_record(key_id, item), raw_key)
 
-    async def list_keys(self, user_id: str) -> list[ApiKeyRecord]:
+    async def list_keys(
+        self,
+        user_id: str,
+        limit: int = DEFAULT_KEY_PAGE_LIMIT,
+        cursor: str | None = None,
+    ) -> ApiKeyPage:
+        bounded_limit = _key_page_limit(limit)
+        _validate_key_cursor(cursor)
         async with self._lock:
-            records = [
-                _to_record(key_id, item)
+            cursor_key: tuple[datetime, str] | None = None
+            if cursor is not None:
+                cursor_item = self.records.get(cursor)
+                if not cursor_item or cursor_item["user_id"] != user_id:
+                    raise InvalidKeyCursor("invalid key cursor")
+                cursor_key = _key_sort_key(cursor, cursor_item)
+            candidates = (
+                (_key_sort_key(key_id, item), key_id, item)
                 for key_id, item in self.records.items()
                 if item["user_id"] == user_id
-            ]
-        return sorted(records, key=lambda item: item.created_at, reverse=True)
+                and (cursor_key is None or _key_sort_key(key_id, item) < cursor_key)
+            )
+            selected = heapq.nlargest(
+                bounded_limit + 1,
+                candidates,
+                key=lambda candidate: candidate[0],
+            )
+            records = tuple(
+                _to_record(key_id, item) for _, key_id, item in selected[:bounded_limit]
+            )
+        next_cursor = records[-1].id if len(selected) > bounded_limit else None
+        return ApiKeyPage(records, next_cursor)
 
     async def revoke_key(self, user_id: str, key_id: str) -> bool:
         async with self._lock:
@@ -226,11 +269,12 @@ class InMemoryKeyRepository:
             if not event or not item or event["status"] != "reserved":
                 return
             estimate = int(event["estimate_microusd"])
+            actual = min(max(0, actual_microusd), estimate)
             item["spend_reserved_microusd"] = max(0, item["spend_reserved_microusd"] - estimate)
-            item["spend_used_microusd"] += max(0, actual_microusd)
+            item["spend_used_microusd"] += actual
             event.update(
                 {
-                    "actual_microusd": max(0, actual_microusd),
+                    "actual_microusd": actual,
                     "status": "settled",
                     "settled_at": datetime.now(UTC),
                     **usage,
@@ -239,7 +283,7 @@ class InMemoryKeyRepository:
             audit_id, audit_event = _new_audit_event(
                 item["user_id"],
                 "inference.settled",
-                **_settlement_audit_fields(key_id, billing_id, actual_microusd, usage),
+                **_settlement_audit_fields(key_id, billing_id, actual, usage),
             )
             self.audit[audit_id] = audit_event
 
@@ -264,6 +308,7 @@ class InMemoryKeyRepository:
             self.audit[audit_id] = audit_event
 
     async def list_usage(self, user_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        bounded_limit = max(1, min(limit, MAX_EVENT_LIST_LIMIT))
         async with self._lock:
             rows = [
                 dict(row, id=row_id)
@@ -271,9 +316,10 @@ class InMemoryKeyRepository:
                 if row["user_id"] == user_id
             ]
         rows.sort(key=lambda row: row["created_at"], reverse=True)
-        return [_public_usage(row) for row in rows[:limit]]
+        return [_public_usage(row) for row in rows[:bounded_limit]]
 
     async def list_audit_events(self, user_id: str, limit: int = 1000) -> list[dict[str, Any]]:
+        bounded_limit = max(1, min(limit, MAX_EVENT_LIST_LIMIT))
         async with self._lock:
             rows = [
                 dict(row, id=row_id)
@@ -281,7 +327,7 @@ class InMemoryKeyRepository:
                 if row["user_id"] == user_id
             ]
         rows.sort(key=lambda row: row["occurred_at"], reverse=True)
-        return [_public_audit_event(row) for row in rows[: max(1, min(limit, 5000))]]
+        return [_public_audit_event(row) for row in rows[:bounded_limit]]
 
 
 class FirestoreKeyRepository:
@@ -373,15 +419,37 @@ class FirestoreKeyRepository:
             return CreatedApiKey(_to_record(key_id, item), raw_key)
         raise RuntimeError("could not allocate a unique API key id")
 
-    async def list_keys(self, user_id: str) -> list[ApiKeyRecord]:
-        def fetch() -> list[ApiKeyRecord]:
-            return [
-                _to_record(snapshot.id, snapshot.to_dict() or {})
-                for snapshot in self.keys.where("user_id", "==", user_id).stream()
-            ]
+    async def list_keys(
+        self,
+        user_id: str,
+        limit: int = DEFAULT_KEY_PAGE_LIMIT,
+        cursor: str | None = None,
+    ) -> ApiKeyPage:
+        bounded_limit = _key_page_limit(limit)
+        _validate_key_cursor(cursor)
 
-        records = await asyncio.to_thread(fetch)
-        return sorted(records, key=lambda item: item.created_at, reverse=True)
+        def fetch() -> ApiKeyPage:
+            query = self.keys.where("user_id", "==", user_id).order_by(
+                "created_at",
+                direction=firestore.Query.DESCENDING,
+            )
+            if cursor is not None:
+                cursor_snapshot = self.keys.document(cursor).get()
+                cursor_item = cursor_snapshot.to_dict() if cursor_snapshot.exists else None
+                if not cursor_item or cursor_item.get("user_id") != user_id:
+                    raise InvalidKeyCursor("invalid key cursor")
+                query = query.start_after(cursor_snapshot)
+            snapshots = list(query.limit(bounded_limit + 1).stream())
+            records = tuple(
+                _to_record(snapshot.id, snapshot.to_dict() or {})
+                for snapshot in snapshots[:bounded_limit]
+            )
+            next_cursor = records[-1].id if len(snapshots) > bounded_limit else None
+            return ApiKeyPage(records, next_cursor)
+
+        # Equality + descending timestamp ordering requires a composite index
+        # on (user_id, created_at) for this collection.
+        return await asyncio.to_thread(fetch)
 
     async def revoke_key(self, user_id: str, key_id: str) -> bool:
         def revoke() -> bool:
@@ -515,7 +583,8 @@ class FirestoreKeyRepository:
                     reason=release_reason,
                 )
             else:
-                actual = max(0, actual_microusd)
+                estimate = int(event.get("estimate_microusd", 0))
+                actual = min(max(0, actual_microusd), estimate)
                 key_update["spend_used_microusd"] = int(item.get("spend_used_microusd", 0)) + actual
                 event_update.update({"status": "settled", "actual_microusd": actual, **usage})
                 audit_event = _audit_event_payload(
@@ -530,32 +599,40 @@ class FirestoreKeyRepository:
         update(transaction)
 
     async def list_usage(self, user_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        bounded_limit = max(1, min(limit, MAX_EVENT_LIST_LIMIT))
+
         def fetch() -> list[dict[str, Any]]:
             return [
                 dict(snapshot.to_dict() or {}, id=snapshot.id)
-                for snapshot in self.usage.where("user_id", "==", user_id).stream()
+                for snapshot in (
+                    self.usage.where("user_id", "==", user_id)
+                    .order_by("created_at", direction=firestore.Query.DESCENDING)
+                    .limit(bounded_limit)
+                    .stream()
+                )
             ]
 
+        # Requires a composite index on (user_id, created_at).
         rows = await asyncio.to_thread(fetch)
-        rows.sort(
-            key=lambda row: row.get("created_at", datetime.min.replace(tzinfo=UTC)),
-            reverse=True,
-        )
-        return [_public_usage(row) for row in rows[:limit]]
+        return [_public_usage(row) for row in rows]
 
     async def list_audit_events(self, user_id: str, limit: int = 1000) -> list[dict[str, Any]]:
+        bounded_limit = max(1, min(limit, MAX_EVENT_LIST_LIMIT))
+
         def fetch() -> list[dict[str, Any]]:
             return [
                 dict(snapshot.to_dict() or {}, id=snapshot.id)
-                for snapshot in self.audit.where("user_id", "==", user_id).stream()
+                for snapshot in (
+                    self.audit.where("user_id", "==", user_id)
+                    .order_by("occurred_at", direction=firestore.Query.DESCENDING)
+                    .limit(bounded_limit)
+                    .stream()
+                )
             ]
 
+        # Requires a composite index on (user_id, occurred_at).
         rows = await asyncio.to_thread(fetch)
-        rows.sort(
-            key=lambda row: row.get("occurred_at", datetime.min.replace(tzinfo=UTC)),
-            reverse=True,
-        )
-        return [_public_audit_event(row) for row in rows[: max(1, min(limit, 5000))]]
+        return [_public_audit_event(row) for row in rows]
 
 
 def build_managed_repository() -> ManagedKeyRepository | None:
@@ -576,6 +653,19 @@ def _new_key() -> tuple[str, str]:
 def _parse_key(raw_key: str) -> tuple[str, str] | None:
     match = KEY_PATTERN.fullmatch(raw_key)
     return (match.group(1), match.group(2)) if match else None
+
+
+def _key_page_limit(value: int) -> int:
+    return max(1, min(value, MAX_KEY_PAGE_LIMIT))
+
+
+def _validate_key_cursor(cursor: str | None) -> None:
+    if cursor is not None and not KEY_ID_PATTERN.fullmatch(cursor):
+        raise InvalidKeyCursor("invalid key cursor")
+
+
+def _key_sort_key(key_id: str, item: dict[str, Any]) -> tuple[datetime, str]:
+    return _as_utc(item["created_at"]), key_id
 
 
 def _display_prefix(raw_key: str) -> str:

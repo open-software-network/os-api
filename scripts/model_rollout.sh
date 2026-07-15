@@ -44,6 +44,13 @@ done
 
 [[ -n "${DEPLOYMENT}" ]] || { echo "--deployment is required" >&2; exit 2; }
 [[ -n "${IMAGE}" || -n "${STAMP}" ]] || { echo "--image or --stamp is required" >&2; exit 2; }
+[[ "${DEPLOYMENT}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || {
+  echo "--deployment must be a Kubernetes DNS label" >&2; exit 2;
+}
+[[ "${NAMESPACE}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || {
+  echo "--namespace must be a Kubernetes DNS label" >&2; exit 2;
+}
+[[ "${TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || { echo "--timeout must be positive seconds" >&2; exit 2; }
 
 CANARY="${DEPLOYMENT}-rollout-canary"
 PORT=18000
@@ -57,6 +64,10 @@ current_image() {
 
 if [[ -z "${IMAGE}" ]]; then
   IMAGE="$(current_image)"
+fi
+if [[ ! "${IMAGE}" =~ @sha256:[0-9a-f]{64}$ ]]; then
+  echo "--image must use an immutable sha256 digest" >&2
+  exit 2
 fi
 
 if [[ -z "${MODEL}" ]]; then
@@ -109,7 +120,7 @@ if [[ "${SKIP_CANARY}" != "true" ]]; then
        | .replicas = 1
        | .selector = {matchLabels: {"sovereign.rollout/canary": $canary}}
        | .strategy = {type: "Recreate"}
-       | .template.metadata = {labels: {"sovereign.rollout/canary": $canary}}
+       | .template.metadata.labels = ((.template.metadata.labels // {}) + {"sovereign.rollout/canary": $canary})
        | .template.spec.containers[0].image = $image)}' |
     kubectl apply -f - >/dev/null
   if ! kubectl -n "${NAMESPACE}" wait deployment "${CANARY}" \
@@ -128,7 +139,8 @@ fi
 log "phase 2: promoting to serving deployment"
 if [[ -n "${STAMP}" ]]; then
   kubectl -n "${NAMESPACE}" patch deployment "${DEPLOYMENT}" --type merge -p \
-    "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"sovereign.rollout/stamp\":\"${STAMP}\"}}}}}" >/dev/null
+    "$(jq -cn --arg stamp "${STAMP}" \
+      '{spec:{template:{metadata:{annotations:{"sovereign.rollout/stamp":$stamp}}}}}')" >/dev/null
 fi
 kubectl -n "${NAMESPACE}" set image "deployment/${DEPLOYMENT}" "vllm=${IMAGE}" >/dev/null
 

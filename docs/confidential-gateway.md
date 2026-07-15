@@ -54,4 +54,6 @@ development evidence. Responses use `Cache-Control: no-store`.
 5. Verify from June's `/verify` page before shifting user traffic.
 
 Cloud Run remains the default until the switch is enabled. This change does not
-deploy production by itself.
+deploy production by itself. While Confidential Space managed instance groups
+serve the production edge, the Cloud Run GitHub workflow exits before building;
+it cannot update or verify the active measured workload.

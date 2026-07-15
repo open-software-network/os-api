@@ -5,9 +5,20 @@ build-backend = "hatchling.build"
 [project]
 name = "os-api"
 version = "0.10.0"
-description = "An OpenAI-compatible router for verifiably private model inference"
+description = "An OpenAI-compatible router for policy-enforced private model inference"
 readme = "README.md"
+license = "MIT"
+license-files = ["AUTHORS.md", "LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"]
+authors = [{ name = "Open Software Network" }]
 requires-python = ">=3.11"
+keywords = ["ai", "confidential-computing", "inference", "openai", "privacy"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Framework :: FastAPI",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+]
 dependencies = [
   "fastapi>=0.115,<1",
   "google-cloud-firestore>=2.20,<3",
@@ -21,6 +32,13 @@ dependencies = [
   "uvicorn[standard]>=0.34,<1",
 ]
 
+[project.urls]
+Homepage = "https://opensoftware.co"
+Documentation = "https://github.com/open-software-network/os-api/tree/main/docs"
+Issues = "https://github.com/open-software-network/os-api/issues"
+Repository = "https://github.com/open-software-network/os-api"
+Security = "https://github.com/open-software-network/os-api/security/policy"
+
 [project.optional-dependencies]
 dev = [
   "pip-audit>=2.9,<3",
@@ -31,6 +49,22 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sovereign_gateway"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"config/models.yaml" = "sovereign_gateway/data/models.yaml"
+
+[tool.hatch.build.targets.sdist]
+exclude = ["/.gitignore"]
+include = [
+  "/config/models.yaml",
+  "/AUTHORS.md",
+  "/LICENSE",
+  "/NOTICE",
+  "/pyproject.toml",
+  "/README.md",
+  "/src/sovereign_gateway",
+  "/THIRD_PARTY_NOTICES.md",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -5,11 +5,6 @@ resources:
   - vllm-confidential-cpu.yaml
   - vllm-standard-internal.yaml
 
-images:
-  - name: us-central1-docker.pkg.dev/PROJECT_ID/sovereign-inference/gateway
-    newName: us-central1-docker.pkg.dev/autonomous-lab-490610/sovereign-inference/gateway
-    digest: sha256:fca81181a16d51cf98c4caa107874ac352708d2985d738afeaebce797cb3f08b
-
 patches:
   - target:
       kind: Deployment

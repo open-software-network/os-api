@@ -127,8 +127,6 @@ resource "google_redis_instance" "rate_limits" {
 resource "google_secret_manager_secret" "runtime" {
   for_each = toset([
     "app-client-api-key",
-    "cloudrun-model-config",
-    "cloudrun-model-config-secondary",
     "gateway-api-key-hashes",
     "gateway-redis-ca",
     "gateway-redis-ca-secondary",
@@ -153,6 +151,10 @@ resource "google_secret_manager_secret" "runtime" {
 
   labels = var.labels
 
+  lifecycle {
+    prevent_destroy = true
+  }
+
   depends_on = [google_project_service.required]
 }
 
@@ -169,8 +171,6 @@ resource "google_project_iam_member" "api_runtime_firestore" {
 
 resource "google_secret_manager_secret_iam_member" "api_runtime" {
   for_each = toset([
-    "cloudrun-model-config",
-    "cloudrun-model-config-secondary",
     "gateway-api-key-hashes",
     "gateway-redis-ca",
     "gateway-redis-ca-secondary",
@@ -260,7 +260,7 @@ resource "google_cloud_run_v2_service" "public_api" {
 
       env {
         name  = "FIRESTORE_COLLECTION_PREFIX"
-        value = "sovereign"
+        value = var.firestore_collection_prefix
       }
 
       env {
@@ -280,7 +280,7 @@ resource "google_cloud_run_v2_service" "public_api" {
 
       env {
         name  = "APP_ORIGIN"
-        value = "https://api.opensoftware.co"
+        value = "https://${var.public_api_domain}"
       }
 
       env {
@@ -295,7 +295,7 @@ resource "google_cloud_run_v2_service" "public_api" {
 
       env {
         name  = "SITE_BASIC_AUTH_USERNAME"
-        value = "alongside"
+        value = var.site_basic_auth_username
       }
 
       # Bump when a `latest` runtime secret changes to force a fresh revision.
@@ -408,25 +408,8 @@ resource "google_cloud_run_v2_service" "public_api" {
       }
 
       volume_mounts {
-        name       = "models"
-        mount_path = "/etc/sovereign"
-      }
-
-      volume_mounts {
         name       = "redis-ca"
         mount_path = "/etc/redis"
-      }
-    }
-
-    volumes {
-      name = "models"
-      secret {
-        secret       = google_secret_manager_secret.runtime["cloudrun-model-config"].secret_id
-        default_mode = 292
-        items {
-          version = "latest"
-          path    = "models.yaml"
-        }
       }
     }
 
@@ -454,6 +437,8 @@ resource "google_cloud_run_v2_service" "public_api" {
 
   depends_on = [
     google_project_service.required["run.googleapis.com"],
+    google_firestore_database.primary,
+    google_firestore_database.global,
     google_project_iam_member.api_runtime_firestore,
     google_secret_manager_secret_iam_member.api_runtime,
   ]

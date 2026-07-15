@@ -31,7 +31,8 @@ spec:
           effect: NoSchedule
       containers:
         - name: agent
-          image: us-central1-docker.pkg.dev/autonomous-lab-490610/sovereign-inference/attestation-agent@sha256:d04d3fd7382a1e25693d04fec014d7d7e0b987c5d1d2ce60bbeb80edb02a1e26
+          # Build deploy/attestation-agent, sign it, and replace this placeholder.
+          image: example.invalid/os-api/attestation-agent@sha256:0000000000000000000000000000000000000000000000000000000000000000
           ports:
             - name: http
               containerPort: 8100

@@ -15,6 +15,7 @@ spec:
       labels:
         app: standard-vllm
         compute-privacy: standard
+        sovereign.network/model: "true"
     spec:
       automountServiceAccountToken: false
       securityContext:

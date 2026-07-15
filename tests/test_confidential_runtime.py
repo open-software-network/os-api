@@ -63,9 +63,7 @@ def test_attested_identity_releases_secrets(
     monkeypatch.setenv("CONFIDENTIAL_SPACE_CREDENTIAL_FILE", str(credentials))
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "privacy-project")
     monkeypatch.setenv("CONFIDENTIAL_SPACE_SECRET_ENV", '{"VENICE_API_KEY":"venice"}')
-    monkeypatch.setenv(
-        "CONFIDENTIAL_SPACE_SECRET_FILES", json.dumps({str(secret_file): "tls-key"})
-    )
+    monkeypatch.setenv("CONFIDENTIAL_SPACE_SECRET_FILES", json.dumps({str(secret_file): "tls-key"}))
 
     class Secrets:
         def access_secret_version(self, request: dict[str, str]) -> SimpleNamespace:
@@ -84,3 +82,17 @@ def test_attested_identity_releases_secrets(
     assert secret_file.read_bytes() == b"private-key"
     assert credentials.stat().st_mode & 0o777 == 0o600
     assert secret_file.stat().st_mode & 0o777 == 0o600
+
+
+def test_private_write_replaces_symlink_without_following(tmp_path: Path) -> None:
+    protected = tmp_path / "protected"
+    protected.write_bytes(b"do-not-overwrite")
+    target = tmp_path / "credentials.json"
+    target.symlink_to(protected)
+
+    confidential_runtime._write_private(target, b"new-credentials")
+
+    assert protected.read_bytes() == b"do-not-overwrite"
+    assert not target.is_symlink()
+    assert target.read_bytes() == b"new-credentials"
+    assert target.stat().st_mode & 0o777 == 0o600
