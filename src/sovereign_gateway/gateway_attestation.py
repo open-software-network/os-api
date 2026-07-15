@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 from dataclasses import dataclass
 
 import httpx
@@ -12,6 +13,31 @@ DEFAULT_AUDIENCE = "https://june-api.opensoftware.co/os-api-gateway"
 
 class GatewayAttestationUnavailable(RuntimeError):
     pass
+
+
+def _launcher_transport_reason(exc: BaseException, socket_path: str) -> str:
+    exception_types: list[str] = []
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        exception_types.append(type(current).__name__)
+        current = current.__cause__ or current.__context__
+
+    try:
+        socket_stat = os.stat(socket_path)
+        socket_state = (
+            f"present_mode_{stat.S_IMODE(socket_stat.st_mode):o}"
+            f"_uid_{socket_stat.st_uid}_gid_{socket_stat.st_gid}"
+        )
+    except OSError as stat_error:
+        socket_state = f"stat_{type(stat_error).__name__}"
+
+    return (
+        "launcher_transport_error_"
+        f"{'_'.join(exception_types)}_socket_{socket_state}"
+        f"_euid_{os.geteuid()}_egid_{os.getegid()}"
+    )
 
 
 @dataclass(frozen=True)
@@ -75,7 +101,9 @@ async def request_gateway_attestation(
             f"launcher_http_status_{exc.response.status_code}"
         ) from exc
     except (httpx.HTTPError, OSError) as exc:
-        raise GatewayAttestationUnavailable("launcher_transport_error") from exc
+        raise GatewayAttestationUnavailable(
+            _launcher_transport_reason(exc, resolved_socket)
+        ) from exc
 
     if len(raw_token) == 0 or len(raw_token) > 128 * 1024:
         raise GatewayAttestationUnavailable("launcher_body_size_invalid")

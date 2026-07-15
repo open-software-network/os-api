@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 
 import httpx
 import pytest
@@ -58,6 +60,24 @@ async def test_missing_launcher_token_fails_closed() -> None:
 
     with pytest.raises(GatewayAttestationUnavailable):
         await request_gateway_attestation("client-nonce-0001", transport=transport)
+
+
+@pytest.mark.asyncio
+async def test_launcher_transport_failure_reports_only_safe_socket_metadata(
+    tmp_path: Path,
+) -> None:
+    socket_path = str(tmp_path / "missing.sock")
+
+    with pytest.raises(GatewayAttestationUnavailable) as caught:
+        await request_gateway_attestation(
+            "client-nonce-0001", socket_path=socket_path
+        )
+
+    reason = str(caught.value)
+    assert reason.startswith("launcher_transport_error_")
+    assert "socket_stat_FileNotFoundError" in reason
+    assert f"euid_{os.geteuid()}_egid_{os.getegid()}" in reason
+    assert socket_path not in reason
 
 
 @pytest.mark.asyncio
