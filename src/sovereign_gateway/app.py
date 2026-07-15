@@ -22,7 +22,7 @@ from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, ValidationError
 from redis.asyncio import Redis
@@ -467,45 +467,6 @@ def create_app() -> FastAPI:
     @app.get("/healthz", include_in_schema=False)
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
-
-    @app.get("/verify", include_in_schema=False)
-    async def verify() -> HTMLResponse:
-        return HTMLResponse(
-            """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Verify OpenSoftware API</title>
-</head>
-<body>
-  <main>
-    <h1>Verify OpenSoftware API</h1>
-    <p>You can inspect the API source and request fresh, nonce-bound hardware
-    evidence without trusting June or Chat.</p>
-
-    <h2>1. Inspect the source</h2>
-    <p>The gateway implementation and deployment configuration are public at
-    <a href="https://github.com/open-software-network/os-api">github.com/open-software-network/os-api</a>.</p>
-
-    <h2>2. Request fresh evidence</h2>
-    <p>Choose your own random nonce, request an attestation token, verify Google's
-    signature, and confirm the token contains your nonce, the expected audience,
-    Intel TDX hardware, debug-disabled status, and the running image digest.</p>
-    <pre><code>NONCE=$(openssl rand -hex 16)
-curl -sS https://api.opensoftware.co/v1/gateway/attestation \
-  -H 'content-type: application/json' \
-  -d "{\"nonce\":\"$NONCE\"}"</code></pre>
-
-    <h2>What this supports</h2>
-    <p>The evidence supports a narrower claim: Google attested the reported API
-    workload identity on Intel TDX for your fresh nonce. It does not prove that
-    every model provider is private or that the public source was reproduced byte
-    for byte. API responses separately report the selected privacy class and backend.</p>
-  </main>
-</body>
-</html>"""
-        )
 
     @app.get("/readyz", include_in_schema=False)
     async def readyz(request: Request) -> Response:

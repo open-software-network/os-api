@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import httpx
 
 DEFAULT_SOCKET_PATH = "/run/container_launcher/teeserver.sock"
-DEFAULT_AUDIENCE = "https://api.opensoftware.co/verify"
+DEFAULT_AUDIENCE = "https://june-api.opensoftware.co/os-api-gateway"
 
 
 class GatewayAttestationUnavailable(RuntimeError):
