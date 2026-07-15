@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 
 import httpx
@@ -65,11 +66,21 @@ async def request_gateway_attestation(
                 },
             )
             response.raise_for_status()
-            payload = response.json()
-    except (httpx.HTTPError, ValueError, OSError) as exc:
+            # Confidential Space returns the generated token as the raw HTTP
+            # response body, not as a JSON object. Keep this strict so a
+            # launcher error document can never be relayed as evidence.
+            raw_token = response.content
+    except (httpx.HTTPError, OSError) as exc:
         raise GatewayAttestationUnavailable from exc
 
-    token = payload.get("token") if isinstance(payload, dict) else None
-    if not isinstance(token, str) or not token:
+    if len(raw_token) == 0 or len(raw_token) > 128 * 1024:
+        raise GatewayAttestationUnavailable
+    try:
+        token = raw_token.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise GatewayAttestationUnavailable from exc
+    if token != token.strip() or not re.fullmatch(
+        r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", token
+    ):
         raise GatewayAttestationUnavailable
     return GatewayAttestation(token=token, audience=resolved_audience, nonce=nonce)

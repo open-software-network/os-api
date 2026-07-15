@@ -24,7 +24,7 @@ async def test_requests_nonce_bound_confidential_space_oidc_token() -> None:
             "token_type": "OIDC",
             "nonces": ["client-nonce-0001"],
         }
-        return httpx.Response(200, json={"token": "signed-attestation-token"})
+        return httpx.Response(200, text="header.payload.signature")
 
     evidence = await request_gateway_attestation(
         "client-nonce-0001", transport=httpx.MockTransport(launcher)
@@ -33,7 +33,7 @@ async def test_requests_nonce_bound_confidential_space_oidc_token() -> None:
     assert evidence.public_dict() == {
         "object": "gateway.attestation",
         "format": "confidential-space.oidc",
-        "token": "signed-attestation-token",
+        "token": "header.payload.signature",
         "audience": DEFAULT_AUDIENCE,
         "nonce": "client-nonce-0001",
     }
@@ -41,7 +41,24 @@ async def test_requests_nonce_bound_confidential_space_oidc_token() -> None:
 
 @pytest.mark.asyncio
 async def test_missing_launcher_token_fails_closed() -> None:
-    transport = httpx.MockTransport(lambda request: httpx.Response(200, json={}))
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, text=""))
+
+    with pytest.raises(GatewayAttestationUnavailable):
+        await request_gateway_attestation("client-nonce-0001", transport=transport)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        '{"token":"header.payload.signature"}',
+        "header.payload.signature\n",
+        "not-a-jwt",
+        "é.payload.signature",
+    ],
+)
+async def test_launcher_response_must_be_one_raw_compact_jwt(body: str) -> None:
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, text=body))
 
     with pytest.raises(GatewayAttestationUnavailable):
         await request_gateway_attestation("client-nonce-0001", transport=transport)
