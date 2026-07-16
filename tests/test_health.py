@@ -33,6 +33,34 @@ def test_health_dashboard_requires_os_accounts_login(client: TestClient) -> None
     assert api.status_code == 401
 
 
+def test_health_dashboard_bypasses_site_basic_auth(
+    client: TestClient, monkeypatch
+) -> None:
+    monkeypatch.setenv("SITE_BASIC_AUTH_USERNAME", "private-site")
+    monkeypatch.setenv("SITE_BASIC_AUTH_PASSWORD", "private-password")
+    monkeypatch.setattr(client.app.state.accounts, "client_id", "client-id")
+
+    page = client.get("/health", follow_redirects=False)
+    api = client.get("/api/health")
+    login = client.get("/auth/start?next=/health", follow_redirects=False)
+    callback = client.get("/auth/callback", follow_redirects=False)
+    stylesheet = client.get("/static/app.css")
+    script = client.get("/static/health.js")
+    home = client.get("/")
+
+    assert page.status_code == 303
+    assert page.headers["location"] == "/auth/start?next=/health"
+    assert api.status_code == 401
+    assert api.json() == {"error": "authentication_required"}
+    assert login.status_code == 303
+    assert login.headers["location"].startswith("https://accounts.opensoftware.co/login?")
+    assert callback.status_code == 303
+    assert stylesheet.status_code == 200
+    assert script.status_code == 200
+    assert home.status_code == 401
+    assert home.headers["www-authenticate"].startswith("Basic ")
+
+
 def test_health_dashboard_fails_closed_for_non_allowlisted_user(
     client: TestClient, monkeypatch
 ) -> None:
