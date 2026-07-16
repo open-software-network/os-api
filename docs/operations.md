@@ -44,6 +44,23 @@ On any alert:
 5. If the model is unhealthy, fail the affected privacy mode closed rather than silently changing its privacy class.
 6. Record customer impact, start/end times, and corrective actions in the incident review.
 
+## Internal health dashboard
+
+The live operations view is available at `/health`. It uses the existing OpenSoftware Accounts
+PKCE session and then applies a second, fail-closed authorization check against
+`HEALTH_DASHBOARD_AUTHORIZED_USER_IDS`. Production loads this value from the
+`health-dashboard-authorized-user-ids` Secret Manager secret; no user IDs belong in Terraform
+variables, plans, or tracked configuration. Store a comma-separated list of immutable OS Accounts
+user IDs as the secret payload. A missing or empty value grants access to nobody. Do not use emails
+or handles in the allowlist because both can change.
+
+The page refreshes `/api/health` every 15 seconds and reports dependency readiness, provider
+circuit state, rolling API availability, error rate, and latency for the gateway instance that
+served the request. Its one-hour telemetry window is process-local and resets on a new revision or
+instance. It records only the operation category, status code, latency, and timestamp; user IDs,
+credentials, full URLs, prompts, and model outputs are never stored in the monitor. Cloud Monitoring
+uptime checks and alert policies remain authoritative for fleet-wide incident detection.
+
 ## Model rollouts
 
 Model server images are pinned by digest in `deploy/kubernetes` and never deployed by mutable tag. Every inference response identifies the artifact that served it: `x-model-backend` names the backend and `x-model-revision` carries the pinned image revision from the model configuration (`revision` per backend in `models.yaml`). When rolling a model image, update the digest in the manifests **and** the `revision` fields in both the in-cluster ConfigMap patch and the `cloudrun-model-config` secret so the header stays truthful.

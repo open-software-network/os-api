@@ -37,6 +37,7 @@ from .confidential_runtime import configure_confidential_runtime
 from .config import Endpoint, GatewayConfig, ModelRoute
 from .errors import openai_error
 from .gateway_attestation import GatewayAttestationUnavailable, request_gateway_attestation
+from .health import HealthMonitor, check_dependencies
 from .managed_keys import (
     KeyUnavailable,
     ManagedKeyRepository,
@@ -351,6 +352,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         failure_threshold=int(os.getenv("ENDPOINT_FAILURE_THRESHOLD", "3")),
         cooldown_seconds=int(os.getenv("ENDPOINT_CIRCUIT_COOLDOWN_SECONDS", "30")),
     )
+    app.state.health_monitor = HealthMonitor()
     app.state.privacy_receipts = build_receipt_repository()
     yield
     await app.state.http.aclose()
@@ -438,7 +440,7 @@ def create_app() -> FastAPI:
         site_auth_configured = bool(
             os.getenv("SITE_BASIC_AUTH_USERNAME") or os.getenv("SITE_BASIC_AUTH_PASSWORD")
         )
-        if request.url.path.startswith(("/auth/", "/api/", "/dashboard")) or (
+        if request.url.path.startswith(("/auth/", "/api/", "/dashboard", "/health")) or (
             site_auth_configured and _site_auth_protects_path(request.url.path)
         ):
             response.headers["cache-control"] = "no-store"
@@ -448,6 +450,12 @@ def create_app() -> FastAPI:
                 request.state.rate_limit_remaining
             )
             response.headers["x-ratelimit-reset-requests"] = str(request.state.rate_limit_reset)
+        duration_ms = round((time.monotonic() - started) * 1000, 2)
+        request.app.state.health_monitor.record(
+            request.url.path,
+            response.status_code,
+            duration_ms,
+        )
         logger.info(
             json.dumps(
                 {
@@ -457,7 +465,7 @@ def create_app() -> FastAPI:
                     "method": request.method,
                     "path": request.url.path,
                     "status": response.status_code,
-                    "duration_ms": round((time.monotonic() - started) * 1000, 2),
+                    "duration_ms": duration_ms,
                 },
                 separators=(",", ":"),
             )
@@ -470,38 +478,10 @@ def create_app() -> FastAPI:
 
     @app.get("/readyz", include_in_schema=False)
     async def readyz(request: Request) -> Response:
-        components: dict[str, str] = {}
-        # Firestore is the system of record for keys, spend, and audit; it is
-        # required for correct operation, so readiness fails when it is down.
-        # Redis only backs rate limiting and admission control, which fail
-        # open, so a Redis outage is reported as "degraded" but does not block
-        # a region from starting or serving — otherwise the fail-open path
-        # could never engage for a fresh instance.
-        required_ok = True
-        config: GatewayConfig = request.app.state.config
-        missing_provider_keys = sorted(
-            provider.id
-            for provider in config.providers.values()
-            if provider.enabled and provider.api_key_env and not provider.api_key
-        )
-        if missing_provider_keys:
-            components["provider_credentials"] = "missing:" + ",".join(missing_provider_keys)
-            required_ok = False
-        if request.app.state.managed_keys:
-            try:
-                await request.app.state.managed_keys.healthcheck()
-            except Exception:
-                components["firestore"] = "unavailable"
-                required_ok = False
-            else:
-                components["firestore"] = "ready"
-        if request.app.state.redis:
-            try:
-                await asyncio.wait_for(request.app.state.redis.ping(), timeout=2)
-            except Exception:
-                components["redis"] = "degraded"
-            else:
-                components["redis"] = "ready"
+        # Firestore is required for correctness; Redis backs controls that
+        # intentionally fail open. Keep this response minimal because it is
+        # public, while the authorized health dashboard adds richer context.
+        required_ok, components = await check_dependencies(request.app)
         status = "ready" if required_ok else "not_ready"
         return JSONResponse(
             status_code=200 if required_ok else 503,

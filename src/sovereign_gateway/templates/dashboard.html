@@ -10,6 +10,7 @@
     </div>
     <div class="account-actions">
       {% if balance %}<span class="balance"><small>Credits</small>{{ balance.get('credits', 0) }}</span>{% endif %}
+      {% if health_access %}<a class="button ghost" href="/health">Service health</a>{% endif %}
       <button class="button ghost" id="logout-button">Log out</button>
     </div>
   </div>
