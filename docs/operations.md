@@ -112,7 +112,7 @@ The model pods handle raw prompts and are the platform's highest exfiltration ri
 
 ## Site access gate
 
-The human-facing site, docs, dashboard, login callbacks, and dashboard JSON routes use HTTP Basic authentication when `SITE_BASIC_AUTH_USERNAME` and `SITE_BASIC_AUTH_PASSWORD` are configured. The password is stored in the `site-basic-auth-password` Secret Manager secret. `/v1/*`, `/healthz`, and `/readyz` are intentionally exempt so API-key clients and infrastructure probes continue to work. Rotate the site password by adding a new secret version and bumping `RUNTIME_CONFIG_VERSION` in both Cloud Run services.
+The human-facing site, docs, and account dashboard use HTTP Basic authentication when `SITE_BASIC_AUTH_USERNAME` and `SITE_BASIC_AUTH_PASSWORD` are configured. The password is stored in the `site-basic-auth-password` Secret Manager secret. `/health`, its OS Accounts login flow, its JSON endpoint and required static assets bypass Basic authentication because the health allowlist is the authorization boundary. `/v1/*`, `/healthz`, and `/readyz` are also intentionally exempt so API-key clients and infrastructure probes continue to work. Rotate the site password by adding a new secret version and bumping `RUNTIME_CONFIG_VERSION` in both Cloud Run services.
 
 ## Edge and denial-of-service controls
 
