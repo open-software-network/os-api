@@ -148,7 +148,7 @@ resource "google_cloud_run_v2_service" "public_api_secondary" {
 
       env {
         name  = "RUNTIME_CONFIG_VERSION"
-        value = "9"
+        value = "june-key-v8-20260715"
       }
 
       env {

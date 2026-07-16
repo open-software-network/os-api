@@ -313,7 +313,7 @@ resource "google_cloud_run_v2_service" "public_api" {
       # Bump when a `latest` runtime secret changes to force a fresh revision.
       env {
         name  = "RUNTIME_CONFIG_VERSION"
-        value = "9"
+        value = "june-key-v8-20260715"
       }
 
       env {

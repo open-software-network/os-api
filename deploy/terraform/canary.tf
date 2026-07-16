@@ -115,7 +115,7 @@ resource "google_cloud_run_v2_service" "api_canary" {
 
       env {
         name  = "RUNTIME_CONFIG_VERSION"
-        value = "9"
+        value = "june-key-v8-20260715"
       }
 
       env {
