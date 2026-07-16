@@ -99,6 +99,16 @@ resource "google_cloud_run_v2_service" "api_canary" {
       }
 
       env {
+        name = "HEALTH_DASHBOARD_AUTHORIZED_USER_IDS"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.runtime["health-dashboard-authorized-user-ids"].secret_id
+            version = "latest"
+          }
+        }
+      }
+
+      env {
         name  = "SITE_BASIC_AUTH_USERNAME"
         value = "alongside"
       }

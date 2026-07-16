@@ -134,6 +134,7 @@ resource "google_secret_manager_secret" "runtime" {
     "gateway-redis-ca-secondary",
     "gateway-redis-url",
     "gateway-redis-url-secondary",
+    "health-dashboard-authorized-user-ids",
     "os-accounts-app-api-key",
     "os-accounts-client-id",
     "site-basic-auth-password",
@@ -176,6 +177,7 @@ resource "google_secret_manager_secret_iam_member" "api_runtime" {
     "gateway-redis-ca-secondary",
     "gateway-redis-url",
     "gateway-redis-url-secondary",
+    "health-dashboard-authorized-user-ids",
     "os-accounts-app-api-key",
     "os-accounts-client-id",
     "site-basic-auth-password",
@@ -291,6 +293,16 @@ resource "google_cloud_run_v2_service" "public_api" {
       env {
         name  = "OS_ACCOUNTS_API_URL"
         value = "https://accounts-api.opensoftware.co"
+      }
+
+      env {
+        name = "HEALTH_DASHBOARD_AUTHORIZED_USER_IDS"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.runtime["health-dashboard-authorized-user-ids"].secret_id
+            version = "latest"
+          }
+        }
       }
 
       env {

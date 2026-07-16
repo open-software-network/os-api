@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}Service health — OpenSoftware API{% endblock %}
+{% block content %}
+<section class="health-dashboard shell">
+  <header class="health-hero">
+    <div>
+      <div class="eyebrow">Internal operations</div>
+      <h1>Service health</h1>
+      <p>Live, privacy-safe telemetry for this <span id="region-label">gateway</span> instance.</p>
+    </div>
+    <div class="health-actions">
+      <span class="signed-in">{{ user.display_name or user.handle }}</span>
+      <button class="button ghost" id="health-logout">Log out</button>
+    </div>
+  </header>
+
+  <section class="health-banner loading-state" id="health-banner" aria-live="polite">
+    <span class="health-orb" id="health-orb"></span>
+    <div><strong id="health-title">Checking service health…</strong><span id="health-subtitle">Connecting to the monitor</span></div>
+    <div class="health-updated"><span>Last checked</span><time id="health-updated">—</time></div>
+  </section>
+
+  <div class="health-metrics" aria-label="Service metrics">
+    <article><span>Availability · 1h</span><strong id="metric-availability">—</strong><small id="metric-availability-detail">No traffic yet</small></article>
+    <article><span>Requests · 5m</span><strong id="metric-requests">—</strong><small id="metric-request-detail">Waiting for samples</small></article>
+    <article><span>P95 latency · 1h</span><strong id="metric-latency">—</strong><small>Gateway response time</small></article>
+    <article><span>Process uptime</span><strong id="metric-uptime">—</strong><small id="metric-version">Current revision</small></article>
+  </div>
+
+  <div class="health-layout">
+    <section class="health-card traffic-card">
+      <div class="health-card-head"><div><h2>Request volume</h2><p>Last 30 minutes · API routes only</p></div><div class="chart-key"><span>Requests</span><span>Errors</span></div></div>
+      <div class="traffic-chart" id="traffic-chart" role="img" aria-label="API request and error volume over the last 30 minutes"></div>
+      <div class="chart-axis"><span>30 min ago</span><span>Now</span></div>
+    </section>
+
+    <section class="health-card">
+      <div class="health-card-head"><div><h2>Core systems</h2><p>Live dependency checks</p></div></div>
+      <div class="component-list" id="component-list"><div class="health-loading">Checking dependencies…</div></div>
+    </section>
+  </div>
+
+  <section class="health-card providers-card">
+    <div class="health-card-head"><div><h2>Inference providers</h2><p>Routing health and process-local circuit state</p></div><span class="monitor-note">Auto-refreshes every 15s</span></div>
+    <div class="provider-grid" id="provider-grid"><div class="health-loading">Loading providers…</div></div>
+  </section>
+
+  <p class="health-footnote">This monitor stores only timestamps, operation categories, response codes, and latency in memory for one hour. It never records users, prompts, outputs, bearer tokens, or request URLs.</p>
+</section>
+{% endblock %}
+{% block scripts %}<script src="/static/health.js" defer></script>{% endblock %}

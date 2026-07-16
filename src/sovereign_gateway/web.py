@@ -19,7 +19,9 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from pydantic import BaseModel, ConfigDict, Field
 
+from . import __version__
 from .accounts import AccountsClient, AccountUser, TokenPair
+from .health import check_dependencies
 from .managed_keys import ManagedKeyRepository
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -33,6 +35,7 @@ ACCESS_COOKIE = "osapi_access"
 REFRESH_COOKIE = "osapi_refresh"
 PKCE_COOKIE = "osapi_pkce"
 STATE_COOKIE = "osapi_state"
+RETURN_COOKIE = "osapi_return_to"
 
 
 class KeyCreateRequest(BaseModel):
@@ -76,7 +79,48 @@ async def dashboard(request: Request) -> Response:
         request=request,
         user=session.user,
         balance=session.balance,
+        health_access=_health_authorized(session.user.id),
     )
+    if session.rotated:
+        _set_session_cookies(response, session.rotated)
+    return response
+
+
+@router.get("/health", response_class=HTMLResponse, include_in_schema=False)
+async def health_dashboard(request: Request) -> Response:
+    session = await _session(request, include_balance=False)
+    if not session:
+        return RedirectResponse("/auth/start?next=/health", status_code=303)
+    if not _health_authorized(session.user.id):
+        return _html(
+            "error.html",
+            request=request,
+            title="Access denied",
+            message="This account is not authorized to view service health.",
+            status_code=403,
+        )
+    response = _html("health.html", request=request, user=session.user)
+    if session.rotated:
+        _set_session_cookies(response, session.rotated)
+    return response
+
+
+@router.get("/api/health", include_in_schema=False)
+async def api_health(request: Request) -> Response:
+    session = await _session(request, include_balance=False)
+    if not session:
+        return JSONResponse({"error": "authentication_required"}, status_code=401)
+    if not _health_authorized(session.user.id):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    readiness_ok, components = await check_dependencies(request.app)
+    snapshot = request.app.state.health_monitor.snapshot(
+        config=request.app.state.config,
+        endpoint_health=request.app.state.endpoint_health,
+        readiness_ok=readiness_ok,
+        components=components,
+        version=__version__,
+    )
+    response = JSONResponse(snapshot)
     if session.rotated:
         _set_session_cookies(response, session.rotated)
     return response
@@ -97,11 +141,16 @@ async def auth_start(request: Request) -> Response:
     state = _base64url(secrets.token_bytes(24))
     challenge = _base64url(hashlib.sha256(verifier.encode()).digest())
     redirect_uri = f"{_app_origin()}/auth/callback"
+    return_to = _safe_return_to(request.query_params.get("next", ""))
     query = urlencode(
         {
             "client_id": accounts.client_id,
             "redirect_uri": redirect_uri,
-            "scope": "profile:read billing:read credits:spend",
+            "scope": (
+                "profile:read"
+                if return_to == "/health"
+                else "profile:read billing:read credits:spend"
+            ),
             "state": state,
             "code_challenge": challenge,
             "code_challenge_method": "S256",
@@ -111,6 +160,10 @@ async def auth_start(request: Request) -> Response:
     cookie_options = _cookie_options(max_age=600)
     response.set_cookie(PKCE_COOKIE, verifier, **cookie_options)
     response.set_cookie(STATE_COOKIE, state, **cookie_options)
+    if return_to:
+        response.set_cookie(RETURN_COOKIE, return_to, **cookie_options)
+    else:
+        response.delete_cookie(RETURN_COOKIE, path="/")
     return response
 
 
@@ -129,12 +182,16 @@ async def auth_callback(request: Request, code: str = "", state: str = "") -> Re
             f"{_app_origin()}/auth/callback",
         )
         if token:
-            response = RedirectResponse("/dashboard", status_code=303)
+            response = RedirectResponse(
+                _safe_return_to(request.cookies.get(RETURN_COOKIE, "")) or "/dashboard",
+                status_code=303,
+            )
             _set_session_cookies(response, token)
         else:
             response = RedirectResponse("/?auth=failed", status_code=303)
     response.delete_cookie(PKCE_COOKIE, path="/")
     response.delete_cookie(STATE_COOKIE, path="/")
+    response.delete_cookie(RETURN_COOKIE, path="/")
     return response
 
 
@@ -299,7 +356,7 @@ async def api_audit_export(request: Request, format: str = "jsonl") -> Response:
     return response
 
 
-async def _session(request: Request) -> Session | None:
+async def _session(request: Request, *, include_balance: bool = True) -> Session | None:
     accounts: AccountsClient = request.app.state.accounts
     access = request.cookies.get(ACCESS_COOKIE)
     refresh = request.cookies.get(REFRESH_COOKIE)
@@ -307,7 +364,8 @@ async def _session(request: Request) -> Session | None:
     if access:
         user, error_code = await accounts.me(access)
         if user and error_code is None:
-            return Session(user, await accounts.balance(access))
+            balance = await accounts.balance(access) if include_balance else None
+            return Session(user, balance)
         if error_code != 3001:
             return None
     if not refresh:
@@ -318,7 +376,21 @@ async def _session(request: Request) -> Session | None:
     user, _ = await accounts.me(rotated.access_token)
     if not user:
         return None
-    return Session(user, await accounts.balance(rotated.access_token), rotated)
+    balance = await accounts.balance(rotated.access_token) if include_balance else None
+    return Session(user, balance, rotated)
+
+
+def _health_authorized(user_id: str) -> bool:
+    allowed = {
+        value.strip()
+        for value in os.getenv("HEALTH_DASHBOARD_AUTHORIZED_USER_IDS", "").split(",")
+        if value.strip()
+    }
+    return user_id in allowed
+
+
+def _safe_return_to(value: str) -> str | None:
+    return value if value in {"/dashboard", "/health"} else None
 
 
 def _repository(request: Request) -> ManagedKeyRepository | None:
