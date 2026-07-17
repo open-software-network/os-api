@@ -263,7 +263,9 @@ def test_rate_limit_returns_retry_metadata(client: TestClient) -> None:
     assert 1 <= int(response.headers["retry-after"]) <= 60
 
 
-def test_failed_auth_attempts_are_rate_limited(client: TestClient) -> None:
+def test_failed_auth_attempts_are_rate_limited(
+    client: TestClient, frozen_limiter_clock: None
+) -> None:
     for _ in range(20):
         response = client.get("/v1/models", headers={"Authorization": "Bearer sk-not-a-real-key"})
         assert response.status_code == 401
@@ -280,7 +282,26 @@ def test_failed_auth_attempts_are_rate_limited(client: TestClient) -> None:
     assert response.status_code == 200
 
 
-def test_missing_key_attempts_are_rate_limited(client: TestClient) -> None:
+def test_rotating_key_auth_attempts_are_rate_limited_by_ip(
+    client: TestClient, frozen_limiter_clock: None
+) -> None:
+    # An attacker enumerating keys never repeats one, so the key-hash bucket
+    # never fills; the per-source IP bucket is what caps the scan.
+    for attempt in range(20):
+        response = client.get(
+            "/v1/models", headers={"Authorization": f"Bearer sk-candidate-{attempt}"}
+        )
+        assert response.status_code == 401
+
+    response = client.get("/v1/models", headers={"Authorization": "Bearer sk-candidate-final"})
+
+    assert response.status_code == 429
+    assert response.json()["error"]["code"] == "rate_limit_exceeded"
+
+
+def test_missing_key_attempts_are_rate_limited(
+    client: TestClient, frozen_limiter_clock: None
+) -> None:
     for _ in range(20):
         response = client.get("/v1/models", headers={"Authorization": ""})
         assert response.status_code == 401

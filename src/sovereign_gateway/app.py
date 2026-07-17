@@ -1588,22 +1588,41 @@ def _rate_limit_response() -> Response:
     return response
 
 
-async def _throttle_failed_auth(request: Request, raw_key: str | None) -> bool:
-    # Failed authentications return before the per-tenant limiter runs, so
-    # throttle them here: bucket by the presented key's hash (the raw key is
-    # never logged or stored) when one was sent, else by client IP.
-    if raw_key:
-        bucket = f"auth-failure:key:{hash_api_key(raw_key)}"
-    else:
-        client_host = request.client.host if request.client else "unknown"
-        bucket = f"auth-failure:ip:{client_host}"
+async def _limit_exceeded(request: Request, bucket: str) -> bool:
     try:
         allowed, _ = await request.app.state.limiter.allow(bucket)
     except Exception:
-        # A 401 is cheap and reaches no upstream; keep rejecting even when
-        # the limiter backend is down.
-        return False
+        # Redis-backed limiting is down. Enforce the same bounded per-process
+        # fallback the valid-key path uses rather than dropping the failed-auth
+        # throttle entirely, which would leave this path fully open during an
+        # outage. If even the in-process fallback errors, a 401 is cheap and
+        # reaches no upstream, so let it through rather than surfacing a 500.
+        try:
+            allowed, _ = await request.app.state.limiter_fallback.allow(bucket)
+        except Exception:
+            return False
     return not allowed
+
+
+async def _throttle_failed_auth(request: Request, raw_key: str | None) -> bool:
+    # Failed authentications return before the per-tenant limiter runs, so
+    # throttle them here. Always key on the client IP: an attacker enumerating
+    # candidate keys presents a fresh hash every attempt, so a key-only bucket
+    # never fills — the IP bucket is what actually caps the brute-force scan
+    # per source. When a key was sent, additionally key on its SHA-256 so a
+    # single client stuck on one wrong key is throttled without penalizing
+    # others behind the same address. Every bucket is checked (so their
+    # fixed-window counters stay in step) and any one over its limit throttles.
+    # The raw key is never logged or stored, only its digest.
+    client_host = request.client.host if request.client else "unknown"
+    buckets = [f"auth-failure:ip:{client_host}"]
+    if raw_key:
+        buckets.append(f"auth-failure:key:{hash_api_key(raw_key)}")
+    throttled = False
+    for bucket in buckets:
+        if await _limit_exceeded(request, bucket):
+            throttled = True
+    return throttled
 
 
 async def _authorize(request: Request) -> Response | None:

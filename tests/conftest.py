@@ -30,6 +30,20 @@ def upstream_requests() -> list[httpx.Request]:
 
 
 @pytest.fixture
+def frozen_limiter_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Pin the fixed-window limiter's clock so count-then-429 tests can't flake
+    # when a wall-clock minute rolls between the last allowed request and the
+    # one expected to be blocked. Only the rate_limit module's `time` reference
+    # is replaced, so retry-after math elsewhere still reads the real clock.
+    import types
+
+    monkeypatch.setattr(
+        "sovereign_gateway.rate_limit.time",
+        types.SimpleNamespace(time=lambda: 1_000_000.0),
+    )
+
+
+@pytest.fixture
 def client(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -111,7 +111,9 @@ def test_redis_loss_serves_via_bounded_fallbacks(client: TestClient) -> None:
     assert "x-ratelimit-remaining-requests" not in response.headers
 
 
-def test_redis_loss_rate_limit_fallback_caps_requests(client: TestClient) -> None:
+def test_redis_loss_rate_limit_fallback_caps_requests(
+    client: TestClient, frozen_limiter_clock: None
+) -> None:
     client.app.state.limiter = FailingLimiter()
 
     # The per-process fallback window allows 2x the configured 20 RPM.
@@ -120,6 +122,26 @@ def test_redis_loss_rate_limit_fallback_caps_requests(client: TestClient) -> Non
         assert response.status_code == 200
 
     response = client.get("/v1/models")
+
+    assert response.status_code == 429
+    assert response.json()["error"]["code"] == "rate_limit_exceeded"
+
+
+def test_redis_loss_still_throttles_failed_auth(
+    client: TestClient, frozen_limiter_clock: None
+) -> None:
+    # A Redis outage must not drop the failed-auth throttle to fully open: it
+    # falls back to the same bounded per-process window (2x the 20 RPM = 40).
+    # Rotating keys means only the per-source IP bucket can catch the scan.
+    client.app.state.limiter = FailingLimiter()
+
+    for attempt in range(40):
+        response = client.get(
+            "/v1/models", headers={"Authorization": f"Bearer sk-candidate-{attempt}"}
+        )
+        assert response.status_code == 401
+
+    response = client.get("/v1/models", headers={"Authorization": "Bearer sk-candidate-final"})
 
     assert response.status_code == 429
     assert response.json()["error"]["code"] == "rate_limit_exceeded"
