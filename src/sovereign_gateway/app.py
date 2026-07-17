@@ -31,7 +31,7 @@ from starlette.formparsers import MultiPartParser
 
 from . import __version__
 from .accounts import AccountsClient, WalletGrant
-from .auth import ApiKeyStore, Principal
+from .auth import ApiKeyStore, Principal, hash_api_key
 from .catalog import CatalogRefreshError, ProviderCatalog
 from .confidential_runtime import configure_confidential_runtime
 from .config import Endpoint, GatewayConfig, ModelRoute
@@ -1799,10 +1799,42 @@ async def _store_privacy_receipt(
         )
 
 
+def _rate_limit_response() -> Response:
+    reset_at = (int(time.time()) // 60 + 1) * 60
+    response = openai_error(
+        429,
+        "Rate limit exceeded",
+        error_type="rate_limit_error",
+        code="rate_limit_exceeded",
+    )
+    response.headers["retry-after"] = str(max(1, reset_at - int(time.time())))
+    return response
+
+
+async def _throttle_failed_auth(request: Request, raw_key: str | None) -> bool:
+    # Failed authentications return before the per-tenant limiter runs, so
+    # throttle them here: bucket by the presented key's hash (the raw key is
+    # never logged or stored) when one was sent, else by client IP.
+    if raw_key:
+        bucket = f"auth-failure:key:{hash_api_key(raw_key)}"
+    else:
+        client_host = request.client.host if request.client else "unknown"
+        bucket = f"auth-failure:ip:{client_host}"
+    try:
+        allowed, _ = await request.app.state.limiter.allow(bucket)
+    except Exception:
+        # A 401 is cheap and reaches no upstream; keep rejecting even when
+        # the limiter backend is down.
+        return False
+    return not allowed
+
+
 async def _authorize(request: Request) -> Response | None:
     authorization = request.headers.get("authorization", "")
     scheme, _, raw_key = authorization.partition(" ")
     if scheme.lower() != "bearer" or not raw_key:
+        if await _throttle_failed_auth(request, None):
+            return _rate_limit_response()
         return openai_error(
             401,
             "Missing bearer API key",
@@ -1813,6 +1845,8 @@ async def _authorize(request: Request) -> Response | None:
     if not principal and request.app.state.managed_keys:
         principal = await request.app.state.managed_keys.authenticate(raw_key)
     if not principal:
+        if await _throttle_failed_auth(request, raw_key):
+            return _rate_limit_response()
         return openai_error(
             401,
             "Invalid API key",
@@ -1843,14 +1877,7 @@ async def _authorize(request: Request) -> Response | None:
     request.state.rate_limit_remaining = remaining
     request.state.rate_limit_reset = reset_at
     if not allowed:
-        response = openai_error(
-            429,
-            "Rate limit exceeded",
-            error_type="rate_limit_error",
-            code="rate_limit_exceeded",
-        )
-        response.headers["retry-after"] = str(max(1, reset_at - int(time.time())))
-        return response
+        return _rate_limit_response()
     request.state.principal = principal
     return None
 

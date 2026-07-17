@@ -263,6 +263,34 @@ def test_rate_limit_returns_retry_metadata(client: TestClient) -> None:
     assert 1 <= int(response.headers["retry-after"]) <= 60
 
 
+def test_failed_auth_attempts_are_rate_limited(client: TestClient) -> None:
+    for _ in range(20):
+        response = client.get("/v1/models", headers={"Authorization": "Bearer sk-not-a-real-key"})
+        assert response.status_code == 401
+        assert response.json()["error"]["code"] == "invalid_api_key"
+
+    response = client.get("/v1/models", headers={"Authorization": "Bearer sk-not-a-real-key"})
+
+    assert response.status_code == 429
+    assert response.json()["error"]["code"] == "rate_limit_exceeded"
+    assert 1 <= int(response.headers["retry-after"]) <= 60
+
+    # Valid keys are bucketed per tenant and stay unaffected.
+    response = client.get("/v1/models")
+    assert response.status_code == 200
+
+
+def test_missing_key_attempts_are_rate_limited(client: TestClient) -> None:
+    for _ in range(20):
+        response = client.get("/v1/models", headers={"Authorization": ""})
+        assert response.status_code == 401
+
+    response = client.get("/v1/models", headers={"Authorization": ""})
+
+    assert response.status_code == 429
+    assert response.json()["error"]["code"] == "rate_limit_exceeded"
+
+
 def test_readiness_reports_dependency_state(client: TestClient) -> None:
     response = client.get("/readyz")
 
