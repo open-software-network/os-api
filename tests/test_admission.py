@@ -96,7 +96,7 @@ class FailingLimiter:
         raise ConnectionError("redis down")
 
 
-def test_redis_loss_fails_open_for_rate_limit_and_admission(client: TestClient) -> None:
+def test_redis_loss_serves_via_bounded_fallbacks(client: TestClient) -> None:
     failing = FailingLimiter()
     client.app.state.limiter = failing
     client.app.state.concurrency = failing
@@ -109,6 +109,41 @@ def test_redis_loss_fails_open_for_rate_limit_and_admission(client: TestClient) 
 
     assert response.status_code == 200
     assert "x-ratelimit-remaining-requests" not in response.headers
+
+
+def test_redis_loss_rate_limit_fallback_caps_requests(client: TestClient) -> None:
+    client.app.state.limiter = FailingLimiter()
+
+    # The per-process fallback window allows 2x the configured 20 RPM.
+    for _ in range(40):
+        response = client.get("/v1/models")
+        assert response.status_code == 200
+
+    response = client.get("/v1/models")
+
+    assert response.status_code == 429
+    assert response.json()["error"]["code"] == "rate_limit_exceeded"
+
+
+def test_redis_loss_admission_fallback_caps_concurrency(client: TestClient) -> None:
+    client.app.state.concurrency = FailingLimiter()
+
+    async def saturate_fallback() -> None:
+        # tee:dual-model configures max_concurrency: 4 in the test catalog.
+        for _ in range(4):
+            assert await client.app.state.concurrency_fallback.acquire("tee:dual-model", 4)
+
+    anyio.run(saturate_fallback)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"X-Confidential-Compute": "required"},
+        json={"model": "dual-model", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "10"
+    assert response.json()["error"]["code"] == "model_overloaded"
 
 
 def test_unlimited_backend_skips_admission_control(client: TestClient) -> None:

@@ -335,6 +335,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         RedisConcurrencyLimiter(redis) if redis else LocalConcurrencyLimiter()
     )
     app.state.concurrency = concurrency
+    # In-process fallbacks, consulted only when the Redis-backed limiters
+    # raise. They are strictly per-process and bounded: the rate fallback
+    # allows 2x the configured per-key RPM (each gateway process enforces its
+    # own share, so the degraded ceiling scales with replica count), and the
+    # concurrency fallback caps admissions at the endpoint limit per process.
+    app.state.limiter_fallback = LocalFixedWindowLimiter(limiter.limit * 2)
+    app.state.concurrency_fallback = LocalConcurrencyLimiter()
     app.state.video_queue_semaphore = asyncio.Semaphore(
         int(os.getenv("VIDEO_QUEUE_MAX_CONCURRENCY", "4"))
     )
@@ -1199,6 +1206,7 @@ def create_app() -> FastAPI:
         for endpoint in candidates:
             provider = config.providers[endpoint.provider]
             capacity_held = False
+            capacity_from_fallback = False
             if endpoint.max_concurrency:
                 try:
                     capacity_held = await request.app.state.concurrency.acquire(
@@ -1216,17 +1224,31 @@ def create_app() -> FastAPI:
                             }
                         )
                     )
-                    capacity_held = True
+                    # Redis is down, so global admission control is
+                    # impossible. Fall back to the bounded per-process
+                    # counter at the endpoint limit instead of failing open.
+                    capacity_held = await request.app.state.concurrency_fallback.acquire(
+                        endpoint.id, endpoint.max_concurrency
+                    )
+                    capacity_from_fallback = capacity_held
                 if not capacity_held:
                     failures.append({"endpoint": endpoint.id, "status": 429})
                     continue
 
-            async def free_capacity(endpoint_id: str = endpoint.id) -> None:
+            async def free_capacity(
+                endpoint_id: str = endpoint.id,
+                from_fallback: bool = capacity_from_fallback,
+            ) -> None:
                 nonlocal capacity_held
                 if capacity_held:
                     capacity_held = False
+                    limiter = (
+                        request.app.state.concurrency_fallback
+                        if from_fallback
+                        else request.app.state.concurrency
+                    )
                     try:
-                        await request.app.state.concurrency.release(endpoint_id)
+                        await limiter.release(endpoint_id)
                     except Exception:
                         logger.exception("endpoint concurrency release failed")
 
@@ -1856,10 +1878,12 @@ async def _authorize(request: Request) -> Response | None:
     try:
         allowed, remaining = await request.app.state.limiter.allow(principal.tenant_id)
     except Exception:
-        # Fail open: hard spend limits stay enforced in Firestore and Cloud
-        # Armor still caps per-IP rates at the edge, so availability wins over
-        # a temporarily unenforced per-key RPM. The alert on this event is the
-        # signal to fail the region away per the runbook.
+        # Redis-backed limiting is down. Keep the redis_degraded alert as the
+        # signal to fail the region away per the runbook, but no longer fail
+        # fully open: enforce the bounded per-process fallback window so a
+        # Redis outage cannot silently lift per-key RPM. Hard spend limits
+        # stay enforced in Firestore and Cloud Armor still caps per-IP rates
+        # at the edge.
         logger.exception(
             json.dumps(
                 {
@@ -1871,6 +1895,9 @@ async def _authorize(request: Request) -> Response | None:
                 separators=(",", ":"),
             )
         )
+        allowed, _ = await request.app.state.limiter_fallback.allow(principal.tenant_id)
+        if not allowed:
+            return _rate_limit_response()
         request.state.principal = principal
         return None
     reset_at = (int(time.time()) // 60 + 1) * 60
