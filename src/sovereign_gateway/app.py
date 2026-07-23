@@ -2070,7 +2070,6 @@ async def _release_billing(
                 {
                     "event": "billing_release_failed",
                     "request_id": request.state.request_id,
-                    "billing_id": billing.billing_id,
                 }
             )
         )
@@ -2096,7 +2095,6 @@ async def _settle_billing(
                     "severity": "WARNING",
                     "event": "billing_usage_fallback",
                     "request_id": request.state.request_id,
-                    "billing_id": billing.billing_id,
                     "reason": "missing" if usage is None else "unbillable",
                     "usage_fields": sorted(usage) if usage else [],
                 },
@@ -2137,7 +2135,6 @@ async def _settle_billing(
                         "severity": "ERROR",
                         "event": "wallet_charge_failed",
                         "request_id": request.state.request_id,
-                        "billing_id": billing.billing_id,
                     }
                 )
             )
@@ -2147,7 +2144,6 @@ async def _settle_billing(
                 {
                     "event": "billing_settlement_failed",
                     "request_id": request.state.request_id,
-                    "billing_id": billing.billing_id,
                 }
             )
         )
