@@ -44,7 +44,7 @@ These are the production-parity items that are not purely engineering: they need
 
 ## Attestation hardening (partially owner, partially engineering)
 
-The attestation endpoint returns a real, client-verifiable TDX quote today (see `recovery-drills/2026-07-10-attestation.md`). Two follow-ons remain, both engineering but worth an explicit priority call:
+The attestation endpoint returns a real, client-verifiable TDX quote today. Restricted drill records validate the control without publishing live infrastructure evidence. Two follow-ons remain, both engineering but worth an explicit priority call:
 
 - Server-side quote verification / attestation PKI (verify against Intel PCS in-platform, not only client-side).
 - Binding a measured-boot model image digest into report-data rather than gateway-asserted configuration, and gating confidential key release on a passing attestation (fail-closed key release).
