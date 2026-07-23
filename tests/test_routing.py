@@ -1039,6 +1039,7 @@ async def test_unbillable_usage_warns_and_charges_fallback(
     assert repository.actual_microusd == billing.fallback_charge_microusd
     assert accounts.charged_microusd == billing.fallback_charge_microusd
     assert "billing_usage_fallback" in caplog.text
+    assert billing.billing_id not in caplog.text
 
 
 @pytest.mark.anyio
