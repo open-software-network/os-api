@@ -7,41 +7,60 @@ concurrency:
   group: os-api-production
   cancel-in-progress: false
 
-permissions:
-  contents: read
-  id-token: write
+permissions: {}
 
 env:
-  PROJECT_ID: autonomous-lab-490610
-  REGION: us-central1
-  SERVICE: sovereign-api
-  CANARY_SERVICE: sovereign-api-canary
-  SECONDARY_SERVICE: sovereign-api-secondary
-  SECONDARY_REGION: us-east4
-  IMAGE: us-central1-docker.pkg.dev/autonomous-lab-490610/sovereign-inference/gateway
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  REGION: ${{ vars.GCP_REGION }}
+  SERVICE: ${{ vars.GCP_SERVICE }}
+  CANARY_SERVICE: ${{ vars.GCP_CANARY_SERVICE }}
+  SECONDARY_SERVICE: ${{ vars.GCP_SECONDARY_SERVICE }}
+  SECONDARY_REGION: ${{ vars.GCP_SECONDARY_REGION }}
+  IMAGE: ${{ vars.GCP_ARTIFACT_IMAGE }}
+  PUBLIC_READY_URL: ${{ vars.PUBLIC_READY_URL }}
 
 jobs:
   deploy:
+    name: deploy
     runs-on: ubuntu-latest
     environment: production
+    permissions:
+      contents: read
+      id-token: write # Required for the Google Cloud workload-identity exchange.
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Validate production configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in PROJECT_ID REGION SERVICE CANARY_SERVICE SECONDARY_SERVICE SECONDARY_REGION IMAGE PUBLIC_READY_URL; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing required production variable: ${name}"
+              exit 1
+            fi
+          done
+          [[ "${IMAGE}" == "${REGION}-docker.pkg.dev/${PROJECT_ID}/"* ]]
+          [[ "${IMAGE}" != *":"* && "${IMAGE}" != *"@"* ]]
+          [[ "${PUBLIC_READY_URL}" == https://* ]]
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
         with:
           project_id: ${{ env.PROJECT_ID }}
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
 
-      - uses: google-github-actions/setup-gcloud@v3
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
         with:
           install_components: beta
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
 
       - name: Validate hosted provider catalog and pricing
         run: |
@@ -67,13 +86,15 @@ jobs:
 
       - name: Sign image for Binary Authorization
         shell: bash
+        env:
+          IMAGE_REFERENCE: ${{ steps.image.outputs.reference }}
         run: |
           set -euo pipefail
           # Cloud Run evaluates the resolved platform manifest while GKE
           # evaluates the reference as written, so sign the buildx index
           # digest and every platform manifest digest beneath it.
           keyversion="projects/${PROJECT_ID}/locations/${REGION}/keyRings/os-api-binauthz/cryptoKeys/release-signing/cryptoKeyVersions/1"
-          index_ref="${{ steps.image.outputs.reference }}"
+          index_ref="${IMAGE_REFERENCE}"
           platform_refs="$(docker buildx imagetools inspect "${index_ref}" --raw \
             | jq -r '.manifests[] | select(.platform.os != "unknown") | .digest' \
             | sed "s|^|${IMAGE}@|")"
@@ -89,6 +110,8 @@ jobs:
       - name: Deploy private canary
         id: canary
         shell: bash
+        env:
+          IMAGE_REFERENCE: ${{ steps.image.outputs.reference }}
         run: |
           set -euo pipefail
           # Binary Authorization occurrences are eventually consistent. Cloud
@@ -101,7 +124,7 @@ jobs:
             if output=$(gcloud run deploy "${CANARY_SERVICE}" \
               --project "${PROJECT_ID}" \
               --region "${REGION}" \
-              --image "${{ steps.image.outputs.reference }}" \
+              --image "${IMAGE_REFERENCE}" \
               --revision-suffix "${suffix}" \
               --update-env-vars "MODEL_CONFIG_PATH=/app/config/models.yaml,VENICE_COMPAT_ENABLED=true" \
               --quiet 2>&1); then
@@ -124,7 +147,7 @@ jobs:
 
       - name: Mint canary identity token
         id: canary-auth
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
         with:
           project_id: ${{ env.PROJECT_ID }}
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
@@ -221,6 +244,8 @@ jobs:
       - name: Deploy production revision without traffic
         id: production
         shell: bash
+        env:
+          IMAGE_REFERENCE: ${{ steps.image.outputs.reference }}
         run: |
           set -euo pipefail
           suffix="gh-${GITHUB_RUN_ID}"
@@ -228,7 +253,7 @@ jobs:
           gcloud run deploy "${SERVICE}" \
             --project "${PROJECT_ID}" \
             --region "${REGION}" \
-            --image "${{ steps.image.outputs.reference }}" \
+            --image "${IMAGE_REFERENCE}" \
             --revision-suffix "${suffix}" \
             --no-traffic \
             --update-env-vars "MODEL_CONFIG_PATH=/app/config/models.yaml,VENICE_COMPAT_ENABLED=true" \
@@ -238,6 +263,8 @@ jobs:
       - name: Deploy secondary-region revision without traffic
         id: secondary
         shell: bash
+        env:
+          IMAGE_REFERENCE: ${{ steps.image.outputs.reference }}
         run: |
           set -euo pipefail
           suffix="gh-${GITHUB_RUN_ID}"
@@ -245,7 +272,7 @@ jobs:
           gcloud run deploy "${SECONDARY_SERVICE}" \
             --project "${PROJECT_ID}" \
             --region "${SECONDARY_REGION}" \
-            --image "${{ steps.image.outputs.reference }}" \
+            --image "${IMAGE_REFERENCE}" \
             --revision-suffix "${suffix}" \
             --no-traffic \
             --update-env-vars "MODEL_CONFIG_PATH=/app/config/models.yaml,VENICE_COMPAT_ENABLED=true" \
@@ -254,27 +281,31 @@ jobs:
 
       - name: Promote production revision
         shell: bash
+        env:
+          PRODUCTION_REVISION: ${{ steps.production.outputs.revision }}
         run: |
           set -euo pipefail
           gcloud run services update-traffic "${SERVICE}" \
             --project "${PROJECT_ID}" \
             --region "${REGION}" \
-            --to-revisions "${{ steps.production.outputs.revision }}=100" \
+            --to-revisions "${PRODUCTION_REVISION}=100" \
             --quiet
 
       - name: Promote secondary-region revision
         shell: bash
+        env:
+          SECONDARY_REVISION: ${{ steps.secondary.outputs.revision }}
         run: |
           set -euo pipefail
           gcloud run services update-traffic "${SECONDARY_SERVICE}" \
             --project "${PROJECT_ID}" \
             --region "${SECONDARY_REGION}" \
-            --to-revisions "${{ steps.secondary.outputs.revision }}=100" \
+            --to-revisions "${SECONDARY_REVISION}=100" \
             --quiet
 
       - name: Verify public endpoint
         shell: bash
         run: |
           set -euo pipefail
-          curl --fail --silent --show-error --max-time 30 https://api.opensoftware.co/readyz \
+          curl --fail --silent --show-error --max-time 30 "${PUBLIC_READY_URL}" \
             | jq -e '.status == "ready"' >/dev/null

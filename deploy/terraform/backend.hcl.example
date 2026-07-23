@@ -1,0 +1,2 @@
+bucket = "example-project-id-os-api-terraform-state"
+prefix = "platform"

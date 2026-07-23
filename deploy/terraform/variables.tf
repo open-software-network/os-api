@@ -262,7 +262,7 @@ variable "github_repository_owner_id" {
 variable "gateway_image" {
   description = "Digest-pinned gateway container deployed to Cloud Run."
   type        = string
-  default     = "us-central1-docker.pkg.dev/autonomous-lab-490610/sovereign-inference/gateway@sha256:9019aa7bb0587a2b4767b6a52e10cdc043d3fb23fb971313c66d9e81f17cf1a6"
+  default     = "us-central1-docker.pkg.dev/example-project-id/sovereign-inference/gateway@sha256:0000000000000000000000000000000000000000000000000000000000000000"
 }
 
 variable "confidential_gateway_additional_image_digests" {

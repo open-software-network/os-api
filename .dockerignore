@@ -1,10 +1,9 @@
-.git
-.github
-.pytest_cache
-.ruff_cache
-.venv
-deploy
-docs
-tests
-*.tfplan
-*.tfstate*
+# Deny by default. Keep the build context aligned with Dockerfile COPY commands.
+**
+!pyproject.toml
+!uv.lock
+!README.md
+!src/
+!src/**
+!config/
+!config/models.yaml

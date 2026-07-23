@@ -1,0 +1,53 @@
+name: Bug report
+description: Report a reproducible, non-sensitive defect
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Never include credentials, customer data, prompts, or production identifiers.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      placeholder: Release, image digest, or commit
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment mode
+      options:
+        - Local development
+        - Hosted provider
+        - Self-hosted Kubernetes
+        - Terraform-managed GCP
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Minimal sanitized steps or test case
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      render: shell
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed credentials, customer data, prompts, production identifiers, and private evidence.
+          required: true

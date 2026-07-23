@@ -15,17 +15,30 @@ The `Deploy production` GitHub workflow is manually dispatched from `main`. It a
 2. An IAM-authenticated canary `/v1/models` call succeeds with the dedicated smoke key.
 3. The public readiness endpoint succeeds after traffic promotion.
 
+Configure deployment-specific values as variables on the protected `production` GitHub
+environment: `GCP_PROJECT_ID`, `GCP_REGION`, `GCP_SERVICE`, `GCP_CANARY_SERVICE`,
+`GCP_SECONDARY_SERVICE`, `GCP_SECONDARY_REGION`, `GCP_ARTIFACT_IMAGE`, `PUBLIC_READY_URL`,
+`GCP_WORKLOAD_IDENTITY_PROVIDER`, and `GCP_DEPLOY_SERVICE_ACCOUNT`. Do not hard-code live
+identifiers in workflows or documentation.
+
+Initialize Terraform with a private backend configuration derived from
+`deploy/terraform/backend.hcl.example`:
+
+```bash
+terraform -chdir=deploy/terraform init -backend-config=backend.hcl
+```
+
 The previous revision remains available for rollback:
 
 ```bash
 gcloud run revisions list \
   --service=sovereign-api \
   --region=us-central1 \
-  --project=autonomous-lab-490610
+  --project=${PROJECT_ID}
 
 gcloud run services update-traffic sovereign-api \
   --region=us-central1 \
-  --project=autonomous-lab-490610 \
+  --project=${PROJECT_ID} \
   --to-revisions=REVISION_NAME=100
 ```
 
@@ -71,7 +84,7 @@ Roll out with `scripts/model_rollout.sh`, which enforces three gates:
 2. **Health-gated promotion**: the CPU model deployment uses `RollingUpdate` with `maxSurge: 1, maxUnavailable: 0`, so the old model keeps serving until the new pod is ready; a stuck rollout is automatically undone. The surge pod schedules onto an autoscaled node (the pool allows two nodes), so allow ~5–15 minutes.
 3. **Post-promote verification**: golden prompts run against the serving deployment; failure triggers an automatic `rollout undo`.
 
-The GPU deployment keeps `Recreate` because it owns a single dedicated TDX GPU node; treat GPU model rollouts as brief planned unavailability of the confidential GPU pool until capacity is diversified. Roll back manually at any time with `kubectl -n inference rollout undo deployment/<name>` — data and gateway config are unaffected by model rollbacks. The latest exercised rollout and automatic rollback are recorded in [the 2026-07-10 model rollout drill](recovery-drills/2026-07-10-model-rollout.md).
+The GPU deployment keeps `Recreate` because it owns a single dedicated TDX GPU node; treat GPU model rollouts as brief planned unavailability of the confidential GPU pool until capacity is diversified. Roll back manually at any time with `kubectl -n inference rollout undo deployment/<name>` — data and gateway config are unaffected by model rollbacks. Keep detailed rollout evidence in the restricted recovery record described in [recovery drills](recovery-drills/README.md).
 
 ## Confidential-compute attestation
 
@@ -98,13 +111,13 @@ The GitHub deploy workflow signs every image it builds, for both the multi-arch 
 
 ```bash
 gcloud beta container binauthz attestations sign-and-create \
-  --project=autonomous-lab-490610 \
-  --artifact-url="us-central1-docker.pkg.dev/autonomous-lab-490610/sovereign-inference/<repo>@sha256:<digest>" \
-  --attestor=os-api-release --attestor-project=autonomous-lab-490610 \
-  --keyversion="projects/autonomous-lab-490610/locations/us-central1/keyRings/os-api-binauthz/cryptoKeys/release-signing/cryptoKeyVersions/1"
+  --project=${PROJECT_ID} \
+  --artifact-url="us-central1-docker.pkg.dev/${PROJECT_ID}/sovereign-inference/<repo>@sha256:<digest>" \
+  --attestor=os-api-release --attestor-project=${PROJECT_ID} \
+  --keyversion="projects/${PROJECT_ID}/locations/us-central1/keyRings/os-api-binauthz/cryptoKeys/release-signing/cryptoKeyVersions/1"
 ```
 
-Sign both the index digest and its `linux/amd64` platform digest (resolve them with `docker buildx imagetools inspect <ref> --raw`). An unsigned image fails with `denied by attestor ... No attestations found that were valid and signed by a key trusted by the attestor`; sign the digest rather than editing the policy. The enforcement and signing drills are recorded in [the 2026-07-10 Binary Authorization drill](recovery-drills/2026-07-10-binauthz.md).
+Sign both the index digest and its `linux/amd64` platform digest (resolve them with `docker buildx imagetools inspect <ref> --raw`). An unsigned image fails with `denied by attestor ... No attestations found that were valid and signed by a key trusted by the attestor`; sign the digest rather than editing the policy. Store detailed enforcement and signing evidence in the restricted [recovery-drill record](recovery-drills/README.md).
 
 ## Egress controls
 
@@ -118,7 +131,7 @@ The human-facing site, docs, and account dashboard use HTTP Basic authentication
 
 Cloud Armor throttles `/v1/*` at 600 requests per source IP per minute. A source that reaches 1,800 requests in one minute is banned for ten minutes. These regional, approximate edge controls are intentionally looser than the 60 RPM per-key Redis limit and exist only to protect availability; they are not billing quotas. Monitoring alerts when rejected Bearer credentials exceed 60 per minute. Review load-balancer source distribution and request IDs before changing thresholds. Do not enable body-inspecting WAF rules on model prompts without a privacy and false-positive review.
 
-Production DNS resolves `api.opensoftware.co` directly to the global load-balancer address `34.36.164.16` in DNS-only mode. Cloud Run uses `INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER`, the legacy Cloud Run domain mapping is removed, and the default `run.app` URL cannot bypass Cloud Armor. Keep the Certificate Manager DNS-authorization CNAME in place so certificate renewal continues to work.
+Production DNS resolves `api.opensoftware.co` to Terraform's `production_edge_ip` output in DNS-only mode. Cloud Run uses `INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER`, the legacy Cloud Run domain mapping is removed, and the default `run.app` URL cannot bypass Cloud Armor. Keep the Certificate Manager DNS-authorization CNAME in place so certificate renewal continues to work.
 
 ## Capacity and shutdown
 
@@ -132,34 +145,34 @@ gcloud container clusters resize sovereign-inference \
   --node-pool=confidential-cpu-tdx \
   --num-nodes=0 \
   --region=us-central1 \
-  --project=autonomous-lab-490610 \
+  --project=${PROJECT_ID} \
   --quiet
 ```
 
 ## Backup and recovery
 
-Terraform state is stored in a versioned GCS backend. Secret Manager retains secret versions; Firestore is the system of record for keys, usage, and customer audit metadata. Firestore point-in-time recovery retains document versions for seven days. Cloud Scheduler starts a managed export of `sovereign_api_keys`, `sovereign_usage`, and `sovereign_audit_events` every day at 04:00 UTC. Exports go to the versioned `autonomous-lab-490610-os-api-firestore-backups` bucket, have a 30-day minimum retention period, and expire after 90 days. The retention policy is intentionally not locked until an owner explicitly accepts the irreversible lock.
+Terraform state is stored in a versioned GCS backend. Secret Manager retains secret versions; Firestore is the system of record for keys, usage, and customer audit metadata. Firestore point-in-time recovery retains document versions for seven days. Cloud Scheduler starts a managed export of `sovereign_api_keys`, `sovereign_usage`, and `sovereign_audit_events` every day at 04:00 UTC. Exports go to the versioned `${PROJECT_ID}-os-api-firestore-backups` bucket, have a 30-day minimum retention period, and expire after 90 days. The retention policy is intentionally not locked until an owner explicitly accepts the irreversible lock.
 
 Run and verify an export without waiting for the next schedule:
 
 ```bash
 gcloud scheduler jobs run os-api-firestore-export \
   --location=us-central1 \
-  --project=autonomous-lab-490610
+  --project=${PROJECT_ID}
 
 gcloud firestore operations list \
   --database='(default)' \
-  --project=autonomous-lab-490610
+  --project=${PROJECT_ID}
 
 gcloud storage ls \
-  gs://autonomous-lab-490610-os-api-firestore-backups/
+  gs://${PROJECT_ID}-os-api-firestore-backups/
 ```
 
 Treat a successful scheduler HTTP response as "export accepted," not "backup complete." Close the check only after the Firestore operation reports `done: true`, has no error, and its timestamped prefix contains a matching `.overall_export_metadata` object.
 
 Quarterly, restore the latest completed export into the designated isolated recovery project and record the measured recovery point and recovery time. The recovery project must use a bucket/database-compatible location, must not have production runtime service accounts, and must never receive production traffic. Verify key, usage, and audit collection counts; sample documents for schema compatibility; confirm raw key secrets and prompts are absent; and then destroy the recovery database. Never restore into production during a drill, and never reactivate an expired or revoked key.
 
-The latest completed exercise is recorded in [the 2026-07-10 recovery drill](recovery-drills/2026-07-10.md).
+Record each completed exercise using the restricted [recovery-drill guidance](recovery-drills/README.md).
 
 ## Regional failover
 
@@ -171,4 +184,4 @@ Because Redis is per-region and only backs rate limiting and admission control �
 
 There is no remaining shared regional single point of failure in the serving path. GPU capacity is still a single dedicated node class (see the capacity section) and remains the one non-replicated resource.
 
-To fail away from a region, detach its NEG from the `os-api-edge` backend service and confirm the other region serves via the header; restore by re-running `terraform apply`, which is authoritative for the backend set. Failback routing is eventually consistent — judge recovery by the attached backend set and continuous 200s, not by which region serves your client. The latest exercise, including two defects the first attempt surfaced, is recorded in [the 2026-07-10 failover drill](recovery-drills/2026-07-10-failover.md).
+To fail away from a region, detach its NEG from the `os-api-edge` backend service and confirm the other region serves via the header; restore by re-running `terraform apply`, which is authoritative for the backend set. Failback routing is eventually consistent — judge recovery by the attached backend set and continuous 200s, not by which region serves your client. Record results using the restricted [recovery-drill guidance](recovery-drills/README.md).
