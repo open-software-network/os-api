@@ -1,0 +1,166 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gateway
+  namespace: inference
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: inference
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: gateway
+  template:
+    metadata:
+      labels:
+        app: gateway
+    spec:
+      serviceAccountName: gateway
+      automountServiceAccountToken: false
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gateway
+          # Replace with the digest-pinned image from your Artifact Registry.
+          image: us-central1-docker.pkg.dev/PROJECT_ID/sovereign-inference/gateway:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: MODEL_CONFIG_PATH
+              value: /etc/sovereign/models.yaml
+            - name: REQUESTS_PER_MINUTE
+              value: "60"
+            - name: MAX_REQUEST_BYTES
+              value: "10485760"
+            - name: API_KEY_HASHES
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-secrets
+                  key: api-key-hashes
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-secrets
+                  key: redis-url
+            - name: REDIS_CA_CERT_PATH
+              value: /etc/redis/ca.pem
+            - name: PHALA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-secrets
+                  key: phala-api-key
+                  optional: true
+            - name: VENICE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-secrets
+                  key: venice-api-key
+                  optional: true
+            - name: ENDPOINT_FAILURE_THRESHOLD
+              value: "3"
+            - name: ENDPOINT_CIRCUIT_COOLDOWN_SECONDS
+              value: "30"
+          volumeMounts:
+            - name: models
+              mountPath: /etc/sovereign
+              readOnly: true
+            - name: redis-ca
+              mountPath: /etc/redis
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+      volumes:
+        - name: models
+          configMap:
+            name: gateway-models
+        - name: redis-ca
+          secret:
+            secretName: gateway-secrets
+            items:
+              - key: redis-ca.pem
+                path: ca.pem
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: gateway
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: inference
+spec:
+  selector:
+    app: gateway
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+  type: ClusterIP
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: gateway
+  namespace: inference
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: gateway
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: gateway
+  namespace: inference
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: gateway
+  minReplicas: 2
+  maxReplicas: 20
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 65

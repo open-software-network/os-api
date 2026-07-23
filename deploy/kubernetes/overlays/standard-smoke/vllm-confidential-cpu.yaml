@@ -1,0 +1,116 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: confidential-vllm-cpu
+  namespace: inference
+spec:
+  replicas: 0
+  strategy:
+    # A new model build must become ready (surging onto an autoscaled node)
+    # before the serving pod is removed; a bad rollout never drops capacity.
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: confidential-vllm
+  template:
+    metadata:
+      labels:
+        app: confidential-vllm
+        compute-privacy: confidential
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 2000
+        runAsGroup: 0
+        fsGroup: 0
+        seccompProfile:
+          type: RuntimeDefault
+      nodeSelector:
+        cloud.google.com/gke-confidential-nodes-instance-type: TDX
+        workload: confidential-cpu
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: confidential-cpu
+          effect: NoSchedule
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai-cpu@sha256:89e1fbe829038b1a560601990c8ec89625c622a969fcbc8f10ce48b6139795be
+          args:
+            - Qwen/Qwen2.5-0.5B-Instruct
+            - --served-model-name=Qwen/Qwen2.5-0.5B-Instruct
+            - --max-model-len=32768
+            - --dtype=bfloat16
+            - --enable-auto-tool-choice
+            - --tool-call-parser=hermes
+          env:
+            - name: VLLM_CPU_KVCACHE_SPACE
+              value: "4"
+            - name: HOME
+              value: /home/vllm
+            - name: USER
+              value: vllm
+            - name: LOGNAME
+              value: vllm
+            - name: HF_HOME
+              value: /home/vllm/.cache/huggingface
+            - name: TRITON_CACHE_DIR
+              value: /home/vllm/.cache/triton
+            - name: TORCHINDUCTOR_CACHE_DIR
+              value: /home/vllm/.cache/torchinductor
+          ports:
+            - name: http
+              containerPort: 8000
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            failureThreshold: 120
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "3"
+              memory: 10Gi
+            limits:
+              cpu: "4"
+              memory: 12Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: model-cache
+              mountPath: /home/vllm/.cache
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 2Gi
+        - name: model-cache
+          emptyDir:
+            sizeLimit: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: confidential-vllm-cpu
+  namespace: inference
+spec:
+  selector:
+    app: confidential-vllm
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+  type: ClusterIP

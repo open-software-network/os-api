@@ -1,0 +1,280 @@
+name: Deploy production
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: os-api-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PROJECT_ID: autonomous-lab-490610
+  REGION: us-central1
+  SERVICE: sovereign-api
+  CANARY_SERVICE: sovereign-api-canary
+  SECONDARY_SERVICE: sovereign-api-secondary
+  SECONDARY_REGION: us-east4
+  IMAGE: us-central1-docker.pkg.dev/autonomous-lab-490610/sovereign-inference/gateway
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v3
+        with:
+          install_components: beta
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Validate hosted provider catalog and pricing
+        run: |
+          uv sync --locked
+          uv run python scripts/validate_provider_catalog.py
+
+      - name: Build and push immutable image
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=true \
+            --sbom=true \
+            --tag "${IMAGE}:${GITHUB_SHA}" \
+            --push \
+            .
+          digest="$(gcloud artifacts docker images describe "${IMAGE}:${GITHUB_SHA}" --format='value(image_summary.digest)')"
+          test -n "${digest}"
+          echo "reference=${IMAGE}@${digest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Sign image for Binary Authorization
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Cloud Run evaluates the resolved platform manifest while GKE
+          # evaluates the reference as written, so sign the buildx index
+          # digest and every platform manifest digest beneath it.
+          keyversion="projects/${PROJECT_ID}/locations/${REGION}/keyRings/os-api-binauthz/cryptoKeys/release-signing/cryptoKeyVersions/1"
+          index_ref="${{ steps.image.outputs.reference }}"
+          platform_refs="$(docker buildx imagetools inspect "${index_ref}" --raw \
+            | jq -r '.manifests[] | select(.platform.os != "unknown") | .digest' \
+            | sed "s|^|${IMAGE}@|")"
+          for ref in "${index_ref}" ${platform_refs}; do
+            gcloud beta container binauthz attestations sign-and-create \
+              --project "${PROJECT_ID}" \
+              --artifact-url "${ref}" \
+              --attestor os-api-release \
+              --attestor-project "${PROJECT_ID}" \
+              --keyversion "${keyversion}"
+          done
+
+      - name: Deploy private canary
+        id: canary
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Binary Authorization occurrences are eventually consistent. Cloud
+          # Run can resolve the signed index to its signed platform manifest a
+          # few seconds before that occurrence is visible to policy evaluation.
+          # Retry only that transient denial; all other deploy failures remain
+          # immediate and fail closed.
+          for attempt in {1..6}; do
+            suffix="gh-${GITHUB_RUN_ID}-${attempt}"
+            if output=$(gcloud run deploy "${CANARY_SERVICE}" \
+              --project "${PROJECT_ID}" \
+              --region "${REGION}" \
+              --image "${{ steps.image.outputs.reference }}" \
+              --revision-suffix "${suffix}" \
+              --update-env-vars "MODEL_CONFIG_PATH=/app/config/models.yaml,VENICE_COMPAT_ENABLED=true" \
+              --quiet 2>&1); then
+              printf '%s\n' "${output}"
+              break
+            fi
+            if [[ "${output}" != *"not authorized by policy"* || "${attempt}" == "6" ]]; then
+              printf '%s\n' "${output}" >&2
+              exit 1
+            fi
+            echo "Binary Authorization signature is not visible yet; retrying canary deploy (${attempt}/6)."
+            sleep 10
+          done
+          canary_url="$(gcloud run services describe "${CANARY_SERVICE}" \
+            --project "${PROJECT_ID}" \
+            --region "${REGION}" \
+            --format='value(status.url)')"
+          test -n "${canary_url}"
+          echo "url=${canary_url}" >> "${GITHUB_OUTPUT}"
+
+      - name: Mint canary identity token
+        id: canary-auth
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          token_format: id_token
+          id_token_audience: ${{ steps.canary.outputs.url }}
+
+      - name: Smoke test private canary
+        shell: bash
+        env:
+          CANARY_URL: ${{ steps.canary.outputs.url }}
+          CANARY_ID_TOKEN: ${{ steps.canary-auth.outputs.id_token }}
+        run: |
+          set -euo pipefail
+          smoke_key="$(gcloud secrets versions access latest \
+            --project "${PROJECT_ID}" \
+            --secret smoke-client-api-key)"
+          echo "::add-mask::${smoke_key}"
+          echo "::add-mask::${CANARY_ID_TOKEN}"
+          for attempt in {1..12}; do
+            if curl --fail --silent --show-error --max-time 15 \
+              -H "X-Serverless-Authorization: Bearer ${CANARY_ID_TOKEN}" \
+              "${CANARY_URL}/readyz" >/dev/null; then
+              break
+            fi
+            if [[ "${attempt}" == "12" ]]; then
+              exit 1
+            fi
+            sleep 5
+          done
+          curl --fail --silent --show-error --max-time 30 \
+            -H "X-Serverless-Authorization: Bearer ${CANARY_ID_TOKEN}" \
+            -H "Authorization: Bearer ${smoke_key}" \
+            "${CANARY_URL}/v1/models" \
+            | jq -e '.object == "list" and any(.data[]; .id == "openai/gpt-oss-20b")' >/dev/null
+
+          # The June desktop depends on this Venice-compatible route. A
+          # deliberately incomplete multipart body must reach route validation
+          # (400), never disappear behind the compatibility gate (404).
+          if ! audio_status="$(curl --silent --show-error --max-time 30 \
+            --output /dev/null --write-out '%{http_code}' \
+            -H "X-Serverless-Authorization: Bearer ${CANARY_ID_TOKEN}" \
+            -H "Authorization: Bearer ${smoke_key}" \
+            -F 'model=nvidia/parakeet-tdt-0.6b-v3' \
+            "${CANARY_URL}/v1/audio/transcriptions")"; then
+            echo "::error::Could not reach the Venice-compatible transcription route (HTTP ${audio_status:-000})"
+            exit 1
+          fi
+          if [[ "${audio_status}" != "400" ]]; then
+            echo "::error::Venice-compatible transcription route returned ${audio_status}, expected 400"
+            exit 1
+          fi
+
+          headers_file="$(mktemp)"
+          body_file="$(mktemp)"
+          trap 'rm -f "${headers_file}" "${body_file}"' EXIT
+          curl --fail --silent --show-error --max-time 120 \
+            --dump-header "${headers_file}" \
+            --output "${body_file}" \
+            -H "X-Serverless-Authorization: Bearer ${CANARY_ID_TOKEN}" \
+            -H "Authorization: Bearer ${smoke_key}" \
+            -H "Content-Type: application/json" \
+            -H "X-Confidential-Compute: required" \
+            -X POST "${CANARY_URL}/v1/chat/completions" \
+            --data '{"model":"openai/gpt-oss-20b","messages":[{"role":"user","content":"Reply with exactly: private-ready"}],"max_tokens":128,"privacy":{"minimum":"tee","require_zero_retention":true,"require_response_proof":true}}'
+          if ! jq -e '.choices[0].message.content | type == "string" and length > 0' "${body_file}" >/dev/null; then
+            echo "::error::Canary completion did not contain non-empty text"
+            jq -c '{object, choices: [.choices[]? | {finish_reason, message: {role: .message.role, content_type: (.message.content | type), content_length: ((.message.content // "") | length)}}]}' "${body_file}"
+            exit 1
+          fi
+          if ! grep -Eiq '^x-os-provider:[[:space:]]*phala[[:space:]]*$' "${headers_file}"; then
+            echo "::error::Canary completion was not routed through Phala"
+            exit 1
+          fi
+          if ! grep -Eiq '^x-os-privacy-level:[[:space:]]*tee[[:space:]]*$' "${headers_file}"; then
+            echo "::error::Canary completion did not report TEE privacy"
+            exit 1
+          fi
+          if ! grep -Eiq '^x-os-attestation-status:[[:space:]]*present[[:space:]]*$' "${headers_file}"; then
+            echo "::error::Canary completion did not report present attestation evidence"
+            exit 1
+          fi
+          generation_id="$(awk 'BEGIN{IGNORECASE=1} /^x-os-generation-id:/ {gsub("\r", "", $2); print $2}' "${headers_file}")"
+          if [[ -z "${generation_id}" ]]; then
+            echo "::error::Canary completion did not return a generation ID"
+            exit 1
+          fi
+          curl --fail --silent --show-error --max-time 30 \
+            -H "X-Serverless-Authorization: Bearer ${CANARY_ID_TOKEN}" \
+            -H "Authorization: Bearer ${smoke_key}" \
+            "${CANARY_URL}/v1/privacy/receipts/${generation_id}" \
+            | jq -e '.provider == "phala" and .privacy.level == "tee" and .evidence.status == "present"' >/dev/null
+
+      - name: Deploy production revision without traffic
+        id: production
+        shell: bash
+        run: |
+          set -euo pipefail
+          suffix="gh-${GITHUB_RUN_ID}"
+          revision="${SERVICE}-${suffix}"
+          gcloud run deploy "${SERVICE}" \
+            --project "${PROJECT_ID}" \
+            --region "${REGION}" \
+            --image "${{ steps.image.outputs.reference }}" \
+            --revision-suffix "${suffix}" \
+            --no-traffic \
+            --update-env-vars "MODEL_CONFIG_PATH=/app/config/models.yaml,VENICE_COMPAT_ENABLED=true" \
+            --quiet
+          echo "revision=${revision}" >> "${GITHUB_OUTPUT}"
+
+      - name: Deploy secondary-region revision without traffic
+        id: secondary
+        shell: bash
+        run: |
+          set -euo pipefail
+          suffix="gh-${GITHUB_RUN_ID}"
+          revision="${SECONDARY_SERVICE}-${suffix}"
+          gcloud run deploy "${SECONDARY_SERVICE}" \
+            --project "${PROJECT_ID}" \
+            --region "${SECONDARY_REGION}" \
+            --image "${{ steps.image.outputs.reference }}" \
+            --revision-suffix "${suffix}" \
+            --no-traffic \
+            --update-env-vars "MODEL_CONFIG_PATH=/app/config/models.yaml,VENICE_COMPAT_ENABLED=true" \
+            --quiet
+          echo "revision=${revision}" >> "${GITHUB_OUTPUT}"
+
+      - name: Promote production revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud run services update-traffic "${SERVICE}" \
+            --project "${PROJECT_ID}" \
+            --region "${REGION}" \
+            --to-revisions "${{ steps.production.outputs.revision }}=100" \
+            --quiet
+
+      - name: Promote secondary-region revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud run services update-traffic "${SECONDARY_SERVICE}" \
+            --project "${PROJECT_ID}" \
+            --region "${SECONDARY_REGION}" \
+            --to-revisions "${{ steps.secondary.outputs.revision }}=100" \
+            --quiet
+
+      - name: Verify public endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --max-time 30 https://api.opensoftware.co/readyz \
+            | jq -e '.status == "ready"' >/dev/null

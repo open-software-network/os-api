@@ -1,0 +1,58 @@
+# Threat model
+
+## Protected assets
+
+- User prompts and model outputs
+- Model weights and private adapters
+- Tenant API keys and upstream service credentials
+- Usage and billing integrity
+- Attestation evidence, response signatures, and normalized privacy receipts
+
+## Claims this implementation can make
+
+- The gateway source does not write prompt or response bodies to logs or storage.
+- A request with confidential compute `required` is rejected when a confidential backend is absent; it is never routed to ordinary compute.
+- The confidential vLLM pod can schedule only on an H100 node labeled by GKE as Intel TDX confidential compute.
+- API keys are compared as SHA-256 digests and are not stored in plaintext by the gateway.
+- Hosted endpoints are filtered by the requested privacy and capability policy before health or
+  price ranking; same-model fallback cannot silently weaken a fail-closed request.
+- When the Confidential Space deployment is enabled, provider keys are released only to a stable,
+  non-debug Intel TDX workload running the exact approved os-api image digest.
+- Any user can request fresh nonce-bound Google Cloud Attestation evidence from
+  `POST /v1/gateway/attestation`; local and ordinary-VM deployments fail closed.
+
+## Claims it cannot make yet
+
+- Complete independent verification of every hosted provider's hardware and software attestation
+  chain. Evidence is conservatively reported as present or missing until a verifier establishes
+  freshness, measurements, and signing-key binding.
+- Protection from a malicious application image. A TEE protects the workload boundary; it does not make vulnerable or exfiltrating code safe.
+- Guaranteed deletion from GPU/CPU memory at a user-selected instant.
+- Anonymity from network metadata, tenant usage records, abuse systems, or billing systems.
+- High availability for confidential H100 inference. Current GCP H100 confidential nodes require interruptible provisioning and quota/capacity planning.
+- Hiding plaintext from the OpenSoftware gateway for ordinary TLS requests. Only supported
+  client-E2EE endpoints keep plaintext from the gateway; otherwise the gateway processes it
+  transiently for authentication, routing, and metering.
+
+## Hosted-provider boundary
+
+- A provider's policy statement is not cryptographic evidence. Catalog entries use the conservative
+  `tee` level until the full trust chain has been independently verified.
+- Evidence headers can be missing, stale, or emitted by a compromised provider gateway. A request
+  with `require_response_proof` fails over or fails closed when evidence is absent, but `present`
+  does not mean `verified`.
+- Provider-specific client ciphertext is never forwarded to a plaintext or different endpoint.
+- Provider credentials are mounted from Secret Manager and are never accepted from customer input,
+  returned in errors, or written to usage events.
+- The gateway stores token, cost, routing, and evidence metadata. It does not intentionally store
+  prompts or completions.
+
+## Required production controls
+
+1. Pin all deployed images by digest, sign them, and enforce signatures with Binary Authorization.
+2. Keep the Confidential Space workload identity condition and June verifier pinned to the exact promoted image digest. Treat any digest drift as a failed deployment, not an automatic upgrade.
+3. Disable body capture at the HTTPS edge, APM, service mesh, exception tracker, and vLLM layer—not only in this gateway.
+4. Use VPC Service Controls, private nodes, egress allowlists, and separate service accounts per workload.
+5. Rotate tenant and upstream keys; support immediate revocation through a control-plane datastore/cache.
+6. Encrypt model disks with CMEK where contractual key control is required and define key-destruction procedures.
+7. Run independent penetration tests and produce a data-flow inventory before making marketing privacy claims.

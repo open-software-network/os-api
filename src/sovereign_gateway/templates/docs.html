@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}Docs — OpenSoftware API{% endblock %}
+{% block content %}
+<div class="docs shell">
+  <aside>
+    <strong>Documentation</strong>
+    <a href="#quickstart">Quickstart</a><a href="#models">Models</a><a href="#privacy">Confidential compute</a><a href="#streaming">Streaming</a><a href="#errors">Errors</a>
+  </aside>
+  <article>
+    <div class="eyebrow">OpenSoftware API</div>
+    <h1>Developer docs</h1>
+    <p class="lede">OpenAI-compatible inference for open models hosted on OpenSoftware infrastructure.</p>
+
+    <h2 id="quickstart">Quickstart</h2>
+    <p>Create a key in the <a href="/dashboard">dashboard</a>, then use the standard OpenAI client.</p>
+    <pre><code>pip install openai</code></pre>
+    <pre><code>from openai import OpenAI
+
+client = OpenAI(
+    api_key="sk-os-…",
+    base_url="https://api.opensoftware.co/v1",
+)
+
+completion = client.chat.completions.create(
+    model="qwen2.5-0.5b-instruct",
+    messages=[{"role": "user", "content": "Say hello"}],
+)
+print(completion.choices[0].message.content)</code></pre>
+    <p>Or call it directly:</p>
+    <pre><code>curl https://api.opensoftware.co/v1/chat/completions \
+  -H "Authorization: Bearer $OPENSOFTWARE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen2.5-0.5b-instruct","messages":[{"role":"user","content":"Hello"}]}'</code></pre>
+
+    <h2 id="models">Models</h2>
+    <div class="model-list">
+      {% for model in models %}
+      <div><code>{{ model.id }}</code><span>{{ "{:,}".format(model.max_context_length or 0) }} token context · ${{ "%.2f"|format(model.input_price_microusd_per_million / 1000000) }}/M input · ${{ "%.2f"|format(model.output_price_microusd_per_million / 1000000) }}/M output</span></div>
+      {% endfor %}
+    </div>
+    <p><code>GET /v1/models</code> returns the live catalog and privacy modes.</p>
+
+    <h2 id="privacy">Confidential compute</h2>
+    <p>Set <code>X-Confidential-Compute</code> on any inference request:</p>
+    <table><thead><tr><th>Value</th><th>Behavior</th></tr></thead><tbody>
+      <tr><td><code>required</code></td><td>Use a configured TEE backend or fail with 409. Never downgrade.</td></tr>
+      <tr><td><code>preferred</code></td><td>Require zero retention, prefer a configured Venice private endpoint, and fall back to a compatible Phala TEE endpoint. This is the default.</td></tr>
+      <tr><td><code>disabled</code></td><td>Use the standard compute backend.</td></tr>
+    </tbody></table>
+    <p>This is a deliberate change from the earlier TEE-first default. Callers that require hardware-backed confidential compute must send <code>required</code>. Responses report the exact hosted-provider contract in <code>X-OS-Privacy-Level</code>; <code>X-Compute-Privacy</code> remains a coarser legacy compute-class field.</p>
+
+    <h2 id="streaming">Streaming</h2>
+    <p>Set <code>stream: true</code>. The endpoint returns OpenAI-style server-sent events and includes the terminal usage block for billing.</p>
+
+    <h2 id="errors">Errors</h2>
+    <p>Errors use the OpenAI JSON shape. Relevant codes include <code>invalid_api_key</code>, <code>spend_limit_exceeded</code>, <code>insufficient_credits</code>, <code>rate_limit_exceeded</code>, and <code>confidential_compute_unavailable</code>.</p>
+  </article>
+</div>
+{% endblock %}
