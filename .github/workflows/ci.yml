@@ -52,5 +52,5 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: azure/setup-kubectl@ad56756fa3471408337333d5055b76a0257d0d55 # v5
+      - uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d # v5
       - run: kubectl kustomize deploy/kubernetes/base > /tmp/rendered.yaml
