@@ -2127,3 +2127,73 @@ async def test_venice_e2ee_key_binding_fails_closed_on_nonce_mismatch() -> None:
             endpoint,
             {"x-venice-tee-model-pub-key": "04" + "ab" * 64},
         )
+
+
+def test_service_budget_handles_audio_bursts_and_remains_bounded(
+    routed_client: TestClient, frozen_limiter_clock: None
+) -> None:
+    # One static key represents all Clovy users. A minute of simultaneous
+    # previews plus final transcription must not hit a single-user 60 RPM cap.
+    for _ in range(61):
+        response = routed_client.post(
+            "/v1/audio/transcriptions",
+            data={"model": "nvidia/parakeet-tdt-0.6b-v3", "response_format": "json"},
+            files={"file": ("audio.wav", b"RIFF-audio", "audio/wav")},
+        )
+        assert response.status_code == 200
+    assert response.headers["x-ratelimit-limit-requests"] == "600"
+    assert response.headers["x-ratelimit-remaining-requests"] == "539"
+
+    # Catalog, chat and compatibility calls consume one bounded service budget.
+    for _ in range(539):
+        assert routed_client.get("/v1/models").status_code == 200
+    response = routed_client.post(
+        "/v1/audio/transcriptions",
+        data={"model": "nvidia/parakeet-tdt-0.6b-v3"},
+        files={"file": ("audio.wav", b"RIFF-audio", "audio/wav")},
+    )
+    assert response.status_code == 429
+    assert response.headers["x-ratelimit-limit-requests"] == "600"
+    assert response.headers["x-ratelimit-remaining-requests"] == "0"
+    assert 1 <= int(response.headers["retry-after"]) <= 60
+
+
+def test_managed_users_and_failed_auth_keep_the_regular_budget(
+    routed_client: TestClient, frozen_limiter_clock: None
+) -> None:
+    from sovereign_gateway.auth import Principal
+
+    class ManagedKeys:
+        async def authenticate(self, key: str) -> Principal | None:
+            if key == "sk-managed-test":
+                # Deliberately use the same tenant as the configured static key:
+                # service traffic must neither bypass nor consume this budget.
+                return Principal("router", "managed-test", key_id="managed-key")
+            return None
+
+    routed_client.app.state.managed_keys = ManagedKeys()
+    managed_headers = {
+        "Authorization": "Bearer sk-managed-test",
+        "X-Service-Key": "true",  # Untrusted headers cannot select the larger budget.
+    }
+    for _ in range(60):
+        response = routed_client.get("/v1/models", headers=managed_headers)
+        assert response.status_code == 200
+    response = routed_client.get("/v1/models", headers=managed_headers)
+    assert response.status_code == 429
+    assert response.headers["x-ratelimit-limit-requests"] == "60"
+    assert response.headers["x-ratelimit-remaining-requests"] == "0"
+
+    for _ in range(60):
+        response = routed_client.get(
+            "/v1/models", headers={"Authorization": "Bearer sk-invalid"}
+        )
+        assert response.status_code == 401
+    assert routed_client.get(
+        "/v1/models", headers={"Authorization": "Bearer sk-invalid"}
+    ).status_code == 429
+
+    response = routed_client.get("/v1/models")
+    assert response.status_code == 200
+    assert response.headers["x-ratelimit-limit-requests"] == "600"
+    assert response.headers["x-ratelimit-remaining-requests"] == "599"

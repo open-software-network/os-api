@@ -44,6 +44,24 @@ gcloud run services update-traffic sovereign-api \
 
 Do not deploy mutable tags. Terraform owns service configuration and CI owns the digest-pinned application revision.
 
+## Request budgets
+
+`REQUESTS_PER_MINUTE` defaults to 60 for managed user keys and failed-authentication
+throttling. `SERVICE_REQUESTS_PER_MINUTE` defaults to 600 for each authenticated
+static service identity configured in `API_KEY_HASHES`; it must be a positive
+integer. A static identity represents a whole caller application, so its budget
+covers that application's combined audio previews, final transcription, chat,
+and catalog requests. Client-supplied identity headers never select this budget.
+
+Service and managed-user counters use separate Redis namespaces, even when their
+tenant names match. On Redis failure each falls back to its own bounded process-local
+window at twice its configured limit, preserving the existing degraded-mode policy;
+that ceiling scales with replica count. Successful and rate-limited responses report
+the active limit, remaining requests, and reset time in `X-RateLimit-*-Requests`;
+429 responses include `Retry-After`. Cloud Armor still applies its separate edge cap.
+Monitor sustained 429s before raising the service budget and honor `Retry-After`
+in callers. Do not remove limits or give managed end-user keys a service exception.
+
 ## Alerts
 
 Terraform creates an external readiness check and policies for sustained 5xx responses, readiness failures, wallet settlement failures, authentication spikes, scheduled backup failures, sustained admission-control rejections (`model_overloaded`), model-backend timeouts and connection failures, and the gateway running near its Cloud Run instance ceiling. Alert notifications go to the configured operations channel. The next alert set should cover Redis memory pressure, model load failures, GPU Xid events, and time-to-first-token by backend.

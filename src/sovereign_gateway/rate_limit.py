@@ -51,13 +51,16 @@ class LocalFixedWindowLimiter:
 
 
 class RedisFixedWindowLimiter:
-    def __init__(self, redis: Redis, requests_per_minute: int) -> None:
+    def __init__(
+        self, redis: Redis, requests_per_minute: int, *, namespace: str = "ratelimit"
+    ) -> None:
         self.redis = redis
         self.limit = requests_per_minute
+        self.namespace = namespace
 
     async def allow(self, principal: str) -> tuple[bool, int]:
         window = int(time.time() // 60)
-        key = f"ratelimit:{principal}:{window}"
+        key = f"{self.namespace}:{principal}:{window}"
         async with self.redis.pipeline(transaction=True) as pipe:
             pipe.incr(key)
             pipe.expire(key, 90)

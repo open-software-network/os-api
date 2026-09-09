@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import anyio
+import pytest
 from fastapi.testclient import TestClient
 
+from sovereign_gateway.app import create_app
 from sovereign_gateway.rate_limit import LocalConcurrencyLimiter
 
 
@@ -98,7 +100,7 @@ class FailingLimiter:
 
 def test_redis_loss_serves_via_bounded_fallbacks(client: TestClient) -> None:
     failing = FailingLimiter()
-    client.app.state.limiter = failing
+    client.app.state.service_limiter = failing
     client.app.state.concurrency = failing
 
     response = client.post(
@@ -108,13 +110,14 @@ def test_redis_loss_serves_via_bounded_fallbacks(client: TestClient) -> None:
     )
 
     assert response.status_code == 200
-    assert "x-ratelimit-remaining-requests" not in response.headers
+    assert response.headers["x-ratelimit-limit-requests"] == "40"
+    assert response.headers["x-ratelimit-remaining-requests"] == "39"
 
 
 def test_redis_loss_rate_limit_fallback_caps_requests(
     client: TestClient, frozen_limiter_clock: None
 ) -> None:
-    client.app.state.limiter = FailingLimiter()
+    client.app.state.service_limiter = FailingLimiter()
 
     # The per-process fallback window allows 2x the configured 20 RPM.
     for _ in range(40):
@@ -180,3 +183,95 @@ def test_unlimited_backend_skips_admission_control(client: TestClient) -> None:
 
     assert response.status_code == 200
     assert limiter.acquires == 0
+
+
+def test_redis_service_counters_do_not_share_managed_user_namespace() -> None:
+    from sovereign_gateway.rate_limit import RedisFixedWindowLimiter
+
+    class RedisCounter:
+        def __init__(self) -> None:
+            self.counts: dict[str, int] = {}
+
+        def pipeline(self, transaction: bool):
+            return self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def incr(self, key: str) -> None:
+            self.key = key
+            self.counts[key] = self.counts.get(key, 0) + 1
+
+        def expire(self, key: str, seconds: int) -> None:
+            pass
+
+        async def execute(self):
+            return self.counts[self.key], True
+
+    async def scenario() -> None:
+        redis = RedisCounter()
+        regular = RedisFixedWindowLimiter(redis, 1)
+        service = RedisFixedWindowLimiter(redis, 2, namespace="service-ratelimit")
+        assert await regular.allow("same-tenant") == (True, 0)
+        assert await regular.allow("same-tenant") == (False, 0)
+        assert await service.allow("same-tenant") == (True, 1)
+        assert await service.allow("same-tenant") == (True, 0)
+        assert await service.allow("same-tenant") == (False, 0)
+        assert len(redis.counts) == 2
+
+    anyio.run(scenario)
+
+
+def test_service_redis_fallback_is_independent_from_managed_user_fallback(
+    client: TestClient, frozen_limiter_clock: None
+) -> None:
+    from sovereign_gateway.auth import Principal
+
+    class ManagedKeys:
+        async def authenticate(self, key: str) -> Principal | None:
+            return Principal("test-tenant", "managed", key_id="managed-key")
+
+    client.app.state.managed_keys = ManagedKeys()
+    client.app.state.limiter = FailingLimiter()
+    client.app.state.service_limiter = FailingLimiter()
+    for _ in range(40):
+        assert client.get("/v1/models").status_code == 200
+    response = client.get("/v1/models")
+    assert response.status_code == 429
+    assert response.headers["x-ratelimit-limit-requests"] == "40"
+    assert response.headers["x-ratelimit-remaining-requests"] == "0"
+
+    headers = {"Authorization": "Bearer sk-managed-test"}
+    for _ in range(40):
+        assert client.get("/v1/models", headers=headers).status_code == 200
+    response = client.get("/v1/models", headers=headers)
+    assert response.status_code == 429
+    assert response.headers["x-ratelimit-limit-requests"] == "40"
+    assert response.headers["x-ratelimit-remaining-requests"] == "0"
+
+
+def test_service_budget_can_be_configured_without_changing_regular_limit(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, frozen_limiter_clock: None
+) -> None:
+    monkeypatch.setenv("SERVICE_REQUESTS_PER_MINUTE", "2")
+    with TestClient(create_app()) as configured:
+        configured.headers.update(client.headers)
+        for _ in range(2):
+            response = configured.get("/v1/models")
+            assert response.status_code == 200
+        response = configured.get("/v1/models")
+        assert response.status_code == 429
+        assert response.headers["x-ratelimit-limit-requests"] == "2"
+        assert configured.app.state.limiter.limit == 20
+
+
+@pytest.mark.parametrize("budget", ["0", "-1", "unlimited"])
+def test_service_budget_rejects_invalid_configuration(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, budget: str
+) -> None:
+    monkeypatch.setenv("SERVICE_REQUESTS_PER_MINUTE", budget)
+    with pytest.raises(ValueError), TestClient(create_app()):
+        pass
