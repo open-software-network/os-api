@@ -77,6 +77,7 @@ models:
     monkeypatch.setenv("API_KEY_HASHES", f"test-tenant={digest}")
     monkeypatch.setenv("TEE_UPSTREAM_KEY", "internal-secret")
     monkeypatch.setenv("REQUESTS_PER_MINUTE", "20")
+    monkeypatch.setenv("SERVICE_REQUESTS_PER_MINUTE", "20")
     monkeypatch.delenv("REDIS_URL", raising=False)
     monkeypatch.delenv("SITE_BASIC_AUTH_USERNAME", raising=False)
     monkeypatch.delenv("SITE_BASIC_AUTH_PASSWORD", raising=False)

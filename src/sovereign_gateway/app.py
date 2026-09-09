@@ -329,6 +329,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.keys = keys
     app.state.managed_keys = managed_keys
     app.state.limiter = limiter
+    service_rpm = int(os.getenv("SERVICE_REQUESTS_PER_MINUTE", "600"))
+    if service_rpm < 1:
+        raise ValueError("SERVICE_REQUESTS_PER_MINUTE must be positive")
+    # Static service credentials represent an entire caller application. Keep
+    # their aggregate budget separate from managed users and failed auth.
+    app.state.service_limiter = (
+        RedisFixedWindowLimiter(redis, service_rpm, namespace="service-ratelimit")
+        if redis else LocalFixedWindowLimiter(service_rpm)
+    )
     app.state.redis = redis
     concurrency: ConcurrencyLimiter = (
         RedisConcurrencyLimiter(redis) if redis else LocalConcurrencyLimiter()
@@ -340,6 +349,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # own share, so the degraded ceiling scales with replica count), and the
     # concurrency fallback caps admissions at the endpoint limit per process.
     app.state.limiter_fallback = LocalFixedWindowLimiter(limiter.limit * 2)
+    app.state.service_limiter_fallback = LocalFixedWindowLimiter(service_rpm * 2)
     app.state.concurrency_fallback = LocalConcurrencyLimiter()
     app.state.video_queue_semaphore = asyncio.Semaphore(
         int(os.getenv("VIDEO_QUEUE_MAX_CONCURRENCY", "4"))
@@ -465,7 +475,7 @@ def create_app() -> FastAPI:
         ):
             response.headers["cache-control"] = "no-store"
         if hasattr(request.state, "rate_limit_remaining"):
-            response.headers["x-ratelimit-limit-requests"] = str(request.app.state.limiter.limit)
+            response.headers["x-ratelimit-limit-requests"] = str(request.state.rate_limit_limit)
             response.headers["x-ratelimit-remaining-requests"] = str(
                 request.state.rate_limit_remaining
             )
@@ -1638,6 +1648,7 @@ async def _authorize(request: Request) -> Response | None:
             code="invalid_api_key",
         )
     principal: Principal | None = request.app.state.keys.authenticate(raw_key)
+    service_key = principal is not None
     if not principal and request.app.state.managed_keys:
         principal = await request.app.state.managed_keys.authenticate(raw_key)
     if not principal:
@@ -1649,8 +1660,13 @@ async def _authorize(request: Request) -> Response | None:
             error_type="authentication_error",
             code="invalid_api_key",
         )
+    limiter = request.app.state.service_limiter if service_key else request.app.state.limiter
+    fallback = (
+        request.app.state.service_limiter_fallback
+        if service_key else request.app.state.limiter_fallback
+    )
     try:
-        allowed, remaining = await request.app.state.limiter.allow(principal.tenant_id)
+        allowed, remaining = await limiter.allow(principal.tenant_id)
     except Exception:
         # Redis-backed limiting is down. Keep the redis_degraded alert as the
         # signal to fail the region away per the runbook, but no longer fail
@@ -1669,12 +1685,10 @@ async def _authorize(request: Request) -> Response | None:
                 separators=(",", ":"),
             )
         )
-        allowed, _ = await request.app.state.limiter_fallback.allow(principal.tenant_id)
-        if not allowed:
-            return _rate_limit_response()
-        request.state.principal = principal
-        return None
+        limiter = fallback
+        allowed, remaining = await limiter.allow(principal.tenant_id)
     reset_at = (int(time.time()) // 60 + 1) * 60
+    request.state.rate_limit_limit = limiter.limit
     request.state.rate_limit_remaining = remaining
     request.state.rate_limit_reset = reset_at
     if not allowed:

@@ -58,6 +58,7 @@ are rejected from these routes, preventing an accidental second billing path.
 
 | Variable | Purpose |
 |---|---|
+| `SERVICE_REQUESTS_PER_MINUTE` | Aggregate minute budget per authenticated static caller identity; defaults to 600. Managed keys and failed auth retain the separate `REQUESTS_PER_MINUTE` budget (60 by default). |
 | `VENICE_COMPAT_ENABLED` | Enables the compatibility endpoints; defaults to false. |
 | `ASR_MODEL_ALLOWLIST` | Comma-separated ASR models; defaults to Parakeet. |
 | `ASR_PRICE_PER_SECOND_USD` | Venice-shaped catalog price used by June billing. |
